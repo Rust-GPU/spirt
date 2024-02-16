@@ -739,11 +739,23 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        self.func_def_body.inner_in_place_transform_with(&mut ReplaceValueWith(|v| match v {
-            Value::ControlRegionInput { region, input_idx } => {
-                Some(self.control_region_input_replacements.get(region)?[input_idx as usize])
+        self.func_def_body.inner_in_place_transform_with(&mut ReplaceValueWith(|v| {
+            // NOTE(eddyb) this needs to be able to apply multiple replacements,
+            // due to the input potentially having redundantly chained `OpPhi`s.
+            //
+            // FIXME(eddyb) union-find-style "path compression" could record the
+            // final value inside `self.control_region_input_replacements` while
+            // replacements are being made, to avoid going through a chain more
+            // than once (and some of these replacements could be applied early).
+            let mut new_v = v;
+            while let Value::ControlRegionInput { region, input_idx } = new_v {
+                if let Some(replacements) = self.control_region_input_replacements.get(region) {
+                    new_v = replacements[input_idx as usize];
+                } else {
+                    break;
+                }
             }
-            _ => None,
+            (v != new_v).then_some(new_v)
         }));
     }
 
