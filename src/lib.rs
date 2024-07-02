@@ -884,7 +884,7 @@ pub enum DataInstKind {
     },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Const(Const),
 
