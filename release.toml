@@ -2,10 +2,10 @@ pre-release-commit-message = "Release {{version}}"
 tag-message = "Release {{version}}"
 tag-name = "{{version}}"
 pre-release-replacements = [
-  { file = "Cargo.toml", prerelease = true, search = "repository = \"https://github.com/EmbarkStudios/spirt\"", replace = "repository = \"https://github.com/EmbarkStudios/spirt/tree/{{tag_name}}\"" },
+  { file = "Cargo.toml", prerelease = true, search = "repository = \"https://github.com/rust-gpu/spirt\"", replace = "repository = \"https://github.com/rust-gpu/spirt/tree/{{tag_name}}\"" },
   { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}" },
   { file = "CHANGELOG.md", search = "\\.\\.\\.HEAD", replace = "...{{tag_name}}" },
   { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}" },
   { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n\n## [Unreleased] - ReleaseDate" },
-  { file = "CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[Unreleased]: https://github.com/EmbarkStudios/spirt/compare/{{tag_name}}...HEAD" },
+  { file = "CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[Unreleased]: https://github.com/rust-gpu/spirt/compare/{{tag_name}}...HEAD" },
 ]

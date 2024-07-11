@@ -29,7 +29,7 @@
     git_main_docs,
     doc = concat!(
         "[`", env!("CARGO_PKG_NAME"), " @ ", env!("GIT_MAIN_DESCRIBE"), "`'s `README`]",
-        "(https://github.com/EmbarkStudios/spirt/tree/", env!("GIT_MAIN_COMMIT"), "#readme)*  "
+        "(https://github.com/rust-gpu/spirt/tree/", env!("GIT_MAIN_COMMIT"), "#readme)*  "
     )
 )]
 #![cfg_attr(
@@ -42,7 +42,7 @@
     doc = concat!("`", env!("CARGO_PKG_NAME"), "`'s `README`*  ")
 )]
 //!
-//! *Check out also [the `EmbarkStudios/spirt` GitHub repository](https://github.com/EmbarkStudios/spirt),
+//! *Check out also [the `rust-gpu/spirt` GitHub repository](https://github.com/rust-gpu/spirt),
 //! for any additional developments.*
 //!
 //! #### Notable types/modules

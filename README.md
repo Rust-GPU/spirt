@@ -10,12 +10,10 @@
 
 **⋯🢒 🇹arget 🠆 🇹ransform 🠆 🇹ranslate ⋯🢒**
 
-[![Embark](https://img.shields.io/badge/embark-open%20source-blueviolet.svg)](https://embark.dev)
 [![Crates.io](https://img.shields.io/crates/v/spirt.svg)](https://crates.io/crates/spirt)
 [![Docs](https://docs.rs/spirt/badge.svg)](https://docs.rs/spirt)
-[![Git Docs](https://img.shields.io/badge/git%20main%20docs-published-blue)](https://embarkstudios.github.io/spirt/spirt/index.html)
-[![dependency status](https://deps.rs/repo/github/EmbarkStudios/spirt/status.svg)](https://deps.rs/repo/github/EmbarkStudios/spirt)
-[![Build status](https://github.com/EmbarkStudios/spirt/workflows/CI/badge.svg)](https://github.com/EmbarkStudios/spirt/actions)
+[![Git Docs](https://img.shields.io/badge/git%20main%20docs-published-blue)](https://rust-gpu.github.io/spirt/spirt/index.html)
+[![Build status](https://github.com/rust-gpu/spirt/workflows/CI/badge.svg)](https://github.com/rust-gpu/spirt/actions)
 </div>
 
 **SPIR-🇹** is a research project aimed at exploring shader-oriented IR designs derived from SPIR-V, and producing a framework around such an IR to facilitate advanced compilation pipelines, beyond what existing SPIR-V tooling allows for.
@@ -40,7 +38,7 @@ The names SPIR, SPIR-V, as well as related names, marks, emblems and images are 
 
 🚧 *This project is in active design and development, many details can and will change* 🚧
 
-If you're interested in using **SPIR-🇹** yourself, you may want to first take a look at [the issue tracker](https://github.com/EmbarkStudios/spirt/issues) for relevant issues, and even open new ones describing your usecase.  
+If you're interested in using **SPIR-🇹** yourself, you may want to first take a look at [the issue tracker](https://github.com/rust-gpu/spirt/issues) for relevant issues, and even open new ones describing your usecase.  
 With the initial focus being on [Rust-GPU]'s usecase, various (otherwise desirable) functionality/APIs/docs may be lacking, or rapidly changing - at the same time, discussions around widening the scope and usability of **SPIR-🇹** _in the long term_ are still welcome.
 
 ### Non-goals (at least in the short term)
@@ -222,7 +220,7 @@ We welcome community contributions to this project.
 Please read our [Contributor Guide](CONTRIBUTING.md) for more information on how to get started.
 Please also read our [Contributor Terms](CONTRIBUTING.md#contributor-terms) before you make any contributions.
 
-Any contribution intentionally submitted for inclusion in an Embark Studios project, shall comply with the Rust standard licensing model (MIT OR Apache 2.0) and therefore be dual licensed as described below, without any additional terms or conditions:
+Any contribution intentionally submitted for inclusion shall comply with the Rust standard licensing model (MIT OR Apache 2.0) and therefore be dual licensed as described below, without any additional terms or conditions:
 
 ### License
 
@@ -233,6 +231,6 @@ This contribution is dual licensed under EITHER OF
 
 at your option.
 
-For clarity, "your" refers to Embark or any other licensee/user of the contribution.
+For clarity, "your" refers to any licensee/user of the contribution.
 
-[Rust-GPU]: https://github.com/EmbarkStudios/rust-gpu
+[Rust-GPU]: https://github.com/rust-gpu/rust-gpu

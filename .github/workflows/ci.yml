@@ -41,7 +41,7 @@ jobs:
 
       - name: Ensure compatibility with rust-gpu nightly rust version
         run: |
-          curl -sSL https://github.com/EmbarkStudios/rust-gpu/raw/main/rust-toolchain.toml | grep -v '^components = ' > rust-toolchain.toml
+          curl -sSL https://github.com/rust-gpu/rust-gpu/raw/main/rust-toolchain.toml | grep -v '^components = ' > rust-toolchain.toml
           cargo check --workspace --all-targets
           rm rust-toolchain.toml
 

@@ -116,9 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pretty-printer with (styled and hyperlinked) HTML output.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/EmbarkStudios/spirt/compare/0.3.0...HEAD
-[0.3.0]: https://github.com/EmbarkStudios/spirt/compare/0.2.0...0.3.0
-[0.2.0]: https://github.com/EmbarkStudios/spirt/compare/0.1.0...0.2.0
+[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/rust-gpu/spirt/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/rust-gpu/spirt/compare/0.1.0...0.2.0
 <!-- HACK(eddyb) `0.0.0` doesn't exist as a "tag before the initial commit", but
      the commit hash referenced here is the newest from `opensource-template`,
      that predates `0.1.0`, i.e. the `opensource-template` parent of the merge
@@ -126,4 +126,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      suitable for a comparison point, as GitHub will dutifully list all commits
      that don't come from `opensource-template`, even the initial commit itself!
 -->
-[0.1.0]: https://github.com/EmbarkStudios/spirt/compare/c5d63c6974d03e1495eba2c72ff403a246586a40...0.1.0
+[0.1.0]: https://github.com/rust-gpu/spirt/compare/c5d63c6974d03e1495eba2c72ff403a246586a40...0.1.0
