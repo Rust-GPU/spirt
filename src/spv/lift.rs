@@ -466,7 +466,7 @@ impl<'a> FuncAt<'a, ControlRegion> {
     /// and being able to stop iteration by returning `Err`.
     ///
     /// RPO iteration over a CFG provides certain guarantees, most importantly
-    /// that SSA definitions are visited before any of their uses.
+    /// that dominators are visited before the entire subgraph they dominate.
     fn rev_post_order_try_for_each<E>(
         self,
         mut f: impl FnMut(CfgCursor<'_>) -> Result<(), E>,

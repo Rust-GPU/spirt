@@ -153,6 +153,7 @@
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
 pub mod cfg;
+pub mod cfgssa;
 mod context;
 pub mod func_at;
 pub mod print;
@@ -705,13 +706,12 @@ pub struct FuncDefBody {
 /// * dominance is simpler, so values defined in a [`ControlRegion`](crate::ControlRegion) can be used:
 ///   * later in that region, including in the region's `outputs`
 ///     (which allows "exporting" values out to the rest of the function)
-///   * outside that region, but *only* if the parent [`ControlNode`](crate::ControlNode) only has
-///     exactly one child region (i.e. a single-case `Select`, or a `Loop`)
+///   * outside that region, but *only* if the parent [`ControlNode`](crate::ControlNode)
+///     is a `Loop` (that is, when the region is a loop's body)
 ///     * this is an "emergent" property, stemming from the region having to
-///       execute (at least once) before the parent [`ControlNode`](crate::ControlNode) can complete,
-///       but is not is not ideal (especially for reasoning about loops) and
-///       should eventually be replaced with passing all such values through
-///       the region `outputs` (or by inlining the region, in the `Select` case)
+///       execute (at least once) before the parent [`ControlNode`](crate::ControlNode)
+///       can complete, but is not is not ideal and should eventually be replaced
+///       with passing all such values through loop (body) `outputs`
 /// * instead of φ ("phi") nodes, SPIR-T uses region `outputs` to merge values
 ///   coming from separate control-flow paths (i.e. the cases of a `Select`),
 ///   and region `inputs` for passing values back along loop backedges
@@ -722,7 +722,13 @@ pub struct FuncDefBody {
 ///     instead of in the merge (where phi nodes require special-casing, as
 ///     their "uses" of all the "source" values would normally be illegal)
 ///   * in unstructured control-flow, region `inputs` are additionally used for
-///     phi nodes, as [`cfg::ControlInst`](crate::cfg::ControlInst)s passing values to their target regions
+///     representing phi nodes, as [`cfg::ControlInst`](crate::cfg::ControlInst)s
+///     passing values to their target regions
+///     * all value uses across unstructured control-flow edges (i.e. not in the
+///       same region containing the value definition) *require* explicit passing,
+///       as unstructured control-flow [`ControlRegion`](crate::ControlRegion)s
+///       do *not* themselves get *any* implied dominance relations from the
+///       shape of the control-flow graph (unlike most typical CFG+SSA IRs)
 pub use context::ControlRegion;
 
 /// Definition for a [`ControlRegion`]: a control-flow region.
@@ -834,10 +840,13 @@ pub enum SelectionKind {
     SpvInst(spv::Inst),
 }
 
-/// Entity handle for a [`DataInstDef`](crate::DataInstDef) (an SSA instruction).
+/// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
 pub use context::DataInst;
 
-/// Definition for a [`DataInst`]: an SSA instruction.
+/// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
+//
+// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `ControlNodeKind`,
+// but also `DataInst` vs `ControlNode` is a purely artificial distinction.
 #[derive(Clone)]
 pub struct DataInstDef {
     pub attrs: AttrSet,
