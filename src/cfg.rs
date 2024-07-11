@@ -78,7 +78,7 @@ impl ControlFlowGraph {
     /// reverse post-order (RPO).
     ///
     /// RPO iteration over a CFG provides certain guarantees, most importantly
-    /// that SSA definitions are visited before any of their uses.
+    /// that dominators are visited before the entire subgraph they dominate.
     pub fn rev_post_order(
         &self,
         func_def_body: &FuncDefBody,

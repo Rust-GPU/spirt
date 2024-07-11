@@ -856,20 +856,43 @@ impl Module {
 
             struct BlockDetails {
                 label_id: spv::Id,
-                phi_count: u32,
+                phi_count: usize,
+
+                // FIXME(eddyb) how inefficient is `FxIndexMap<spv::Id, Type>`?
+                // (vs e.g. a bitset combined with not duplicating `Type`s per-block?)
+                cfgssa_inter_block_uses: FxIndexMap<spv::Id, Type>,
             }
 
             // Index IDs declared within the function, first.
             let mut local_id_defs = FxIndexMap::default();
             // `OpPhi`s are also collected here, to assign them per-edge.
             let mut phi_to_values = FxIndexMap::<PhiKey, SmallVec<[spv::Id; 1]>>::default();
+            // FIXME(eddyb) wouldn't `EntityOrientedDenseMap` make more sense?
             let mut block_details = FxIndexMap::<ControlRegion, BlockDetails>::default();
             let mut has_blocks = false;
+            let mut cfgssa_def_map = {
+                // FIXME(eddyb) in theory, this could be a toggle, but there is
+                // very little value in allowing dominance-based SSA use rules.
+                const SPIRT_CFGSSA_UNDOMINATE: bool = true;
+
+                SPIRT_CFGSSA_UNDOMINATE.then(|| {
+                    let mut def_map = crate::cfgssa::DefMap::new();
+
+                    // HACK(eddyb) allow e.g. `OpFunctionParameter` to
+                    // be treated like `OpPhi`s of the entry block.
+                    if let DeclDef::Present(func_def_body) = &func_decl.def {
+                        def_map.add_block(func_def_body.body);
+                    }
+
+                    def_map
+                })
+            };
             {
                 let mut next_param_idx = 0u32;
                 for raw_inst in &raw_insts {
                     let IntraFuncInst {
                         without_ids: spv::Inst { opcode, ref imms },
+                        result_type,
                         result_id,
                         ..
                     } = *raw_inst;
@@ -909,8 +932,14 @@ impl Module {
                                         .control_regions
                                         .define(&cx, ControlRegionDef::default())
                                 };
-                                block_details
-                                    .insert(block, BlockDetails { label_id: id, phi_count: 0 });
+                                block_details.insert(
+                                    block,
+                                    BlockDetails {
+                                        label_id: id,
+                                        phi_count: 0,
+                                        cfgssa_inter_block_uses: Default::default(),
+                                    },
+                                );
                                 LocalIdDef::BlockLabel(block)
                             } else if opcode == wk.OpPhi {
                                 let (&current_block, block_details) = match block_details.last_mut()
@@ -922,6 +951,7 @@ impl Module {
 
                                 let phi_idx = block_details.phi_count;
                                 block_details.phi_count = phi_idx.checked_add(1).unwrap();
+                                let phi_idx = u32::try_from(phi_idx).unwrap();
 
                                 assert!(imms.is_empty());
                                 // FIXME(eddyb) use `array_chunks` when that's stable.
@@ -961,6 +991,29 @@ impl Module {
                         };
                         local_id_defs.insert(id, local_id_def);
                     }
+
+                    if let Some(def_map) = &mut cfgssa_def_map {
+                        if let DeclDef::Present(func_def_body) = &func_decl.def {
+                            let current_block = match block_details.last() {
+                                Some((&current_block, _)) => current_block,
+                                // HACK(eddyb) ensure e.g. `OpFunctionParameter`
+                                // are treated like `OpPhi`s of the entry block.
+                                None => func_def_body.body,
+                            };
+
+                            if opcode == wk.OpLabel {
+                                // HACK(eddyb) the entry block was already added.
+                                if current_block != func_def_body.body {
+                                    def_map.add_block(current_block);
+                                }
+                                continue;
+                            }
+
+                            if let Some(id) = result_id {
+                                def_map.add_def(current_block, id, result_type.unwrap());
+                            }
+                        }
+                    }
                 }
             }
 
@@ -992,7 +1045,94 @@ impl Module {
                 None
             };
 
-            let mut current_block_control_region_and_details = None;
+            // HACK(eddyb) an entire separate traversal is required to find
+            // all inter-block uses, before any blocks get lowered to SPIR-T.
+            let mut cfgssa_use_accumulator = cfgssa_def_map
+                .as_ref()
+                .filter(|_| func_def_body.is_some())
+                .map(crate::cfgssa::UseAccumulator::new);
+            if let Some(use_acc) = &mut cfgssa_use_accumulator {
+                // HACK(eddyb) ensure e.g. `OpFunctionParameter`
+                // are treated like `OpPhi`s of the entry block.
+                let mut current_block = func_def_body.as_ref().unwrap().body;
+                for raw_inst in &raw_insts {
+                    let IntraFuncInst {
+                        without_ids: spv::Inst { opcode, ref imms },
+                        result_id,
+                        ..
+                    } = *raw_inst;
+
+                    if opcode == wk.OpLabel {
+                        current_block = match local_id_defs[&result_id.unwrap()] {
+                            LocalIdDef::BlockLabel(control_region) => control_region,
+                            LocalIdDef::Value(_) => unreachable!(),
+                        };
+                        continue;
+                    }
+
+                    if opcode == wk.OpPhi {
+                        assert!(imms.is_empty());
+                        // FIXME(eddyb) use `array_chunks` when that's stable.
+                        for value_and_source_block_id in raw_inst.ids.chunks(2) {
+                            let &[value_id, source_block_id]: &[_; 2] =
+                                value_and_source_block_id.try_into().unwrap();
+
+                            if let Some(&LocalIdDef::BlockLabel(source_block)) =
+                                local_id_defs.get(&source_block_id)
+                            {
+                                // HACK(eddyb) `value_id` would be explicitly used
+                                // in `source_block`, in a "BB args" representation,
+                                // but phis move the use to the edge's target.
+                                use_acc.add_use(source_block, value_id);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // HACK(eddyb) while including merges as edges may seem useful,
+                    // they don't participate in dominance (and thus SSA validity),
+                    // and if there's any chance `current_block` is *not* the
+                    // closest dominator of a merge, that merge could contain
+                    // uses that don't belong/are illegal in `current_block`.
+                    if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
+                        continue;
+                    }
+
+                    for &id in &raw_inst.ids {
+                        // HACK(eddyb) treat all mentions of `OpLabel` IDs as
+                        // CFG edge targets, which turns out to be accurate,
+                        // except for `OpPhi`/`OpSelectionMerge`/`OpLoopMerge`
+                        // (which are already special-cased above).
+                        if let Some(&LocalIdDef::BlockLabel(target_block)) = local_id_defs.get(&id)
+                        {
+                            use_acc.add_edge(current_block, target_block);
+                        } else {
+                            // HACK(eddyb) this heavily relies on `add_use(_, id)`
+                            // ignoring `id`s which aren't recognized by `def_map`.
+                            use_acc.add_use(current_block, id);
+                        }
+                    }
+                }
+            }
+            if let Some(use_acc) = cfgssa_use_accumulator {
+                for (block, inter_block_uses) in use_acc.into_inter_block_uses() {
+                    block_details[&block].cfgssa_inter_block_uses = inter_block_uses;
+                }
+            }
+
+            struct CurrentBlock<'a> {
+                region: ControlRegion,
+
+                // FIXME(eddyb) figure out a better name and/or organization for this.
+                details: &'a BlockDetails,
+
+                // HACK(eddyb) this is probably very inefficient but allows easy
+                // access to inter-block-used IDs, in a form directly usable in
+                // the current block (i.e. `ControlRegion` inputs).
+                shadowed_local_id_defs: FxIndexMap<spv::Id, LocalIdDef>,
+            }
+
+            let mut current_block = None;
             for (raw_inst_idx, raw_inst) in raw_insts.iter().enumerate() {
                 let lookahead_raw_inst =
                     |dist| raw_inst_idx.checked_add(dist).and_then(|i| raw_insts.get(i));
@@ -1051,7 +1191,7 @@ impl Module {
                     };
 
                 if opcode == wk.OpFunctionParameter {
-                    if current_block_control_region_and_details.is_some() {
+                    if current_block.is_some() {
                         return Err(invalid(
                             "out of order: `OpFunctionParameter`s should come \
                              before the function's blocks",
@@ -1084,22 +1224,74 @@ impl Module {
                     // A `ControlRegion` (using an empty `Block` `ControlNode`
                     // as its sole child) was defined earlier,
                     // to be able to have an entry in `local_id_defs`.
-                    let control_region = match local_id_defs[&result_id.unwrap()] {
-                        LocalIdDef::BlockLabel(control_region) => control_region,
+                    let region = match local_id_defs[&result_id.unwrap()] {
+                        LocalIdDef::BlockLabel(region) => region,
                         LocalIdDef::Value(_) => unreachable!(),
                     };
-                    let current_block_details = &block_details[&control_region];
-                    assert_eq!(current_block_details.label_id, result_id.unwrap());
-                    current_block_control_region_and_details =
-                        Some((control_region, current_block_details));
+                    let details = &block_details[&region];
+                    assert_eq!(details.label_id, result_id.unwrap());
+                    current_block = Some(CurrentBlock {
+                        region,
+                        details,
+
+                        // HACK(eddyb) reuse `shadowed_local_id_defs` storage.
+                        shadowed_local_id_defs: current_block
+                            .take()
+                            .map(|CurrentBlock { mut shadowed_local_id_defs, .. }| {
+                                shadowed_local_id_defs.clear();
+                                shadowed_local_id_defs
+                            })
+                            .unwrap_or_default(),
+                    });
                     continue;
                 }
-                let (current_block_control_region, current_block_details) =
-                    current_block_control_region_and_details.ok_or_else(|| {
-                        invalid("out of order: not expected before the function's blocks")
-                    })?;
+                let current_block = current_block.as_mut().ok_or_else(|| {
+                    invalid("out of order: not expected before the function's blocks")
+                })?;
                 let current_block_control_region_def =
-                    &mut func_def_body.control_regions[current_block_control_region];
+                    &mut func_def_body.control_regions[current_block.region];
+
+                // HACK(eddyb) the `ControlRegion` inputs for inter-block uses
+                // have to be inserted just after all the `OpPhi`s' region inputs,
+                // or right away (e.g. on `OpLabel`) when there are no `OpPhi`s,
+                // so the easiest place to insert them is before handling the
+                // first instruction in the block that's not `OpLabel`/`OpPhi`.
+                if opcode != wk.OpPhi
+                    && current_block.shadowed_local_id_defs.is_empty()
+                    && !current_block.details.cfgssa_inter_block_uses.is_empty()
+                {
+                    assert!(current_block_control_region_def.children.is_empty());
+
+                    current_block.shadowed_local_id_defs.extend(
+                        current_block.details.cfgssa_inter_block_uses.iter().map(
+                            |(&used_id, &ty)| {
+                                let input_idx = current_block_control_region_def
+                                    .inputs
+                                    .len()
+                                    .try_into()
+                                    .unwrap();
+                                current_block_control_region_def
+                                    .inputs
+                                    .push(ControlRegionInputDecl { attrs: AttrSet::default(), ty });
+                                (
+                                    used_id,
+                                    LocalIdDef::Value(Value::ControlRegionInput {
+                                        region: current_block.region,
+                                        input_idx,
+                                    }),
+                                )
+                            },
+                        ),
+                    );
+                }
+
+                // HACK(eddyb) shadowing the closure with the same name, could
+                // it be defined here to make use of `current_block`?
+                let lookup_global_or_local_id_for_data_or_control_inst_input =
+                    |id| match current_block.shadowed_local_id_defs.get(&id) {
+                        Some(&shadowed) => Ok(shadowed),
+                        None => lookup_global_or_local_id_for_data_or_control_inst_input(id),
+                    };
 
                 if is_last_in_block {
                     if opcode.def().category != spec::InstructionCategory::ControlFlow
@@ -1134,7 +1326,9 @@ impl Module {
 
                         let target_block_details = &block_details[&target_block];
 
-                        if target_block_details.phi_count == 0 {
+                        if target_block_details.phi_count == 0
+                            && target_block_details.cfgssa_inter_block_uses.is_empty()
+                        {
                             return Ok(());
                         }
 
@@ -1146,9 +1340,9 @@ impl Module {
 
                         let inputs = (0..target_block_details.phi_count).map(|target_phi_idx| {
                             let phi_key = PhiKey {
-                                source_block_id: current_block_details.label_id,
+                                source_block_id: current_block.details.label_id,
                                 target_block_id: target_block_details.label_id,
-                                target_phi_idx,
+                                target_phi_idx: target_phi_idx.try_into().unwrap(),
                             };
                             let phi_value_ids =
                                 phi_to_values.swap_remove(&phi_key).unwrap_or_default();
@@ -1165,6 +1359,16 @@ impl Module {
                                 ))),
                             }
                         });
+                        let inputs = inputs.chain(
+                            target_block_details.cfgssa_inter_block_uses.keys().map(|&used_id| {
+                                match lookup_global_or_local_id_for_data_or_control_inst_input(
+                                    used_id,
+                                )? {
+                                    LocalIdDef::Value(v) => Ok(v),
+                                    LocalIdDef::BlockLabel(_) => unreachable!(),
+                                }
+                            }),
+                        );
                         target_inputs_entry.insert(inputs.collect::<Result<_, _>>()?);
 
                         Ok(())
@@ -1222,7 +1426,7 @@ impl Module {
                         .unwrap()
                         .control_inst_on_exit_from
                         .insert(
-                            current_block_control_region,
+                            current_block.region,
                             cfg::ControlInst { attrs, kind, inputs, targets, target_inputs },
                         );
                 } else if opcode == wk.OpPhi {
@@ -1265,7 +1469,7 @@ impl Module {
                             .as_mut()
                             .unwrap()
                             .loop_merge_to_loop_header
-                            .insert(loop_merge_target, current_block_control_region);
+                            .insert(loop_merge_target, current_block.region);
                     }
 
                     // HACK(eddyb) merges are mostly ignored - this may be lossy,
