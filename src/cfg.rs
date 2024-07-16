@@ -130,6 +130,7 @@ mod sealed {
         }
     }
 }
+use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use sealed::IncomingEdgeCount;
 
 struct TraversalState<PreVisit: FnMut(ControlRegion), PostVisit: FnMut(ControlRegion)> {
@@ -481,11 +482,82 @@ pub struct Structurizer<'a> {
     // FIXME(eddyb) use `EntityOrientedDenseMap` (which lacks iteration by design).
     structurize_region_state: FxIndexMap<ControlRegion, StructurizeRegionState>,
 
-    /// Accumulated replacements (caused by `target_inputs`s), i.e.:
-    /// `Value::ControlRegionInput { region, input_idx }` must be replaced
-    /// with `control_region_input_replacements[region][input_idx]`, as
-    /// the original `region` cannot have be directly reused.
-    control_region_input_replacements: EntityOrientedDenseMap<ControlRegion, SmallVec<[Value; 2]>>,
+    /// Accumulated rewrites (caused by e.g. `target_inputs`s, but not only),
+    /// i.e.: `Value::ControlRegionInput { region, input_idx }` must be
+    /// rewritten based on `control_region_input_rewrites[region]`, as either
+    /// the original `region` wasn't reused, or its inputs were renumbered.
+    control_region_input_rewrites:
+        EntityOrientedDenseMap<ControlRegion, ControlRegionInputRewrites>,
+}
+
+/// How all `Value::ControlRegionInput { region, input_idx }` for a `region`
+/// must be rewritten (see also `control_region_input_rewrites` docs).
+enum ControlRegionInputRewrites {
+    /// Complete replacement with another value (which can take any form), as
+    /// `region` wasn't kept in its original form in the final structured IR.
+    ///
+    /// **Note**: such replacement can be chained, i.e. a replacement value can
+    /// be `Value::ControlRegionInput { region: other_region, .. }`, and then
+    /// `other_region` itself may have its inputs written.
+    ReplaceWith(SmallVec<[Value; 2]>),
+
+    /// The value may remain an input of the same `region`, only changing its
+    /// `input_idx` (e.g. if indices need compaction after removing some inputs),
+    /// or get replaced anyway, depending on the `Result` for `input_idx`.
+    ///
+    /// **Note**: renumbering can only be the last rewrite step of a value,
+    /// as `region` must've been chosen to be kept in the final structured IR,
+    /// but the `Err` cases are transitive just like `ReplaceWith`.
+    //
+    // FIXME(eddyb) this is a bit silly, maybe try to rely more on hermeticity
+    // to get rid of this?
+    RenumberOrReplaceWith(SmallVec<[Result<u32, Value>; 2]>),
+}
+
+impl ControlRegionInputRewrites {
+    // HACK(eddyb) this is here because it depends on a field of `Structurizer`
+    // and borrowing issues ensue if it's made a method of `Structurizer`.
+    fn rewrite_all(
+        rewrites: &EntityOrientedDenseMap<ControlRegion, Self>,
+    ) -> impl crate::transform::Transformer + '_ {
+        // FIXME(eddyb) maybe this should be provided by `transform`.
+        use crate::transform::*;
+        struct ReplaceValueWith<F>(F);
+        impl<F: Fn(Value) -> Option<Value>> Transformer for ReplaceValueWith<F> {
+            fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
+                self.0(*v).map_or(Transformed::Unchanged, Transformed::Changed)
+            }
+        }
+
+        ReplaceValueWith(move |v| {
+            let mut new_v = v;
+            while let Value::ControlRegionInput { region, input_idx } = new_v {
+                match rewrites.get(region) {
+                    // NOTE(eddyb) this needs to be able to apply multiple replacements,
+                    // due to the input potentially having redundantly chained `OpPhi`s.
+                    //
+                    // FIXME(eddyb) union-find-style "path compression" could record the
+                    // final value inside `rewrites` while replacements are being made,
+                    // to avoid going through a chain more than once (and some of these
+                    // replacements could also be applied early).
+                    Some(ControlRegionInputRewrites::ReplaceWith(replacements)) => {
+                        new_v = replacements[input_idx as usize];
+                    }
+                    Some(ControlRegionInputRewrites::RenumberOrReplaceWith(
+                        renumbering_and_replacements,
+                    )) => match renumbering_and_replacements[input_idx as usize] {
+                        Ok(new_idx) => {
+                            new_v = Value::ControlRegionInput { region, input_idx: new_idx };
+                            break;
+                        }
+                        Err(replacement) => new_v = replacement,
+                    },
+                    None => break,
+                }
+            }
+            (v != new_v).then_some(new_v)
+        })
+    }
 }
 
 /// The state of one `.structurize_region(region)` invocation, and its result.
@@ -735,6 +807,22 @@ impl DeferredEdgeBundleSet {
         }
     }
 
+    fn iter_targets_with_edge_bundle_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (DeferredTarget, &mut IncomingEdgeBundle<()>)> {
+        match self {
+            DeferredEdgeBundleSet::Unreachable => Either::Left(None.into_iter()),
+            DeferredEdgeBundleSet::Always { target, edge_bundle } => {
+                Either::Left(Some((*target, edge_bundle)).into_iter())
+            }
+            DeferredEdgeBundleSet::Choice { target_to_deferred } => Either::Right(
+                target_to_deferred
+                    .iter_mut()
+                    .map(|(&target, deferred)| (target, &mut deferred.edge_bundle)),
+            ),
+        }
+    }
+
     // HACK(eddyb) this only exists because of `DeferredEdgeBundleSet`'s lossy
     // representation wrt conditions, so removal from a `DeferredEdgeBundleSet`
     // cannot be used for e.g. `Select` iterating over per-case deferreds.
@@ -975,7 +1063,7 @@ impl<'a> Structurizer<'a> {
             incoming_edge_counts_including_loop_exits,
 
             structurize_region_state: FxIndexMap::default(),
-            control_region_input_replacements: EntityOrientedDenseMap::new(),
+            control_region_input_rewrites: EntityOrientedDenseMap::new(),
         }
     }
 
@@ -1070,39 +1158,15 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        self.apply_value_replacements();
-    }
-
-    /// The last step of structurization is processing bulk replacements
-    /// collected while structurizing (like `control_region_input_replacements`).
-    fn apply_value_replacements(self) {
-        // FIXME(eddyb) maybe this should be provided by `transform`.
-        use crate::transform::*;
-        struct ReplaceValueWith<F>(F);
-        impl<F: Fn(Value) -> Option<Value>> Transformer for ReplaceValueWith<F> {
-            fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
-                self.0(*v).map_or(Transformed::Unchanged, Transformed::Changed)
-            }
-        }
-
-        self.func_def_body.inner_in_place_transform_with(&mut ReplaceValueWith(|v| {
-            // NOTE(eddyb) this needs to be able to apply multiple replacements,
-            // due to the input potentially having redundantly chained `OpPhi`s.
-            //
-            // FIXME(eddyb) union-find-style "path compression" could record the
-            // final value inside `self.control_region_input_replacements` while
-            // replacements are being made, to avoid going through a chain more
-            // than once (and some of these replacements could be applied early).
-            let mut new_v = v;
-            while let Value::ControlRegionInput { region, input_idx } = new_v {
-                if let Some(replacements) = self.control_region_input_replacements.get(region) {
-                    new_v = replacements[input_idx as usize];
-                } else {
-                    break;
-                }
-            }
-            (v != new_v).then_some(new_v)
-        }));
+        // The last step of structurization is applying rewrites accumulated
+        // while structurizing (i.e. `control_region_input_rewrites`).
+        //
+        // FIXME(eddyb) obsolete this by fully taking advantage of hermeticity,
+        // and only replacing `Value::ControlRegionInput { region, .. }` within
+        // `region`'s children, shallowly, whenever `region` gets claimed.
+        self.func_def_body.inner_in_place_transform_with(
+            &mut ControlRegionInputRewrites::rewrite_all(&self.control_region_input_rewrites),
+        );
     }
 
     fn try_claim_edge_bundle(
@@ -1175,13 +1239,10 @@ impl<'a> Structurizer<'a> {
             // the output side yet (i.e. they still have SSA-like semantics),
             // it gets wrapped in a `ControlRegion`, which can be as hermetic as
             // the loop body itself was originally.
-            let wrapper_region = self.func_def_body.control_regions.define(
-                self.cx,
-                ControlRegionDef {
-                    inputs: self.func_def_body.at(body).def().inputs.clone(),
-                    ..Default::default()
-                },
-            );
+            // NOTE(eddyb) both input declarations and the child `Loop` node are
+            // added later down below, after the `Loop` node is created.
+            let wrapper_region =
+                self.func_def_body.control_regions.define(self.cx, ControlRegionDef::default());
 
             // Any loop body region inputs, which must receive values from both
             // the loop entry and the backedge, become explicit "loop state",
@@ -1192,12 +1253,54 @@ impl<'a> Structurizer<'a> {
             // and have the loop state be output from the whole node itself,
             // for any outside uses of values defined within the loop body.
             let body_def = self.func_def_body.at_mut(body).def();
-            let initial_inputs =
-                (0..edge_bundle.target_inputs.len()).map(|input_idx| Value::ControlRegionInput {
-                    region: wrapper_region,
-                    input_idx: input_idx.try_into().unwrap(),
-                });
-            body_def.outputs = backedge.target_inputs;
+            let original_input_decls = mem::take(&mut body_def.inputs);
+            assert!(body_def.outputs.is_empty());
+
+            // HACK(eddyb) some dataflow through the loop body is redundant,
+            // and can be lifted out of it, but the worst part is that applying
+            // the replacement requires leaving alone all the non-redundant
+            // `body` region inputs at the same time, and it's not really
+            // feasible to move `body`'s children into a new region without
+            // wasting it completely (i.e. can't swap with `wrapper_region`).
+            let mut initial_inputs = SmallVec::<[_; 2]>::new();
+            let body_input_rewrites = ControlRegionInputRewrites::RenumberOrReplaceWith(
+                backedge
+                    .target_inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(original_idx, mut backedge_value)| {
+                        ControlRegionInputRewrites::rewrite_all(
+                            &self.control_region_input_rewrites,
+                        )
+                        .transform_value_use(&backedge_value)
+                        .apply_to(&mut backedge_value);
+
+                        let original_idx = u32::try_from(original_idx).unwrap();
+                        if backedge_value
+                            == (Value::ControlRegionInput { region: body, input_idx: original_idx })
+                        {
+                            // FIXME(eddyb) does this have to be general purpose,
+                            // or could this be handled as `None` with a single
+                            // `wrapper_region` per `ControlRegionInputRewrites`?
+                            Err(Value::ControlRegionInput {
+                                region: wrapper_region,
+                                input_idx: original_idx,
+                            })
+                        } else {
+                            let renumbered_idx = u32::try_from(body_def.inputs.len()).unwrap();
+                            initial_inputs.push(Value::ControlRegionInput {
+                                region: wrapper_region,
+                                input_idx: original_idx,
+                            });
+                            body_def.inputs.push(original_input_decls[original_idx as usize]);
+                            body_def.outputs.push(backedge_value);
+                            Ok(renumbered_idx)
+                        }
+                    })
+                    .collect(),
+            );
+            self.control_region_input_rewrites.insert(body, body_input_rewrites);
+
             assert_eq!(initial_inputs.len(), body_def.inputs.len());
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
 
@@ -1205,17 +1308,15 @@ impl<'a> Structurizer<'a> {
             let loop_node = self.func_def_body.control_nodes.define(
                 self.cx,
                 ControlNodeDef {
-                    kind: ControlNodeKind::Loop {
-                        initial_inputs: initial_inputs.collect(),
-                        body,
-                        repeat_condition,
-                    },
+                    kind: ControlNodeKind::Loop { initial_inputs, body, repeat_condition },
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
             );
 
-            self.func_def_body.control_regions[wrapper_region]
+            let wrapper_region_def = &mut self.func_def_body.control_regions[wrapper_region];
+            wrapper_region_def.inputs = original_input_decls;
+            wrapper_region_def
                 .children
                 .insert_last(loop_node, &mut self.func_def_body.control_nodes);
 
@@ -1490,12 +1591,14 @@ impl<'a> Structurizer<'a> {
     /// Append to `parent_region` a new `Select` [`ControlNode`] built from
     /// partially structured `cases`, merging all of their `deferred_edges`
     /// together into a combined `DeferredEdgeBundleSet` (which gets returned).
+    //
+    // FIXME(eddyb) handle `unreachable` cases losslessly.
     fn structurize_select_into(
         &mut self,
         parent_region: ControlRegion,
         kind: SelectionKind,
         scrutinee: Value,
-        cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
+        mut cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
     ) -> DeferredEdgeBundleSet {
         // `Select` isn't actually needed unless there's at least two `cases`.
         if cases.len() <= 1 {
@@ -1504,10 +1607,51 @@ impl<'a> Structurizer<'a> {
             });
         }
 
-        // Gather the full set of deferred edges (and returns), along with the
-        // necessary information for the `Select`'s `ControlNodeOutputDecl`s.
-        let mut deferred_edges_to_input_count_and_total_edge_count = FxIndexMap::default();
-        let mut deferred_return_types = None;
+        // Prepare all cases, ensuring they all have backing `ControlRegion`s,
+        // and define the `Select` node early (for `Value::ControlNodeOutput`s).
+        //
+        // FIXME(eddyb) some cases may be `unreachable`, and that's erased here.
+        // FIXME(eddyb) don't force `select_node` to be materialized, and therefore
+        // `cases` to exist, until they are needed for plumbing dataflow.
+        let select_node = {
+            let cases = cases
+                .iter()
+                .map(|case| {
+                    let case_region = match case {
+                        &Ok(ClaimedRegion { structured_body, .. }) => structured_body,
+                        Err(_) => self
+                            .func_def_body
+                            .control_regions
+                            .define(self.cx, ControlRegionDef::default()),
+                    };
+
+                    // FIXME(eddyb) should these be asserts that it's already empty?
+                    let case_region_def = self.func_def_body.at_mut(case_region).def();
+                    case_region_def.outputs.clear();
+                    case_region
+                })
+                .collect();
+            self.func_def_body.control_nodes.define(
+                self.cx,
+                ControlNodeDef {
+                    kind: ControlNodeKind::Select { kind, scrutinee, cases },
+                    outputs: [].into_iter().collect(),
+                }
+                .into(),
+            )
+        };
+        let case_region_by_idx =
+            |this: &Self, case_idx: usize| match &this.func_def_body.at(select_node).def().kind {
+                ControlNodeKind::Select { cases, .. } => cases[case_idx],
+                _ => unreachable!(),
+            };
+
+        // Gather the full set of deferred edges (and returns).
+        struct DeferredTargetSummary {
+            input_count: usize,
+            total_edge_count: IncomingEdgeCount,
+        }
+        let mut deferred_targets = FxIndexMap::default();
         for case in &cases {
             let case_deferred_edges = match case {
                 Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => deferred_edges,
@@ -1515,175 +1659,207 @@ impl<'a> Structurizer<'a> {
             for (target, edge_bundle) in case_deferred_edges.iter_targets_with_edge_bundle() {
                 let input_count = edge_bundle.target_inputs.len();
 
-                let (old_input_count, accumulated_edge_count) =
-                    deferred_edges_to_input_count_and_total_edge_count
-                        .entry(target)
-                        .or_insert((input_count, IncomingEdgeCount::default()));
-                assert_eq!(*old_input_count, input_count);
-                *accumulated_edge_count += edge_bundle.accumulated_count;
-
-                if target == DeferredTarget::Return && deferred_return_types.is_none() {
-                    // HACK(eddyb) because there's no `FuncDecl` available, take the
-                    // types from the returned values and hope they match.
-                    deferred_return_types = Some(
-                        edge_bundle
-                            .target_inputs
-                            .iter()
-                            .map(|&v| self.func_def_body.at(v).type_of(self.cx)),
-                    );
-                }
+                let summary = deferred_targets.entry(target).or_insert(DeferredTargetSummary {
+                    input_count,
+                    total_edge_count: IncomingEdgeCount::default(),
+                });
+                assert_eq!(summary.input_count, input_count);
+                summary.total_edge_count += edge_bundle.accumulated_count;
             }
         }
 
-        // The `Select` outputs are the concatenation of `target_inputs`, for
-        // each unique `deferred_edges` target.
-        //
-        // FIXME(eddyb) this `struct` only really exists for readability.
-        struct Deferred {
-            target: DeferredTarget,
-            target_input_count: usize,
-
-            /// Sum of `accumulated_count` for this `target` across all `cases`.
-            total_edge_count: IncomingEdgeCount,
-        }
-        let deferreds = || {
-            deferred_edges_to_input_count_and_total_edge_count.iter().map(
-                |(&target, &(target_input_count, total_edge_count))| Deferred {
-                    target,
-                    target_input_count,
-                    total_edge_count,
-                },
-            )
-        };
-        let mut output_decls: SmallVec<[_; 2]> =
-            SmallVec::with_capacity(deferreds().map(|deferred| deferred.target_input_count).sum());
-        for deferred in deferreds() {
-            let target_input_types = match deferred.target {
-                DeferredTarget::Region(target) => {
-                    Either::Left(self.func_def_body.at(target).def().inputs.iter().map(|i| i.ty))
+        // FIXME(eddyb) `control_region_input_rewrites` mappings, generated
+        // for every `ClaimedRegion` that has been merged into a larger region,
+        // only get applied after structurization fully completes, but here it's
+        // very useful to have the fully resolved values across all `cases`'
+        // incoming/outgoing edges (note, however, that within outgoing edges,
+        // i.e. `case_deferred_edges`' `target_inputs`, `Value::ControlRegionInput`
+        // are not resolved using the contents of `case_structured_body_inputs`,
+        // which is kept hermetic until just before `structurize_select` returns).
+        for case in &mut cases {
+            let (case_structured_body_inputs, case_deferred_edges) = match case {
+                Ok(ClaimedRegion { structured_body_inputs, deferred_edges, .. }) => {
+                    (&mut structured_body_inputs[..], deferred_edges)
                 }
-                DeferredTarget::Return => Either::Right(deferred_return_types.take().unwrap()),
+                Err(deferred_edges) => (&mut [][..], deferred_edges),
             };
-            assert_eq!(target_input_types.len(), deferred.target_input_count);
+            let all_values = case_structured_body_inputs.iter_mut().chain(
+                case_deferred_edges
+                    .iter_targets_with_edge_bundle_mut()
+                    .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs),
+            );
+            for v in all_values {
+                ControlRegionInputRewrites::rewrite_all(&self.control_region_input_rewrites)
+                    .transform_value_use(v)
+                    .apply_to(v);
+            }
+        }
 
-            output_decls.extend(
-                target_input_types
-                    .map(|ty| ControlNodeOutputDecl { attrs: AttrSet::default(), ty }),
+        // Merge all `deferred_edges` by plumbing their per-case `target_input`s
+        // (into per-case region outputs, and therefore `select_node` outputs)
+        // out of all cases that can reach them, with undef constants used to
+        // fill any gaps (i.e. for the targets not reached through each case),
+        // while deferred conditions are collected separately (for `LazyCond`).
+        let deferred_edges = deferred_targets.into_iter().map(|(target, target_summary)| {
+            let DeferredTargetSummary { input_count, total_edge_count } = target_summary;
+
+            let per_case_deferred: SmallVec<[Option<DeferredEdgeBundle<()>>; 8]> = cases
+                .iter_mut()
+                .map(|case| match case {
+                    Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => {
+                        deferred_edges.steal_deferred_by_target_without_removal(target)
+                    }
+                })
+                .collect();
+
+            let target_inputs = (0..input_count)
+                .map(|target_input_idx| {
+                    let per_case_target_input = per_case_deferred.iter().map(|per_case_deferred| {
+                        per_case_deferred.as_ref().map(
+                            |DeferredEdgeBundle { edge_bundle, .. }| {
+                                edge_bundle.target_inputs[target_input_idx]
+                            },
+                        )
+                    });
+
+                    // Avoid introducing dynamic dataflow when the same value is
+                    // used across all cases (which can reach this `target`).
+                    let unique_target_input_value = per_case_target_input
+                        .clone()
+                        .zip_eq(&cases)
+                        .filter_map(|(v, case)| Some((v?, case)))
+                        .map(|(v, case)| {
+                            // If possible, resolve `v` to a `Value` valid in
+                            // `parent_region` (where `select_node` will go).
+                            match case {
+                                // `case`'s `structured_body` effectively "wraps"
+                                // its `deferred_edges` (where `v` came from),
+                                // so values from `parent_region` can only be
+                                // hermetically used via `structured_body` inputs.
+                                Ok(ClaimedRegion {
+                                    structured_body,
+                                    structured_body_inputs,
+                                    ..
+                                }) => match v {
+                                    Value::Const(_) => Ok(v),
+                                    Value::ControlRegionInput { region, input_idx }
+                                        if region == *structured_body =>
+                                    {
+                                        Ok(structured_body_inputs[input_idx as usize])
+                                    }
+                                    _ => Err(()),
+                                },
+
+                                // `case` has no region of its own, so everything
+                                // it carries is already from within `parent_region`.
+                                Err(_) => Ok(v),
+                            }
+                        })
+                        .dedup()
+                        .exactly_one();
+                    if let Ok(Ok(v)) = unique_target_input_value {
+                        return v;
+                    }
+
+                    let ty = match target {
+                        DeferredTarget::Region(target) => {
+                            self.func_def_body.at(target).def().inputs[target_input_idx].ty
+                        }
+                        // HACK(eddyb) in the absence of `FuncDecl`, infer the
+                        // type from each returned value (and require they match).
+                        DeferredTarget::Return => per_case_target_input
+                            .clone()
+                            .flatten()
+                            .map(|v| self.func_def_body.at(v).type_of(self.cx))
+                            .dedup()
+                            .exactly_one()
+                            .ok()
+                            .expect("mismatched `return`ed value types"),
+                    };
+
+                    let output_decls = &mut self.func_def_body.at_mut(select_node).def().outputs;
+                    let output_idx = output_decls.len();
+                    output_decls.push(ControlNodeOutputDecl { attrs: AttrSet::default(), ty });
+                    for (case_idx, v) in per_case_target_input.enumerate() {
+                        let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
+                        let case_region = case_region_by_idx(self, case_idx);
+                        let outputs = &mut self.func_def_body.at_mut(case_region).def().outputs;
+                        assert_eq!(outputs.len(), output_idx);
+                        outputs.push(v);
+                    }
+                    Value::ControlNodeOutput {
+                        control_node: select_node,
+                        output_idx: output_idx.try_into().unwrap(),
+                    }
+                })
+                .collect();
+
+            // Simplify `LazyCond`s eagerly, to reduce costs later on.
+            //
+            // FIXME(eddyb) take into account some cases being `unreachable`.
+            // FIXME(eddyb) is "`LazyCond::True` for all cases" redundant with
+            // the fact that `DeferredEdgeBundleSet` doesn't store a condition
+            // for the single-target case?
+            let condition = if per_case_deferred
+                .iter()
+                .all(|d| matches!(d, Some(DeferredEdgeBundle { condition: LazyCond::True, .. })))
+            {
+                LazyCond::True
+            } else {
+                LazyCond::MergeSelect {
+                    control_node: select_node,
+                    per_case_conds: per_case_deferred
+                        .into_iter()
+                        .map(|per_case_deferred| match per_case_deferred {
+                            Some(DeferredEdgeBundle { condition, .. }) => condition,
+                            None => LazyCond::False,
+                        })
+                        .collect(),
+                }
+            };
+
+            DeferredEdgeBundle {
+                condition,
+                edge_bundle: IncomingEdgeBundle {
+                    target,
+                    accumulated_count: total_edge_count,
+                    target_inputs,
+                },
+            }
+        });
+        let deferred_edges = deferred_edges.collect();
+
+        // Final sanity check for cases' regions being coherent, but also where
+        // per-case `region_inputs` become `control_region_input_rewrites`.
+        //
+        // FIXME(eddyb) don't replace `Value::ControlRegionInput { region, .. }`
+        // with `region_inputs` when the `region` ends up a `ControlNode` child,
+        // but instead make all `ControlRegion`s entirely hermetic wrt inputs.
+        for (case_idx, case) in cases.into_iter().enumerate() {
+            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
+                if !structured_body_inputs.is_empty() {
+                    self.control_region_input_rewrites.insert(
+                        structured_body,
+                        ControlRegionInputRewrites::ReplaceWith(structured_body_inputs),
+                    );
+                    self.func_def_body.at_mut(structured_body).def().inputs.clear();
+                }
+            }
+
+            let case_region = case_region_by_idx(self, case_idx);
+
+            // All deferrals must have been converted into outputs above.
+            assert_eq!(
+                self.func_def_body.at(case_region).def().outputs.len(),
+                self.func_def_body.at(select_node).def().outputs.len(),
             );
         }
-
-        // Convert the cases into `ControlRegion`s, each outputting the full set
-        // of values described by `outputs` (with undef filling in any gaps),
-        // while deferred conditions are collected separately (for `LazyCond`).
-        let mut deferred_per_case_conditions: SmallVec<[_; 8]> =
-            deferreds().map(|_| Vec::with_capacity(cases.len())).collect();
-        let cases = cases
-            .into_iter()
-            .enumerate()
-            .map(|(case_idx, case)| {
-                let (case_region, mut deferred_edges) = match case {
-                    Ok(ClaimedRegion {
-                        structured_body,
-                        structured_body_inputs,
-                        deferred_edges,
-                    }) => {
-                        if !structured_body_inputs.is_empty() {
-                            self.control_region_input_replacements
-                                .insert(structured_body, structured_body_inputs);
-                        }
-                        (structured_body, deferred_edges)
-                    }
-                    Err(deferred_edges) => (
-                        self.func_def_body
-                            .control_regions
-                            .define(self.cx, ControlRegionDef::default()),
-                        deferred_edges,
-                    ),
-                };
-
-                let mut outputs = SmallVec::with_capacity(output_decls.len());
-                for (deferred, per_case_conditions) in
-                    deferreds().zip_eq(&mut deferred_per_case_conditions)
-                {
-                    let (edge_condition, values_or_count) = match deferred_edges
-                        .steal_deferred_by_target_without_removal(deferred.target)
-                    {
-                        Some(DeferredEdgeBundle { condition, edge_bundle }) => {
-                            (Some(condition), Ok(edge_bundle.target_inputs))
-                        }
-
-                        None => (Some(LazyCond::False), Err(deferred.target_input_count)),
-                    };
-
-                    if let Some(edge_condition) = edge_condition {
-                        assert_eq!(per_case_conditions.len(), case_idx);
-                        per_case_conditions.push(edge_condition);
-                    }
-
-                    match values_or_count {
-                        Ok(values) => outputs.extend(values),
-                        Err(missing_value_count) => {
-                            let decls_for_missing_values =
-                                &output_decls[outputs.len()..][..missing_value_count];
-                            outputs.extend(
-                                decls_for_missing_values
-                                    .iter()
-                                    .map(|output| Value::Const(self.const_undef(output.ty))),
-                            );
-                        }
-                    }
-                }
-
-                // All deferrals must have been converted into outputs above.
-                assert_eq!(outputs.len(), output_decls.len());
-
-                self.func_def_body.at_mut(case_region).def().inputs.clear();
-                self.func_def_body.at_mut(case_region).def().outputs = outputs;
-                case_region
-            })
-            .collect();
-
-        let kind = ControlNodeKind::Select { kind, scrutinee, cases };
-        let select_node = self
-            .func_def_body
-            .control_nodes
-            .define(self.cx, ControlNodeDef { kind, outputs: output_decls }.into());
-
-        // Build `deferred_edges` for the whole `Select`, pointing to
-        // the outputs of the `select_node` `ControlNode` for all `Value`s.
-        let mut outputs = (0..)
-            .map(|output_idx| Value::ControlNodeOutput { control_node: select_node, output_idx });
-        let deferreds = deferreds().zip_eq(deferred_per_case_conditions).map(
-            |(deferred, per_case_conditions)| {
-                let target_inputs = outputs.by_ref().take(deferred.target_input_count).collect();
-
-                // Simplify `LazyCond`s eagerly, to reduce costs later on.
-                let condition =
-                    if per_case_conditions.iter().all(|cond| matches!(cond, LazyCond::True)) {
-                        LazyCond::True
-                    } else {
-                        LazyCond::MergeSelect {
-                            control_node: select_node,
-                            per_case_conds: per_case_conditions,
-                        }
-                    };
-
-                DeferredEdgeBundle {
-                    condition,
-                    edge_bundle: IncomingEdgeBundle {
-                        target: deferred.target,
-                        accumulated_count: deferred.total_edge_count,
-                        target_inputs,
-                    },
-                }
-            },
-        );
 
         self.func_def_body.control_regions[parent_region]
             .children
             .insert_last(select_node, &mut self.func_def_body.control_nodes);
 
-        deferreds.collect()
+        deferred_edges
     }
 
     // FIXME(eddyb) this should try to handle as many `LazyCond` as are available,
@@ -1758,8 +1934,10 @@ impl<'a> Structurizer<'a> {
         match maybe_claimed_region {
             Ok(ClaimedRegion { structured_body, structured_body_inputs, deferred_edges }) => {
                 if !structured_body_inputs.is_empty() {
-                    self.control_region_input_replacements
-                        .insert(structured_body, structured_body_inputs);
+                    self.control_region_input_rewrites.insert(
+                        structured_body,
+                        ControlRegionInputRewrites::ReplaceWith(structured_body_inputs),
+                    );
                 }
                 let new_children =
                     mem::take(&mut self.func_def_body.at_mut(structured_body).def().children);
