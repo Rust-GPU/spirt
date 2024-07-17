@@ -228,19 +228,52 @@ struct LoopFinder<'a> {
     scc_state: EntityOrientedDenseMap<ControlRegion, SccState>,
 }
 
-// FIXME(eddyb) make `Option<Option<SccStackIdx>>` the same size somehow.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SccStackIdx(u32);
 
 #[derive(PartialEq, Eq)]
 enum SccState {
     /// CFG node has been reached and ended up somewhere on the `scc_stack`,
-    /// where it will remain after the SCC it's part of will be completed.
+    /// where it will remain until the SCC it's part of will be completed.
     Pending(SccStackIdx),
 
     /// CFG node had been reached once, but is no longer on the `scc_stack`, its
     /// parent SCC having been completed (or it wasn't in an SCC to begin with).
-    Complete,
+    Complete(EventualCfgExits),
+}
+
+/// Summary of all the ways in which a CFG node may eventually leave the CFG.
+///
+// HACK(eddyb) a loop can reach a CFG subgraph that happens to always "diverge"
+// (e.g. ending in `unreachable`, `ExitInvocation`, or even infinite loops,
+// though those have other issues) and strictly speaking that would always be
+// an edge leaving the SCC of the loop (as it can't reach a backedge), but it
+// still shouldn't be treated as an exit because it doesn't reconverge to the
+// rest of the function, i.e. it can't reach any `return`s, which is what this
+// tracks in order to later make a more accurate decision wrt loop exits.
+//
+// NOTE(eddyb) only in the case where a loop *also* has non-"diverging" exits,
+// do the "diverging" ones not get treated as exits, as the presence of both
+// disambiguates `break`s from naturally "diverging" sections of the loop body
+// (at least for CFGs built from languages without labelled `break` or `goto`,
+// but even then it would be pretty convoluted to set up `break` to diverge,
+// while `break some_outer_label` to reconverge to the rest of the function).
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+struct EventualCfgExits {
+    // FIXME(eddyb) do the other situations need their own flags here?
+    may_return_from_func: bool,
+}
+
+impl std::ops::BitOr for EventualCfgExits {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self { may_return_from_func: self.may_return_from_func | other.may_return_from_func }
+    }
+}
+impl std::ops::BitOrAssign for EventualCfgExits {
+    fn bitor_assign(&mut self, other: Self) {
+        *self = *self | other;
+    }
 }
 
 impl<'a> LoopFinder<'a> {
@@ -261,12 +294,25 @@ impl<'a> LoopFinder<'a> {
     ///
     /// Here we track stack indices (as the stack order is the traversal order),
     /// and distinguish the acyclic case to avoid treating most nodes as self-loops.
-    fn find_earliest_scc_root_of(&mut self, node: ControlRegion) -> Option<SccStackIdx> {
+    //
+    // FIXME(eddyb) name of the function is a bit clunky wrt its return type.
+    fn find_earliest_scc_root_of(
+        &mut self,
+        node: ControlRegion,
+    ) -> (Option<SccStackIdx>, EventualCfgExits) {
         let state_entry = self.scc_state.entry(node);
         if let Some(state) = &state_entry {
             return match *state {
-                SccState::Pending(scc_stack_idx) => Some(scc_stack_idx),
-                SccState::Complete => None,
+                SccState::Pending(scc_stack_idx) => {
+                    // HACK(eddyb) this means that `EventualCfgExits`s will be
+                    // inconsistently observed across the `Pending` nodes of a
+                    // loop body, but that is sound as it cannot feed into any
+                    // `Complete` state until the loop header itself is complete,
+                    // and the monotonic nature of `EventualCfgExits` means that
+                    // the loop header will still get to see the complete picture.
+                    (Some(scc_stack_idx), EventualCfgExits::default())
+                }
+                SccState::Complete(eventual_cfg_exits) => (None, eventual_cfg_exits),
             };
         }
         let scc_stack_idx = SccStackIdx(self.scc_stack.len().try_into().unwrap());
@@ -279,10 +325,20 @@ impl<'a> LoopFinder<'a> {
             .get(node)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
+        let mut eventual_cfg_exits = EventualCfgExits::default();
+
+        if let ControlInstKind::Return = control_inst.kind {
+            eventual_cfg_exits.may_return_from_func = true;
+        }
+
         let earliest_scc_root = control_inst
             .targets
             .iter()
             .flat_map(|&target| {
+                let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
+                    self.find_earliest_scc_root_of(target);
+                eventual_cfg_exits |= eventual_cfg_exits_of_target;
+
                 // HACK(eddyb) if one of the edges is already known to be a loop exit
                 // (from `OpLoopMerge` specifically), treat it almost like a backedge,
                 // but with the additional requirement that the loop header is already
@@ -295,9 +351,7 @@ impl<'a> LoopFinder<'a> {
                         }
                     });
 
-                self.find_earliest_scc_root_of(target)
-                    .into_iter()
-                    .chain(root_candidate_from_loop_merge)
+                earliest_scc_root_of_target.into_iter().chain(root_candidate_from_loop_merge)
             })
             .min();
 
@@ -307,21 +361,36 @@ impl<'a> LoopFinder<'a> {
 
             // It's now possible to find all the loop exits: they're all the
             // edges from nodes of this SCC (loop) to nodes not in the SCC.
-            let target_in_scc = |target| match self.scc_state.get(target) {
-                Some(&SccState::Pending(i)) => i >= scc_stack_idx,
-                _ => false,
+            let target_is_exit = |target| {
+                match self.scc_state[target] {
+                    SccState::Pending(i) => {
+                        assert!(i >= scc_stack_idx);
+                        false
+                    }
+                    SccState::Complete(eventual_cfg_exits_of_target) => {
+                        let EventualCfgExits { may_return_from_func: loop_may_reconverge } =
+                            eventual_cfg_exits;
+                        let EventualCfgExits { may_return_from_func: target_may_reconverge } =
+                            eventual_cfg_exits_of_target;
+
+                        // HACK(eddyb) see comment on `EventualCfgExits` for why
+                        // edges leaving the SCC aren't treated as loop exits
+                        // when they're "more divergent" than the loop itself,
+                        // i.e. if any edges leaving the SCC can reconverge,
+                        // (and therefore the loop as a whole can reconverge)
+                        // only those edges are kept as loop exits.
+                        target_may_reconverge == loop_may_reconverge
+                    }
+                }
             };
             self.loop_header_to_exit_targets.insert(
                 node,
                 self.scc_stack[scc_start..]
                     .iter()
                     .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node]
-                            .targets
-                            .iter()
-                            .copied()
-                            .filter(|&target| !target_in_scc(target))
+                        self.cfg.control_inst_on_exit_from[scc_node].targets.iter().copied()
                     })
+                    .filter(|&target| target_is_exit(target))
                     .collect(),
             );
 
@@ -331,7 +400,7 @@ impl<'a> LoopFinder<'a> {
             // loop header itself, are already marked as complete, meaning that
             // all exits and backedges will be ignored, and the recursion will
             // only find more SCCs within the loop body (i.e. nested loops).
-            self.scc_state[node] = SccState::Complete;
+            self.scc_state[node] = SccState::Complete(eventual_cfg_exits);
             let loop_body_range = scc_start + 1..self.scc_stack.len();
             for &scc_node in &self.scc_stack[loop_body_range.clone()] {
                 self.scc_state.remove(scc_node);
@@ -344,16 +413,16 @@ impl<'a> LoopFinder<'a> {
             // Remove the entire SCC from the accumulation stack all at once.
             self.scc_stack.truncate(scc_start);
 
-            return None;
+            return (None, eventual_cfg_exits);
         }
 
         // Not actually in an SCC at all, just some node outside any CFG cycles.
         if earliest_scc_root.is_none() {
             assert!(self.scc_stack.pop() == Some(node));
-            self.scc_state[node] = SccState::Complete;
+            self.scc_state[node] = SccState::Complete(eventual_cfg_exits);
         }
 
-        earliest_scc_root
+        (earliest_scc_root, eventual_cfg_exits)
     }
 }
 
