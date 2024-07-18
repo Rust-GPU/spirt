@@ -504,21 +504,20 @@ enum StructurizeRegionState {
     /// Structurization completed, and this region can now be claimed.
     Ready {
         /// If this region had backedges (targeting its start [`ControlRegion`]),
-        /// their bundle is taken from the region's [`DeferredEdgeBundleSet`],
-        /// and kept in this field instead (for simpler/faster access).
+        /// this is equal to their `accumulated_count`, for faster access.
         ///
         /// Claiming a region with backedges can combine them with the bundled
         /// edges coming into the CFG cycle from outside, and instead of failing
         /// due to the latter not being enough to claim the region on their own,
         /// actually perform loop structurization.
-        backedge: Option<DeferredEdgeBundle<()>>,
+        accumulated_backedge_count: IncomingEdgeCount,
 
         region: PartialControlRegion,
     },
 
     /// Region was claimed (by an [`IncomingEdgeBundle`], with the appropriate
-    /// total [`IncomingEdgeCount`], minus any `consumed_backedges`), and has
-    /// since likely been incorporated as part of some larger region.
+    /// total [`IncomingEdgeCount`], minus `accumulated_backedge_count`), and
+    /// must eventually be incorporated as part of some larger region.
     Claimed,
 }
 
@@ -774,21 +773,13 @@ impl<'a> Structurizer<'a> {
         let structurize_region_state =
             mem::take(&mut self.structurize_region_state).into_iter().chain([(
                 self.func_def_body.body,
-                StructurizeRegionState::Ready { region: body_region, backedge: None },
+                StructurizeRegionState::Ready {
+                    region: body_region,
+                    accumulated_backedge_count: IncomingEdgeCount::default(),
+                },
             )]);
         for (target, state) in structurize_region_state {
-            if let StructurizeRegionState::Ready { mut region, backedge } = state {
-                // Undo `backedge` extraction from deferred edges, if needed.
-                if let Some(backedge) = backedge {
-                    assert!(
-                        region
-                            .deferred_edges
-                            .target_to_deferred
-                            .insert(DeferredTarget::Region(target), backedge)
-                            .is_none()
-                    );
-                }
-
+            if let StructurizeRegionState::Ready { region, .. } = state {
                 self.repair_unclaimed_region(target, region);
             }
         }
@@ -867,19 +858,20 @@ impl<'a> Structurizer<'a> {
             self.structurize_region_from(target);
         }
 
-        let backedge = match &self.structurize_region_state[&target] {
+        let backedge_count = match self.structurize_region_state[&target] {
             // This `try_claim_edge_bundle` call is itself a backedge, and it's
             // coherent to not let any of them claim the loop itself, and only
             // allow claiming the whole loop (if successfully structurized).
-            StructurizeRegionState::InProgress => None,
+            StructurizeRegionState::InProgress => IncomingEdgeCount::default(),
 
-            StructurizeRegionState::Ready { backedge, .. } => backedge.as_ref(),
+            StructurizeRegionState::Ready { accumulated_backedge_count, .. } => {
+                accumulated_backedge_count
+            }
 
             StructurizeRegionState::Claimed => {
                 unreachable!("cfg::Structurizer::try_claim_edge_bundle: already claimed");
             }
         };
-        let backedge_count = backedge.map(|e| e.edge_bundle.accumulated_count).unwrap_or_default();
 
         if self.incoming_edge_counts_including_loop_exits[target]
             != edge_bundle.accumulated_count + backedge_count
@@ -890,19 +882,26 @@ impl<'a> Structurizer<'a> {
         let state =
             self.structurize_region_state.insert(target, StructurizeRegionState::Claimed).unwrap();
 
-        let (backedge, mut region) = match state {
+        let mut region = match state {
             StructurizeRegionState::InProgress => unreachable!(
                 "cfg::Structurizer::try_claim_edge_bundle: cyclic calls \
                  should not get this far"
             ),
 
-            StructurizeRegionState::Ready { backedge, region } => (backedge, region),
+            StructurizeRegionState::Ready { region, .. } => region,
 
             StructurizeRegionState::Claimed => {
                 // Handled above.
                 unreachable!()
             }
         };
+        let backedge = (backedge_count != IncomingEdgeCount::default()).then(|| {
+            region
+                .deferred_edges
+                .target_to_deferred
+                .swap_remove(&DeferredTarget::Region(target))
+                .unwrap()
+        });
 
         // FIXME(eddyb) remove this field in most cases.
         assert!(region.structured_body_holder == Some(target));
@@ -1246,18 +1245,21 @@ impl<'a> Structurizer<'a> {
             region = merged_region;
         }
 
-        // Try to extract (deferred) backedges (which later get turned into loops).
-        let backedge = region
+        // Cache the edge count for backedges (which later get turned into loops).
+        let accumulated_backedge_count = region
             .deferred_edges
             .target_to_deferred
-            .swap_remove(&DeferredTarget::Region(unstructured_region));
+            .get(&DeferredTarget::Region(unstructured_region))
+            .map(|d| d.edge_bundle.accumulated_count)
+            .unwrap_or_default();
 
         // FIXME(eddyb) remove this field in most cases.
         assert!(region.structured_body_holder == Some(unstructured_region));
 
-        let old_state = self
-            .structurize_region_state
-            .insert(unstructured_region, StructurizeRegionState::Ready { backedge, region });
+        let old_state = self.structurize_region_state.insert(
+            unstructured_region,
+            StructurizeRegionState::Ready { accumulated_backedge_count, region },
+        );
         if !matches!(old_state, Some(StructurizeRegionState::InProgress)) {
             unreachable!(
                 "cfg::Structurizer::structurize_region_from: \
