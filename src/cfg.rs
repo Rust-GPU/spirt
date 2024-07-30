@@ -1,5 +1,6 @@
 //! Control-flow graph (CFG) abstractions and utilities.
 
+use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
     spv, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeDef,
     ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
@@ -130,7 +131,6 @@ mod sealed {
         }
     }
 }
-use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use sealed::IncomingEdgeCount;
 
 struct TraversalState<PreVisit: FnMut(ControlRegion), PostVisit: FnMut(ControlRegion)> {
@@ -678,16 +678,26 @@ impl<T> DeferredEdgeBundle<T> {
 /// that might be needed, and then removing the unused ones, but this way we
 /// never generate unused outputs, and can potentially even optimize away some
 /// redundant dataflow (e.g. `if cond { true } else { false }` is just `cond`).
+#[derive(Clone)]
 enum LazyCond {
-    // FIXME(eddyb) remove `False` in favor of `Option<LazyCond>`?
+    // HACK(eddyb) `Undef` is used when the condition comes from e.g. a `Select`
+    // case that diverges and/or represents `unreachable`.
+    Undef,
+
     False,
     True,
-    MergeSelect {
+
+    Merge(Rc<LazyCondMerge>),
+}
+
+enum LazyCondMerge {
+    Select {
         control_node: ControlNode,
-        // FIXME(eddyb) the lowest level of this ends up with a `Vec` containing
-        // only `LazyCond::{False,True}`, and that could more easily be expressed
-        // as e.g. a bitset? (or even `SmallVec<[bool; 16]>`, tho that's silly)
-        per_case_conds: Vec<LazyCond>,
+        // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
+        // `LazyCond::{Undef,False,True}`, and that could more efficiently be
+        // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Merge`
+        // means that this is more compact than it would otherwise be.
+        per_case_conds: SmallVec<[LazyCond; 4]>,
     },
 }
 
@@ -709,7 +719,7 @@ enum DeferredTarget {
 /// that exactly one [`DeferredEdgeBundle`] condition must be `true` at any
 /// given time (the only non-trivial case, [`DeferredEdgeBundleSet::Choice`],
 /// satisfies it because it's only used for merging `Select` cases, and so
-/// all the conditions will end up using disjoint [`LazyCond::MergeSelect`]s).
+/// all the conditions will end up using disjoint [`LazyCond::Merge`]s).
 enum DeferredEdgeBundleSet {
     Unreachable,
 
@@ -1304,7 +1314,7 @@ impl<'a> Structurizer<'a> {
             assert_eq!(initial_inputs.len(), body_def.inputs.len());
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
 
-            let repeat_condition = self.materialize_lazy_cond(repeat_condition);
+            let repeat_condition = self.materialize_lazy_cond(&repeat_condition);
             let loop_node = self.func_def_body.control_nodes.define(
                 self.cx,
                 ControlNodeDef {
@@ -1398,9 +1408,35 @@ impl<'a> Structurizer<'a> {
                         accumulated_count: IncomingEdgeCount::ONE,
                         target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
                     })
-                    .map_err(|edge_bundle| DeferredEdgeBundleSet::Always {
-                        target: DeferredTarget::Region(edge_bundle.target),
-                        edge_bundle: edge_bundle.with_target(()),
+                    .map_err(|edge_bundle| {
+                        // HACK(eddyb) special-case "shared `unreachable`" to
+                        // always inline it and avoid awkward "merges".
+                        // FIXME(eddyb) should this be in a separate CFG pass?
+                        // (i.e. is there a risk of other logic needing this?)
+                        let target_is_trivial_unreachable =
+                            match self.structurize_region_state.get(&edge_bundle.target) {
+                                Some(StructurizeRegionState::Ready {
+                                    region_deferred_edges: DeferredEdgeBundleSet::Unreachable,
+                                    ..
+                                }) => {
+                                    // FIXME(eddyb) DRY this "is empty region" check.
+                                    self.func_def_body
+                                        .at(edge_bundle.target)
+                                        .at_children()
+                                        .into_iter()
+                                        .next()
+                                        .is_none()
+                                }
+                                _ => false,
+                            };
+                        if target_is_trivial_unreachable {
+                            DeferredEdgeBundleSet::Unreachable
+                        } else {
+                            DeferredEdgeBundleSet::Always {
+                                target: DeferredTarget::Region(edge_bundle.target),
+                                edge_bundle: edge_bundle.with_target(()),
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -1474,7 +1510,7 @@ impl<'a> Structurizer<'a> {
 
                     let scrutinee = inputs[0];
 
-                    self.structurize_select_into(region, kind, scrutinee, target_regions)
+                    self.structurize_select_into(region, kind, Ok(scrutinee), target_regions)
                 }
             }
         };
@@ -1509,25 +1545,12 @@ impl<'a> Structurizer<'a> {
                 break;
             };
 
-            let else_is_unreachable =
-                matches!(else_deferred_edges, DeferredEdgeBundleSet::Unreachable);
-
-            // The "then" side is only taken if `condition` holds, except that
-            // `condition` can be ignored when the "else" side is unreachable.
-            //
-            // FIXME(eddyb) move this into `structurize_select_into`, by letting
-            // it also take `LazyCond`, not just `Value`, for `scrutinee`.
-            deferred_edges = if else_is_unreachable {
-                self.append_maybe_claimed_region(region, Ok(then_region))
-            } else {
-                let condition = self.materialize_lazy_cond(condition);
-                self.structurize_select_into(
-                    region,
-                    SelectionKind::BoolCond,
-                    condition,
-                    [Ok(then_region), Err(else_deferred_edges)].into_iter().collect(),
-                )
-            };
+            deferred_edges = self.structurize_select_into(
+                region,
+                SelectionKind::BoolCond,
+                Err(&condition),
+                [Ok(then_region), Err(else_deferred_edges)].into_iter().collect(),
+            );
         }
 
         // Cache the edge count for backedges (which later get turned into loops).
@@ -1566,54 +1589,94 @@ impl<'a> Structurizer<'a> {
         &mut self,
         parent_region: ControlRegion,
         kind: SelectionKind,
-        scrutinee: Value,
+        scrutinee: Result<Value, &LazyCond>,
         mut cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
     ) -> DeferredEdgeBundleSet {
-        // `Select` isn't actually needed unless there's at least two `cases`.
-        if cases.len() <= 1 {
-            return cases.into_iter().next().map_or(DeferredEdgeBundleSet::Unreachable, |case| {
-                self.append_maybe_claimed_region(parent_region, case)
-            });
+        // HACK(eddyb) don't nest a sole convergent case inside the `Select`,
+        // and instead prefer early convergence (see also `EventualCfgExits`).
+        // NOTE(eddyb) this also happens to handle the situation where `Select`
+        // isn't even needed (i.e. the other cases don't even have side-effects),
+        // via the `any_non_empty_case` check (after taking `convergent_case`).
+        // FIXME(eddyb) consider introducing some kind of `assume` for `scrutinee`,
+        // to preserve its known value (whenever `convergent_case` is reached).
+        let convergent_cases = cases.iter_mut().filter(|case| match case {
+            Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => {
+                !matches!(deferred_edges, DeferredEdgeBundleSet::Unreachable)
+            }
+        });
+        if let Ok(convergent_case) = convergent_cases.exactly_one() {
+            // HACK(eddyb) this relies on `structurize_select_into`'s behavior
+            // for `unreachable` cases being largely equivalent to empty cases.
+            let convergent_case =
+                mem::replace(convergent_case, Err(DeferredEdgeBundleSet::Unreachable));
+
+            // FIXME(eddyb) avoid needing recursion, by instead changing the
+            // "`Select` node insertion cursor" (into `parent_region`), and
+            // stashing `convergent_case`'s deferred edges to return later.
+            let deferred_edges =
+                self.structurize_select_into(parent_region, kind, scrutinee, cases);
+            assert!(matches!(deferred_edges, DeferredEdgeBundleSet::Unreachable));
+
+            // The sole convergent case goes in the `parent_region`, and its
+            // relationship with the `Select` (if it was even necessary at all)
+            // is only at most one of side-effect sequencing.
+            return self.append_maybe_claimed_region(parent_region, convergent_case);
         }
 
-        // Prepare all cases, ensuring they all have backing `ControlRegion`s,
-        // and define the `Select` node early (for `Value::ControlNodeOutput`s).
+        // Support lazily defining the `Select` node, as soon as it's necessary
+        // (i.e. to plumb per-case dataflow through `Value::ControlNodeOutput`s),
+        // but also if any of the cases actually have non-empty regions, which
+        // is checked after the special-cases (which return w/o a `Select` at all).
         //
         // FIXME(eddyb) some cases may be `unreachable`, and that's erased here.
-        // FIXME(eddyb) don't force `select_node` to be materialized, and therefore
-        // `cases` to exist, until they are needed for plumbing dataflow.
-        let select_node = {
-            let cases = cases
-                .iter()
-                .map(|case| {
-                    let case_region = match case {
-                        &Ok(ClaimedRegion { structured_body, .. }) => structured_body,
-                        Err(_) => self
-                            .func_def_body
-                            .control_regions
-                            .define(self.cx, ControlRegionDef::default()),
-                    };
+        let mut cached_select_node = None;
+        let mut non_move_kind = Some(kind);
+        let mut get_or_define_select_node = |this: &mut Self, cases: &[_]| {
+            *cached_select_node.get_or_insert_with(|| {
+                let kind = non_move_kind.take().unwrap();
+                let cases = cases
+                    .iter()
+                    .map(|case| {
+                        let case_region = match case {
+                            &Ok(ClaimedRegion { structured_body, .. }) => structured_body,
+                            Err(_) => this
+                                .func_def_body
+                                .control_regions
+                                .define(this.cx, ControlRegionDef::default()),
+                        };
 
-                    // FIXME(eddyb) should these be asserts that it's already empty?
-                    let case_region_def = self.func_def_body.at_mut(case_region).def();
-                    case_region_def.outputs.clear();
-                    case_region
-                })
-                .collect();
-            self.func_def_body.control_nodes.define(
-                self.cx,
-                ControlNodeDef {
-                    kind: ControlNodeKind::Select { kind, scrutinee, cases },
-                    outputs: [].into_iter().collect(),
-                }
-                .into(),
-            )
+                        // FIXME(eddyb) should these be asserts that it's already empty?
+                        let case_region_def = this.func_def_body.at_mut(case_region).def();
+                        case_region_def.outputs.clear();
+                        case_region
+                    })
+                    .collect();
+                let scrutinee =
+                    scrutinee.unwrap_or_else(|lazy_cond| this.materialize_lazy_cond(lazy_cond));
+                let select_node = this.func_def_body.control_nodes.define(
+                    this.cx,
+                    ControlNodeDef {
+                        kind: ControlNodeKind::Select { kind, scrutinee, cases },
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                this.func_def_body.control_regions[parent_region]
+                    .children
+                    .insert_last(select_node, &mut this.func_def_body.control_nodes);
+                select_node
+            })
         };
-        let case_region_by_idx =
-            |this: &Self, case_idx: usize| match &this.func_def_body.at(select_node).def().kind {
-                ControlNodeKind::Select { cases, .. } => cases[case_idx],
-                _ => unreachable!(),
-            };
+
+        // Ensure the `Select` exists if needed for any per-case side-effects.
+        let any_non_empty_case = cases.iter().any(|case| {
+            case.as_ref().is_ok_and(|&ClaimedRegion { structured_body, .. }| {
+                self.func_def_body.at(structured_body).at_children().into_iter().next().is_some()
+            })
+        });
+        if any_non_empty_case {
+            get_or_define_select_node(self, &cases);
+        }
 
         // Gather the full set of deferred edges (and returns).
         struct DeferredTargetSummary {
@@ -1665,18 +1728,26 @@ impl<'a> Structurizer<'a> {
         }
 
         // Merge all `deferred_edges` by plumbing their per-case `target_input`s
-        // (into per-case region outputs, and therefore `select_node` outputs)
+        // (into per-case region outputs, and therefore the `Select` outputs)
         // out of all cases that can reach them, with undef constants used to
         // fill any gaps (i.e. for the targets not reached through each case),
         // while deferred conditions are collected separately (for `LazyCond`).
         let deferred_edges = deferred_targets.into_iter().map(|(target, target_summary)| {
             let DeferredTargetSummary { input_count, total_edge_count } = target_summary;
 
-            let per_case_deferred: SmallVec<[Option<DeferredEdgeBundle<()>>; 8]> = cases
+            // HACK(eddyb) `Err` wraps only `LazyCond::{Undef,False}`, which allows
+            // distinguishing between "not taken" and "not even reachable".
+            let per_case_deferred: SmallVec<[Result<DeferredEdgeBundle<()>, LazyCond>; 8]> = cases
                 .iter_mut()
                 .map(|case| match case {
                     Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => {
-                        deferred_edges.steal_deferred_by_target_without_removal(target)
+                        if let DeferredEdgeBundleSet::Unreachable = deferred_edges {
+                            Err(LazyCond::Undef)
+                        } else {
+                            deferred_edges
+                                .steal_deferred_by_target_without_removal(target)
+                                .ok_or(LazyCond::False)
+                        }
                     }
                 })
                 .collect();
@@ -1684,7 +1755,7 @@ impl<'a> Structurizer<'a> {
             let target_inputs = (0..input_count)
                 .map(|target_input_idx| {
                     let per_case_target_input = per_case_deferred.iter().map(|per_case_deferred| {
-                        per_case_deferred.as_ref().map(
+                        per_case_deferred.as_ref().ok().map(
                             |DeferredEdgeBundle { edge_bundle, .. }| {
                                 edge_bundle.target_inputs[target_input_idx]
                             },
@@ -1699,7 +1770,7 @@ impl<'a> Structurizer<'a> {
                         .filter_map(|(v, case)| Some((v?, case)))
                         .map(|(v, case)| {
                             // If possible, resolve `v` to a `Value` valid in
-                            // `parent_region` (where `select_node` will go).
+                            // `parent_region` (i.e. the `Select` node parent).
                             match case {
                                 // `case`'s `structured_body` effectively "wraps"
                                 // its `deferred_edges` (where `v` came from),
@@ -1746,12 +1817,17 @@ impl<'a> Structurizer<'a> {
                             .expect("mismatched `return`ed value types"),
                     };
 
+                    let select_node = get_or_define_select_node(self, &cases);
                     let output_decls = &mut self.func_def_body.at_mut(select_node).def().outputs;
                     let output_idx = output_decls.len();
                     output_decls.push(ControlNodeOutputDecl { attrs: AttrSet::default(), ty });
                     for (case_idx, v) in per_case_target_input.enumerate() {
                         let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
-                        let case_region = case_region_by_idx(self, case_idx);
+
+                        let case_region = match &self.func_def_body.at(select_node).def().kind {
+                            ControlNodeKind::Select { cases, .. } => cases[case_idx],
+                            _ => unreachable!(),
+                        };
                         let outputs = &mut self.func_def_body.at_mut(case_region).def().outputs;
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
@@ -1763,28 +1839,26 @@ impl<'a> Structurizer<'a> {
                 })
                 .collect();
 
-            // Simplify `LazyCond`s eagerly, to reduce costs later on.
+            // Simplify `LazyCond`s eagerly, to reduce costs later on, or even
+            // outright avoid defining the `Select` node in the first place.
             //
-            // FIXME(eddyb) take into account some cases being `unreachable`.
-            // FIXME(eddyb) is "`LazyCond::True` for all cases" redundant with
-            // the fact that `DeferredEdgeBundleSet` doesn't store a condition
-            // for the single-target case?
-            let condition = if per_case_deferred
-                .iter()
-                .all(|d| matches!(d, Some(DeferredEdgeBundle { condition: LazyCond::True, .. })))
+            // FIXME(eddyb) move all simplifications from `materialize_lazy_cond`
+            // to here (allowing e.g. not defining the `Select` in more cases).
+            let per_case_conds =
+                per_case_deferred.iter().map(|per_case_deferred| match per_case_deferred {
+                    Ok(DeferredEdgeBundle { condition, .. }) => condition,
+                    Err(undef_or_false) => undef_or_false,
+                });
+            let condition = if per_case_conds
+                .clone()
+                .all(|cond| matches!(cond, LazyCond::Undef | LazyCond::True))
             {
                 LazyCond::True
             } else {
-                LazyCond::MergeSelect {
-                    control_node: select_node,
-                    per_case_conds: per_case_deferred
-                        .into_iter()
-                        .map(|per_case_deferred| match per_case_deferred {
-                            Some(DeferredEdgeBundle { condition, .. }) => condition,
-                            None => LazyCond::False,
-                        })
-                        .collect(),
-                }
+                LazyCond::Merge(Rc::new(LazyCondMerge::Select {
+                    control_node: get_or_define_select_node(self, &cases),
+                    per_case_conds: per_case_conds.cloned().collect(),
+                }))
             };
 
             DeferredEdgeBundle {
@@ -1798,13 +1872,14 @@ impl<'a> Structurizer<'a> {
         });
         let deferred_edges = deferred_edges.collect();
 
-        // Final sanity check for cases' regions being coherent, but also where
-        // per-case `region_inputs` become `control_region_input_rewrites`.
+        // Only as the very last step, can per-case `region_inputs` be added to
+        // `control_region_input_rewrites`.
         //
         // FIXME(eddyb) don't replace `Value::ControlRegionInput { region, .. }`
         // with `region_inputs` when the `region` ends up a `ControlNode` child,
         // but instead make all `ControlRegion`s entirely hermetic wrt inputs.
-        for (case_idx, case) in cases.into_iter().enumerate() {
+        #[allow(clippy::manual_flatten)]
+        for case in cases {
             if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
                 if !structured_body_inputs.is_empty() {
                     self.control_region_input_rewrites.insert(
@@ -1814,19 +1889,7 @@ impl<'a> Structurizer<'a> {
                     self.func_def_body.at_mut(structured_body).def().inputs.clear();
                 }
             }
-
-            let case_region = case_region_by_idx(self, case_idx);
-
-            // All deferrals must have been converted into outputs above.
-            assert_eq!(
-                self.func_def_body.at(case_region).def().outputs.len(),
-                self.func_def_body.at(select_node).def().outputs.len(),
-            );
         }
-
-        self.func_def_body.control_regions[parent_region]
-            .children
-            .insert_last(select_node, &mut self.func_def_body.control_nodes);
 
         deferred_edges
     }
@@ -1834,20 +1897,29 @@ impl<'a> Structurizer<'a> {
     // FIXME(eddyb) this should try to handle as many `LazyCond` as are available,
     // for incorporating them all at once, ideally with a switch instead
     // of N individual branches with their own booleans etc.
-    fn materialize_lazy_cond(&mut self, cond: LazyCond) -> Value {
+    fn materialize_lazy_cond(&mut self, cond: &LazyCond) -> Value {
         match cond {
+            LazyCond::Undef => Value::Const(self.const_undef(self.type_bool)),
             LazyCond::False => Value::Const(self.const_false),
             LazyCond::True => Value::Const(self.const_true),
-            LazyCond::MergeSelect { control_node, per_case_conds } => {
-                // HACK(eddyb) this should not allocate most of the time, and
-                // avoids complications later below, when mutating the cases.
+
+            // `LazyCond::Merge` was only created in the first place if a merge
+            // was actually necessary, so there shouldn't be simplifications to
+            // do here (i.e. the value provided is if `materialize_lazy_cond`
+            // never gets called because the target has become unconditional).
+            //
+            // FIXME(eddyb) there is still an `if cond { true } else { false }`
+            // special-case (repalcing with just `cond`), that cannot be expressed
+            // currently in `LazyCond` itself (but maybe it should be).
+            LazyCond::Merge(merge) => {
+                let LazyCondMerge::Select { control_node, ref per_case_conds } = **merge;
+
+                // HACK(eddyb) this won't actually allocate most of the time,
+                // and avoids complications later below, when mutating the cases.
                 let per_case_conds: SmallVec<[_; 8]> = per_case_conds
                     .into_iter()
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
-
-                // FIXME(eddyb) this should handle an all-`true` `per_case_conds`
-                // (but `structurize_select` currently takes care of those).
 
                 let ControlNodeDef { kind, outputs: output_decls } =
                     &mut *self.func_def_body.control_nodes[control_node];
@@ -1979,7 +2051,7 @@ impl<'a> Structurizer<'a> {
 
             let condition = Some(condition)
                 .filter(|_| else_target_and_inputs.is_some())
-                .map(|cond| self.materialize_lazy_cond(cond));
+                .map(|cond| self.materialize_lazy_cond(&cond));
             let branch_control_inst = ControlInst {
                 attrs: AttrSet::default(),
                 kind: if condition.is_some() {
