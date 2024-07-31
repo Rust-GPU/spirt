@@ -490,6 +490,14 @@ impl<'a> FuncAt<'a, ControlNode> {
                 visitor.visit_control_region_def(self.at(*body));
                 visitor.visit_value_use(repeat_condition);
             }
+            ControlNodeKind::ExitInvocation {
+                kind: cfg::ExitInvocationKind::SpvInst(_),
+                inputs,
+            } => {
+                for v in inputs {
+                    visitor.visit_value_use(v);
+                }
+            }
         }
         for output in outputs {
             output.inner_visit_with(visitor);

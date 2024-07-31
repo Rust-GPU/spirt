@@ -430,7 +430,9 @@ impl<'a, 'p> FuncAt<'a, CfgCursor<'p>> {
                     parent: cursor.parent,
                 }),
 
-                ControlNodeKind::Select { .. } | ControlNodeKind::Loop { .. } => None,
+                ControlNodeKind::Select { .. }
+                | ControlNodeKind::Loop { .. }
+                | ControlNodeKind::ExitInvocation { .. } => None,
             },
 
             // Exiting a `ControlNode` chains to a sibling/parent.
@@ -498,7 +500,7 @@ impl<'a> FuncAt<'a, ControlNode> {
         parent: &CfgCursor<'_, ControlParent>,
     ) -> Result<(), E> {
         let child_regions: &[_] = match &self.def().kind {
-            ControlNodeKind::Block { .. } => &[],
+            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &[],
             ControlNodeKind::Select { cases, .. } => cases,
             ControlNodeKind::Loop { body, .. } => slice::from_ref(body),
         };
@@ -679,7 +681,7 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Entering a `ControlNode` with child `ControlRegion`s.
+                // Entering a `ControlNode` with child `ControlRegion`s (or diverging).
                 (CfgPoint::ControlNodeEntry(control_node), None) => {
                     let control_node_def = func_def_body.at(control_node).def();
                     match &control_node_def.kind {
@@ -719,6 +721,15 @@ impl<'a> FuncLifting<'a> {
                                 }),
                             }
                         }
+
+                        ControlNodeKind::ExitInvocation { kind, inputs } => Terminator {
+                            attrs: AttrSet::default(),
+                            kind: Cow::Owned(cfg::ControlInstKind::ExitInvocation(kind.clone())),
+                            inputs: inputs.clone(),
+                            targets: [].into_iter().collect(),
+                            target_phi_values: FxIndexMap::default(),
+                            merge: None,
+                        },
                     }
                 }
 
@@ -734,7 +745,7 @@ impl<'a> FuncLifting<'a> {
                     };
 
                     match func_def_body.at(parent_node).def().kind {
-                        ControlNodeKind::Block { .. } => {
+                        ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => {
                             unreachable!()
                         }
 
@@ -829,7 +840,7 @@ impl<'a> FuncLifting<'a> {
         // of a linear branch chain (and potentially fusable), later on.
         //
         // FIXME(eddyb) use `EntityOrientedDenseMap` here.
-        let mut use_counts = FxHashMap::default();
+        let mut use_counts = FxHashMap::<CfgPoint, usize>::default();
         use_counts.reserve(blocks.len());
         let all_edges = blocks.first().map(|(&entry_point, _)| entry_point).into_iter().chain(
             blocks.values().flat_map(|block| {
@@ -918,7 +929,7 @@ impl<'a> FuncLifting<'a> {
         }
 
         // Remove now-unused blocks.
-        blocks.retain(|point, _| use_counts[point] > 0);
+        blocks.retain(|point, _| use_counts.get(point).is_some_and(|&count| count > 0));
 
         // Collect `OpPhi`s from other blocks' edges into each block.
         //
