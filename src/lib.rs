@@ -829,6 +829,19 @@ pub enum ControlNodeKind {
         // have any ambiguity as to whether it can see `body`-computed values)
         repeat_condition: Value,
     },
+
+    /// Leave the current invocation, similar to returning from every function
+    /// call in the stack (up to and including the entry-point), but potentially
+    /// indicating a fatal error as well.
+    //
+    // FIXME(eddyb) make this less shader-controlflow-centric.
+    ExitInvocation {
+        kind: cfg::ExitInvocationKind,
+
+        // FIXME(eddyb) centralize `Value` inputs across `ControlNode`s,
+        // and only use stricter types for building/traversing the IR.
+        inputs: SmallVec<[Value; 2]>,
+    },
 }
 
 #[derive(Clone)]

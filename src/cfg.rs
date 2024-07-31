@@ -1381,13 +1381,10 @@ impl<'a> Structurizer<'a> {
                    `ControlInst` (CFG wasn't unstructured in the first place?)",
             );
 
-        /// Marker error type for unhandled [`ControlInst`]s below.
-        struct UnsupportedControlInst(ControlInst);
-
         // Start with the concatenation of `region` and `control_inst_on_exit`,
         // always appending `ControlNode`s (including the children of entire
         // `ClaimedRegion`s) to `region`'s definition itself.
-        let deferred_edges_from_control_inst = {
+        let mut deferred_edges = {
             let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
 
             // FIXME(eddyb) this loses `attrs`.
@@ -1429,42 +1426,47 @@ impl<'a> Structurizer<'a> {
                     //   cases, and potentially even introducing `assume`s
                     // - a `Loop` body is not actually possible when divergent
                     //   (as there can be no backedge to form a cyclic CFG)
-                    Ok(DeferredEdgeBundleSet::Unreachable)
+                    DeferredEdgeBundleSet::Unreachable
                 }
 
-                ControlInstKind::ExitInvocation(_) => {
+                ControlInstKind::ExitInvocation(kind) => {
                     assert_eq!(target_regions.len(), 0);
 
-                    // FIXME(eddyb) introduce equivalent `ControlNodeKind` for these.
-                    Err(UnsupportedControlInst(ControlInst {
-                        attrs,
-                        kind,
-                        inputs,
-                        targets,
-                        target_inputs,
-                    }))
+                    let control_node = self.func_def_body.control_nodes.define(
+                        self.cx,
+                        ControlNodeDef {
+                            kind: ControlNodeKind::ExitInvocation { kind, inputs },
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    self.func_def_body.control_regions[region]
+                        .children
+                        .insert_last(control_node, &mut self.func_def_body.control_nodes);
+
+                    DeferredEdgeBundleSet::Unreachable
                 }
 
                 ControlInstKind::Return => {
                     assert_eq!(target_regions.len(), 0);
 
-                    Ok(DeferredEdgeBundleSet::Always {
+                    DeferredEdgeBundleSet::Always {
                         target: DeferredTarget::Return,
                         edge_bundle: IncomingEdgeBundle {
                             accumulated_count: IncomingEdgeCount::default(),
                             target: (),
                             target_inputs: inputs,
                         },
-                    })
+                    }
                 }
 
                 ControlInstKind::Branch => {
                     assert_eq!((inputs.len(), target_regions.len()), (0, 1));
 
-                    Ok(self.append_maybe_claimed_region(
+                    self.append_maybe_claimed_region(
                         region,
                         target_regions.into_iter().next().unwrap(),
-                    ))
+                    )
                 }
 
                 ControlInstKind::SelectBranch(kind) => {
@@ -1472,43 +1474,10 @@ impl<'a> Structurizer<'a> {
 
                     let scrutinee = inputs[0];
 
-                    Ok(self.structurize_select_into(region, kind, scrutinee, target_regions))
+                    self.structurize_select_into(region, kind, scrutinee, target_regions)
                 }
             }
         };
-
-        let mut deferred_edges = deferred_edges_from_control_inst.unwrap_or_else(
-            |UnsupportedControlInst(control_inst)| {
-                // HACK(eddyb) this only remains used for `ExitInvocation`.
-                // FIXME(eddyb) implement this as first-class, it keeps causing
-                // issues where it needlessly results in an unstructured "tail".
-                assert!(control_inst.targets.is_empty());
-
-                // HACK(eddyb) attach the unsupported `ControlInst` to a fresh
-                // new "proxy" `ControlRegion`, that can then be the target of
-                // a deferred edge, specially crafted to be unclaimable.
-                let proxy =
-                    self.func_def_body.control_regions.define(self.cx, ControlRegionDef::default());
-                self.func_def_body
-                    .unstructured_cfg
-                    .as_mut()
-                    .unwrap()
-                    .control_inst_on_exit_from
-                    .insert(proxy, control_inst);
-                self.structurize_region_state.insert(proxy, StructurizeRegionState::InProgress);
-                self.incoming_edge_counts_including_loop_exits
-                    .insert(proxy, IncomingEdgeCount::ONE);
-
-                DeferredEdgeBundleSet::Always {
-                    target: DeferredTarget::Region(proxy),
-                    edge_bundle: IncomingEdgeBundle {
-                        target: (),
-                        accumulated_count: IncomingEdgeCount::default(),
-                        target_inputs: [].into_iter().collect(),
-                    },
-                }
-            },
-        );
 
         // Try to resolve deferred edges that may have accumulated, and keep
         // going until there's no more deferred edges that can be claimed.

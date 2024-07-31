@@ -3053,6 +3053,15 @@ impl Print for FuncAt<'_, ControlNode> {
                     repeat_condition.print(printer),
                 ])
             }
+            ControlNodeKind::ExitInvocation {
+                kind: cfg::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
+                inputs,
+            } => printer.pretty_spv_inst(
+                kw_style,
+                *opcode,
+                imms,
+                inputs.iter().map(|v| v.print(printer)),
+            ),
         };
         pretty::Fragment::new([
             Use::AlignmentAnchorForControlNode(self.position).print_as_def(printer),

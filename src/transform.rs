@@ -615,7 +615,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<ControlNode>> {
 impl FuncAtMut<'_, ControlNode> {
     fn child_regions(&mut self) -> &mut [ControlRegion] {
         match &mut self.reborrow().def().kind {
-            ControlNodeKind::Block { .. } => &mut [][..],
+            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &mut [][..],
 
             ControlNodeKind::Select { cases, .. } => cases,
             ControlNodeKind::Loop { body, .. } => slice::from_mut(body),
@@ -641,8 +641,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
             } => {
                 transformer.transform_value_use(scrutinee).apply_to(scrutinee);
             }
-            ControlNodeKind::Loop { initial_inputs, body: _, repeat_condition: _ } => {
-                for v in initial_inputs {
+            ControlNodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
+            | ControlNodeKind::ExitInvocation {
+                kind: cfg::ExitInvocationKind::SpvInst(_),
+                inputs,
+            } => {
+                for v in inputs {
                     transformer.transform_value_use(v).apply_to(v);
                 }
             }
@@ -660,7 +664,11 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
         match kind {
             // Fully handled above, before recursing into any child regions.
             ControlNodeKind::Block { insts: _ }
-            | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ } => {}
+            | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ }
+            | ControlNodeKind::ExitInvocation {
+                kind: cfg::ExitInvocationKind::SpvInst(_),
+                inputs: _,
+            } => {}
 
             ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
                 transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
