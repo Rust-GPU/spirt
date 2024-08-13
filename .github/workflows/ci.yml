@@ -18,9 +18,8 @@ jobs:
           submodules: true
       - uses: actions-rs/toolchain@v1
         with:
-          # HACK(eddyb) only nightly supports setting `version = "Two"`
-          # in `rustfmt.toml`, which is needed to format array/slice patterns
-          # at all (see https://github.com/rust-lang/rustfmt/pull/4994).
+          # FIXME(eddyb) `style_edition = "2024"` in `rustfmt.toml` is what keeps
+          # this on `nightly`, should switch to `stable` when that stabilizes.
           toolchain: nightly
           override: true
 
