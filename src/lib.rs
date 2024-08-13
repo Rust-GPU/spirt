@@ -104,7 +104,6 @@
     clippy::match_wild_err_arm,
     clippy::match_wildcard_for_single_variants,
     clippy::mem_forget,
-    clippy::mismatched_target_os,
     clippy::missing_enforced_import_renames,
     clippy::mut_mut,
     clippy::mutex_integer,
@@ -145,6 +144,9 @@
     // NOTE(eddyb) ignored because it's misguided to suggest `let mut s = ...;`
     // and `s.push_str(...);` when `+` is equivalent and does not require `let`.
     clippy::string_add,
+
+    // FIXME(eddyb) rework doc comments to conform to linted expectations.
+    clippy::too_long_first_doc_paragraph,
 )]
 // NOTE(eddyb) this is stronger than the "Embark standard lints" above, because
 // we almost never need `unsafe` code and this is a further "speed bump" to it.
