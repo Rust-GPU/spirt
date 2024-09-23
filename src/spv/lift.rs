@@ -4,12 +4,12 @@ use crate::func_at::FuncAt;
 use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    cfg, AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode,
-    ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst,
-    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey,
-    Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody,
-    Import, Module, ModuleDebugInfo, ModuleDialect, SelectionKind, Type, TypeDef, TypeKind,
-    TypeOrConst, Value,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeKind,
+    ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst, DataInstDef,
+    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey, Exportee, Func,
+    FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module,
+    ModuleDebugInfo, ModuleDialect, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    cfg,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -484,10 +484,10 @@ impl<'a> FuncAt<'a, ControlRegion> {
         let region = self.position;
         f(CfgCursor { point: CfgPoint::RegionEntry(region), parent })?;
         for func_at_control_node in self.at_children() {
-            func_at_control_node.rev_post_order_try_for_each_inner(
-                f,
-                &CfgCursor { point: ControlParent::Region(region), parent },
-            )?;
+            func_at_control_node.rev_post_order_try_for_each_inner(f, &CfgCursor {
+                point: ControlParent::Region(region),
+                parent,
+            })?;
         }
         f(CfgCursor { point: CfgPoint::RegionExit(region), parent })
     }
@@ -907,17 +907,14 @@ impl<'a> FuncLifting<'a> {
                     // they start being tracked.
                     if target_phis.is_empty() {
                         let extra_insts = mem::take(extra_insts);
-                        let new_terminator = mem::replace(
-                            new_terminator,
-                            Terminator {
-                                attrs: Default::default(),
-                                kind: Cow::Owned(cfg::ControlInstKind::Unreachable),
-                                inputs: Default::default(),
-                                targets: Default::default(),
-                                target_phi_values: Default::default(),
-                                merge: None,
-                            },
-                        );
+                        let new_terminator = mem::replace(new_terminator, Terminator {
+                            attrs: Default::default(),
+                            kind: Cow::Owned(cfg::ControlInstKind::Unreachable),
+                            inputs: Default::default(),
+                            targets: Default::default(),
+                            target_phi_values: Default::default(),
+                            merge: None,
+                        });
                         *target_use_count = 0;
 
                         let combined_block = &mut blocks[block_idx];

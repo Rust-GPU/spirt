@@ -228,13 +228,10 @@ impl<'a, BlockId: Copy + Eq + Hash, DefId: Copy + Eq + Hash, DefType: Copy>
             .map(|block_id| BlockIdx(self.def_map.blocks_by_id.get_index_of(&block_id).unwrap()));
 
         if self.blocks[target_block_idx].preds.insert(source_block_idx) {
-            self.add_uses_to(
-                source_block_idx,
-                AddUsesSource::PropagateBackwardsAcrossEdge {
-                    target: target_block_idx,
-                    only_dirty: false,
-                },
-            );
+            self.add_uses_to(source_block_idx, AddUsesSource::PropagateBackwardsAcrossEdge {
+                target: target_block_idx,
+                only_dirty: false,
+            });
         }
     }
 
@@ -243,13 +240,10 @@ impl<'a, BlockId: Copy + Eq + Hash, DefId: Copy + Eq + Hash, DefType: Copy>
             for i in 0..self.blocks[block_idx].preds.len() {
                 let pred_block_idx = self.blocks[block_idx].preds[i];
 
-                self.add_uses_to(
-                    pred_block_idx,
-                    AddUsesSource::PropagateBackwardsAcrossEdge {
-                        target: block_idx,
-                        only_dirty: true,
-                    },
-                );
+                self.add_uses_to(pred_block_idx, AddUsesSource::PropagateBackwardsAcrossEdge {
+                    target: block_idx,
+                    only_dirty: true,
+                });
             }
             self.blocks[block_idx].dirty_chunks.clear();
         }

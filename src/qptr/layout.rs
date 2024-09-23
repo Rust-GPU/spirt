@@ -2,7 +2,7 @@
 
 use crate::qptr::shapes;
 use crate::{
-    spv, AddrSpace, Attr, Const, ConstKind, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst,
+    AddrSpace, Attr, Const, ConstKind, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst, spv,
 };
 use itertools::Either;
 use smallvec::SmallVec;

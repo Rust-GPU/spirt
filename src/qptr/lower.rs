@@ -4,12 +4,12 @@
 use super::layout::*;
 
 use crate::func_at::FuncAtMut;
-use crate::qptr::{shapes, QPtrAttr, QPtrOp};
+use crate::qptr::{QPtrAttr, QPtrOp, shapes};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
-    spv, AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
+    AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
     ControlNodeKind, DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, Diag,
-    FuncDecl, GlobalVarDecl, OrdAssertEq, Type, TypeKind, TypeOrConst, Value,
+    FuncDecl, GlobalVarDecl, OrdAssertEq, Type, TypeKind, TypeOrConst, Value, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
