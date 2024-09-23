@@ -3,11 +3,11 @@
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
-    cfg, print, AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNodeDef,
-    ControlNodeKind, ControlRegion, ControlRegionDef, ControlRegionInputDecl, DataInstDef,
-    DataInstFormDef, DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee,
-    Func, FuncDecl, FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import,
-    InternedStr, Module, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNodeDef, ControlNodeKind,
+    ControlRegion, ControlRegionDef, ControlRegionInputDecl, DataInstDef, DataInstFormDef,
+    DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
+    Module, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -660,16 +660,13 @@ impl Module {
                     None => DeclDef::Present(GlobalVarDefBody { initializer }),
                 };
 
-                let global_var = module.global_vars.define(
-                    &cx,
-                    GlobalVarDecl {
-                        attrs: mem::take(&mut attrs),
-                        type_of_ptr_to: type_of_ptr_to_global_var,
-                        shape: None,
-                        addr_space: AddrSpace::SpvStorageClass(storage_class),
-                        def,
-                    },
-                );
+                let global_var = module.global_vars.define(&cx, GlobalVarDecl {
+                    attrs: mem::take(&mut attrs),
+                    type_of_ptr_to: type_of_ptr_to_global_var,
+                    shape: None,
+                    addr_space: AddrSpace::SpvStorageClass(storage_class),
+                    def,
+                });
                 let ptr_to_global_var = cx.intern(ConstDef {
                     attrs: AttrSet::default(),
                     ty: type_of_ptr_to_global_var,
@@ -752,17 +749,14 @@ impl Module {
                     }
                 };
 
-                let func = module.funcs.define(
-                    &cx,
-                    FuncDecl {
-                        attrs: mem::take(&mut attrs),
-                        ret_type: func_ret_type,
-                        params: func_type_param_types
-                            .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
-                            .collect(),
-                        def,
-                    },
-                );
+                let func = module.funcs.define(&cx, FuncDecl {
+                    attrs: mem::take(&mut attrs),
+                    ret_type: func_ret_type,
+                    params: func_type_param_types
+                        .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
+                        .collect(),
+                    def,
+                });
                 id_defs.insert(func_id, IdDef::Func(func));
 
                 current_func_body = Some(FuncBody { func_id, func, insts: vec![] });
@@ -932,14 +926,11 @@ impl Module {
                                         .control_regions
                                         .define(&cx, ControlRegionDef::default())
                                 };
-                                block_details.insert(
-                                    block,
-                                    BlockDetails {
-                                        label_id: id,
-                                        phi_count: 0,
-                                        cfgssa_inter_block_uses: Default::default(),
-                                    },
-                                );
+                                block_details.insert(block, BlockDetails {
+                                    label_id: id,
+                                    phi_count: 0,
+                                    cfgssa_inter_block_uses: Default::default(),
+                                });
                                 LocalIdDef::BlockLabel(block)
                             } else if opcode == wk.OpPhi {
                                 let (&current_block, block_details) = match block_details.last_mut()
@@ -1425,10 +1416,13 @@ impl Module {
                         .as_mut()
                         .unwrap()
                         .control_inst_on_exit_from
-                        .insert(
-                            current_block.region,
-                            cfg::ControlInst { attrs, kind, inputs, targets, target_inputs },
-                        );
+                        .insert(current_block.region, cfg::ControlInst {
+                            attrs,
+                            kind,
+                            inputs,
+                            targets,
+                            target_inputs,
+                        });
                 } else if opcode == wk.OpPhi {
                     if !current_block_control_region_def.children.is_empty() {
                         return Err(invalid(

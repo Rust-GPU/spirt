@@ -1,6 +1,6 @@
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    cfg, AttrSet, Const, Context, DataInstForm, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type,
+    AttrSet, Const, Context, DataInstForm, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type, cfg,
 };
 
 /// Apply the [`cfg::Structurizer`] algorithm to all function definitions in `module`.

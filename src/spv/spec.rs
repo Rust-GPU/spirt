@@ -846,13 +846,10 @@ impl Spec {
                     bases[0] = "LiteralContextDependentNumber";
                 }
 
-                (
-                    o.kind,
-                    [
-                        operand_kinds.lookup(bases[0]).unwrap(),
-                        operand_kinds.lookup(bases[1]).unwrap(),
-                    ],
-                )
+                (o.kind, [
+                    operand_kinds.lookup(bases[0]).unwrap(),
+                    operand_kinds.lookup(bases[1]).unwrap(),
+                ])
             })
             .collect();
 

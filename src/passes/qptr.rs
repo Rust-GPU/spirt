@@ -1,8 +1,8 @@
 //! [`QPtr`](crate::TypeKind::QPtr) transforms.
 
 use crate::visit::{InnerVisit, Visitor};
-use crate::{qptr, DataInstForm};
 use crate::{AttrSet, Const, Context, Func, FxIndexSet, GlobalVar, Module, Type};
+use crate::{DataInstForm, qptr};
 
 pub fn lower_from_spv_ptrs(module: &mut Module, layout_config: &qptr::LayoutConfig) {
     let cx = &module.cx();

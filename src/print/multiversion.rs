@@ -1,7 +1,7 @@
 //! Multi-version pretty-printing support (e.g. for comparing the IR between passes).
 
-use crate::print::pretty::{self, TextOp};
 use crate::FxIndexMap;
+use crate::print::pretty::{self, TextOp};
 use internal_iterator::{
     FromInternalIterator, InternalIterator, IntoInternalIterator, IteratorExt,
 };

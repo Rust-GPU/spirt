@@ -4,13 +4,13 @@
 use super::layout::*;
 
 use crate::func_at::FuncAtMut;
-use crate::qptr::{shapes, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::qptr::{QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
-    spv, AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
     ControlNodeKind, DataInst, DataInstDef, DataInstFormDef, DataInstKind, DeclDef, Diag,
     DiagLevel, EntityDefs, EntityOrientedDenseMap, Func, FuncDecl, FxIndexMap, GlobalVar,
-    GlobalVarDecl, Module, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    GlobalVarDecl, Module, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -520,15 +520,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     _ => return Err(LiftError(Diag::bug(["non-Buffer pointee".into()]))),
                 };
 
-                self.deferred_ptr_noops.insert(
-                    data_inst,
-                    DeferredPtrNoop {
-                        output_pointer: buf_ptr,
-                        output_pointer_addr_space: addr_space,
-                        output_pointee_layout: buf_data_layout,
-                        parent_block,
-                    },
-                );
+                self.deferred_ptr_noops.insert(data_inst, DeferredPtrNoop {
+                    output_pointer: buf_ptr,
+                    output_pointer_addr_space: addr_space,
+                    output_pointee_layout: buf_data_layout,
+                    parent_block,
+                });
 
                 DataInstDef {
                     // FIXME(eddyb) avoid the repeated call to `type_of_val`
@@ -557,10 +554,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                 last_field.mem_layout.fixed_base.size == 0
                                     && last_field.mem_layout.dyn_unit_stride
                                         == Some(dyn_unit_stride)
-                                    && matches!(
-                                        last_field.components,
-                                        Components::Elements { fixed_len: None, .. }
-                                    )
+                                    && matches!(last_field.components, Components::Elements {
+                                        fixed_len: None,
+                                        ..
+                                    })
                             }) =>
                     {
                         u32::try_from(offsets.len() - 1).unwrap()
@@ -660,15 +657,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 if access_chain_inputs.len() == 1 {
-                    self.deferred_ptr_noops.insert(
-                        data_inst,
-                        DeferredPtrNoop {
-                            output_pointer: base_ptr,
-                            output_pointer_addr_space: addr_space,
-                            output_pointee_layout: TypeLayout::Concrete(layout),
-                            parent_block,
-                        },
-                    );
+                    self.deferred_ptr_noops.insert(data_inst, DeferredPtrNoop {
+                        output_pointer: base_ptr,
+                        output_pointer_addr_space: addr_space,
+                        output_pointee_layout: TypeLayout::Concrete(layout),
+                        parent_block,
+                    });
                     DataInstDef {
                         // FIXME(eddyb) avoid the repeated call to `type_of_val`
                         // (and the interning of a temporary `DataInstFormDef`),

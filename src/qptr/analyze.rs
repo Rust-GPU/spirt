@@ -1,9 +1,9 @@
 //! [`QPtr`](crate::TypeKind::QPtr) usage analysis (for legalizing/lifting).
 
 // HACK(eddyb) sharing layout code with other modules.
-use super::{layout::*, QPtrMemUsageKind};
+use super::{QPtrMemUsageKind, layout::*};
 
-use super::{shapes, QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage};
+use super::{QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage, shapes};
 use crate::func_at::FuncAt;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{

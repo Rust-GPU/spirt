@@ -3,12 +3,12 @@
 use crate::func_at::FuncAt;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
-    cfg, spv, AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode,
-    ControlNodeDef, ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode, ControlNodeDef,
+    ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
     ControlRegionInputDecl, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef,
     DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
-    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
