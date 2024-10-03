@@ -21,7 +21,10 @@ jobs:
           # FIXME(eddyb) `style_edition = "2024"` in `rustfmt.toml` is what keeps
           # this on `nightly`, should switch to `stable` when that stabilizes.
           toolchain: nightly
-          override: true
+          # HACK(eddyb) use `nightly` by default without breaking the ability to
+          # temporarily bypass it through `rust-toolchain.toml`.
+          default: true
+          override: false
 
       # run cargo fetch w/ --locked to verify Cargo.lock is up-to-date
       - run: cargo fetch --locked
