@@ -2,23 +2,17 @@
 # More documentation for the advisories section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
-# The lint level for security vulnerabilities
-vulnerability = "deny"
-# The lint level for unmaintained crates
-unmaintained = "deny"
+# NOTE(eddyb) see https://github.com/EmbarkStudios/cargo-deny/pull/611.
+version = 2
 # The lint level for crates that have been yanked from their source registry
 yanked = "deny"
-# The lint level for crates with security notices. Note that as of
-# 2019-12-17 there are no security notice advisories in
-# https://github.com/rustsec/advisory-db
-notice = "deny"
 
 # This section is considered when running `cargo deny check licenses`
 # More documentation for the licenses section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
 [licenses]
-# The lint level for crates which do not have a detectable license
-unlicensed = "deny"
+# NOTE(eddyb) see https://github.com/EmbarkStudios/cargo-deny/pull/611.
+version = 2
 # List of explicitly allowed licenses
 # See https://spdx.org/licenses/ for list of possible licenses
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
@@ -27,8 +21,6 @@ allow = [
     "Apache-2.0",
     "Unicode-DFS-2016",
 ]
-# Lint level for licenses considered copyleft
-copyleft = "deny"
 
 # This section is considered when running `cargo deny check bans`.
 # More documentation about the 'bans' section can be found here:
@@ -38,11 +30,6 @@ copyleft = "deny"
 multiple-versions = "deny"
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
-# Certain crates/versions that will be skipped when doing duplicate detection.
-skip = [
-    # FIXME(eddyb) `syn 2` has not replaced `syn 1` across the ecosystem yet.
-    { name = "syn", version = "2" },
-]
 
 # This section is considered when running `cargo deny check sources`.
 # More documentation about the 'sources' section can be found here:
