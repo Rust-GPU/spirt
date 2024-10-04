@@ -398,7 +398,7 @@ enum ControlParent {
     ControlNode(ControlNode),
 }
 
-impl<'a, 'p> FuncAt<'a, CfgCursor<'p>> {
+impl<'p> FuncAt<'_, CfgCursor<'p>> {
     /// Return the next [`CfgPoint`] (wrapped in [`CfgCursor`]) in a linear
     /// chain within structured control-flow (i.e. no branching to child regions).
     fn unique_successor(self) -> Option<CfgCursor<'p>> {
@@ -461,7 +461,7 @@ impl<'a, 'p> FuncAt<'a, CfgCursor<'p>> {
     }
 }
 
-impl<'a> FuncAt<'a, ControlRegion> {
+impl FuncAt<'_, ControlRegion> {
     /// Traverse every [`CfgPoint`] (deeply) contained in this [`ControlRegion`],
     /// in reverse post-order (RPO), with `f` receiving each [`CfgPoint`]
     /// in turn (wrapped in [`CfgCursor`], for further traversal flexibility),
@@ -493,7 +493,7 @@ impl<'a> FuncAt<'a, ControlRegion> {
     }
 }
 
-impl<'a> FuncAt<'a, ControlNode> {
+impl FuncAt<'_, ControlNode> {
     fn rev_post_order_try_for_each_inner<E>(
         self,
         f: &mut impl FnMut(CfgCursor<'_>) -> Result<(), E>,

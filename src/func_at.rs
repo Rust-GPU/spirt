@@ -91,7 +91,7 @@ impl<'a> Iterator for FuncAt<'a, EntityListIter<DataInst>> {
     }
 }
 
-impl<'a> DoubleEndedIterator for FuncAt<'a, EntityListIter<DataInst>> {
+impl DoubleEndedIterator for FuncAt<'_, EntityListIter<DataInst>> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let (prev, rest) = self.position.split_last(self.data_insts)?;
         self.position = rest;

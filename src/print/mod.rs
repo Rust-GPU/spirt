@@ -1145,7 +1145,7 @@ impl Printer<'_> {
     }
 }
 
-impl<'a> Printer<'a> {
+impl Printer<'_> {
     /// Pretty-print a string literal with escaping and styling.
     //
     // FIXME(eddyb) add methods like this for all styled text (e.g. numeric literals).
