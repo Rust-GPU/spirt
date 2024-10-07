@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.4.0] - 2024-10-07
+
 ### Changed 🛠
 - [PR#4](https://github.com/Rust-GPU/spirt/pull/4) updated `SPIRV-Headers`
   to match Vulkan SDK 1.3.290
@@ -146,7 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pretty-printer with (styled and hyperlinked) HTML output.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/rust-gpu/spirt/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/rust-gpu/spirt/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/rust-gpu/spirt/compare/0.1.0...0.2.0
 <!-- HACK(eddyb) `0.0.0` doesn't exist as a "tag before the initial commit", but
