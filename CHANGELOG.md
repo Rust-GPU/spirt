@@ -33,6 +33,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.4.0] - 2024-10-07
+
+### Changed 🛠
+- [PR#4](https://github.com/Rust-GPU/spirt/pull/4) updated `SPIRV-Headers`
+  to match Vulkan SDK 1.3.290
+
+### Fixed 🩹
+- [PR#2](https://github.com/Rust-GPU/spirt/pull/2) included a combination of control-flow (restructurization) refactors and fixes:
+  - fixed rewrites of chains of `OpPhi`s (for e.g. Rust-GPU's non-minimal SSA form)
+  - isolated the `ControlRegion`s of unstructured SPIR-T CFGs from eachother
+    - i.e. removed the implicit dominance-based (SSA-style) "value visibility" semantics
+    - explicit (phi-like) propagation of *all* values across CFG edges required
+    - structured control-flow, however, retained its more flexible "value visibility"
+    - (re)structurization "fuses" away the massively redundant dataflow *when sound*
+  - fixed SSA dominance issues (introduced by [PR#48 "minimal loops"](https://github.com/EmbarkStudios/spirt/pull/48)) using the above
+    - i.e. opportunistically simplify conservative (maximally redundant) dataflow
+    - could be expanded on in the future, moving towards hermetic (RVSDG-like) regions
+  - fixed issues with `ExitInvocation`s, by supporting them in structured SPIR-T
+    - e.g. this includes terminators like `OpKill`, `OpEmitMeshTasksEXT`, etc.
+    - also enables (very hacky) "abort" via `ExitInvocation(OpReturn)` from entry-point
+  - optimized common cases of divergent (`unreachable`/`ExitInvocation`) control-flow
+    - e.g. `if cond { abort() } else { foo() }` -> `if cond { abort() } else {} foo()`
+    - effectively flattens chains of checks (w/ the `abort() = ExitInvocation(OpReturn)` hack)
+
+---
+
+### ⬆️ *above entries after repository move (to [`Rust-GPU/spirt`](https://github.com/Rust-GPU/spirt)*)
+*See also [the transition announcement blog post](https://rust-gpu.github.io/blog/transition-announcement/).*
+### ⬇️ *below entries before repository move (from [`EmbarkStudios/spirt`](https://github.com/EmbarkStudios/spirt))*
+
+---
+
 ### Changed 🛠
 - [PR#61](https://github.com/EmbarkStudios/spirt/pull/61) updated `SPIRV-Headers`
   to match Vulkan SDK 1.3.275
@@ -116,7 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pretty-printer with (styled and hyperlinked) HTML output.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/rust-gpu/spirt/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/rust-gpu/spirt/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/rust-gpu/spirt/compare/0.1.0...0.2.0
 <!-- HACK(eddyb) `0.0.0` doesn't exist as a "tag before the initial commit", but
