@@ -24,13 +24,12 @@ use crate::print::multiversion::Versions;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
-    ControlNodeDef, ControlNodeKind, ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm,
-    DataInstFormDef, DataInstKind, DeclDef, Diag, DiagLevel, DiagMsgPart, EntityListIter,
-    ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
-    GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, OrdAssertEq,
-    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
-    cfg, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
+    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, Diag, DiagLevel,
+    DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
+    FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
+    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -49,30 +48,30 @@ mod pretty;
 ///
 /// In order to represent parts of a DAG textually, it first needs to have its
 /// nodes "flattened" into an order (also known as "topo(logical) sorting"),
-/// which [`Plan`] wholly records, before any printing can commence.
+/// which [`Plan`] records (as [`PlanItem`]s), before any printing can commence.
 ///
 /// Additionally, nodes without a significant identity (i.e. interned ones) may
 /// have their separate definition omitted in some cases where printing them
 /// inline at their use site(s) is preferred (e.g. when they have a single use).
 ///
 /// Once a [`Plan`] contains everything that needs to be printed, calling the
-/// [`.pretty_print()`](Plan::pretty_print) method will print all of the nodes
+/// [`.pretty_print()`](Plan::pretty_print) method will print all of the [`PlanItem`]s
 /// in the [`Plan`], and its return value can be e.g. formatted with [`fmt::Display`].
 pub struct Plan<'a> {
     cx: &'a Context,
 
-    /// When visiting module-stored nodes, the [`Module`] is needed to map the
-    /// [`Node`] to the (per-version) definition, which is then stored in the
-    /// (per-version) `node_defs` map.
+    /// When visiting module-stored [`PlanItem`]s, the [`Module`] is needed to map
+    /// the [`PlanItem`] to the (per-version) definition, which is then stored in
+    /// the (per-version) `item_defs` map.
     current_module: Option<&'a Module>,
 
     /// Versions allow comparing multiple copies of the same e.g. [`Module`],
-    /// with definitions sharing a [`Node`] key being shown together.
+    /// with definitions sharing a [`PlanItem`] key being shown together.
     ///
-    /// Specific [`Node`]s may be present in only a subset of versions, and such
+    /// Specific [`PlanItem`]s may be present in only a subset of versions, and such
     /// a distinction will be reflected in the output.
     ///
-    /// For [`Node`] collection, `versions.last()` constitutes the "active" one.
+    /// For [`PlanItem`] collection, `versions.last()` constitutes the "active" one.
     versions: Vec<PlanVersion<'a>>,
 
     /// Merged per-[`Use`] counts across all versions.
@@ -113,9 +112,9 @@ struct PlanVersion<'a> {
     /// or left empty (in the single-version mode).
     name: String,
 
-    /// Definitions for all the [`Node`]s which may need to be printed later
-    /// (with the exception of [`Node::AllCxInterned`], which is special-cased).
-    node_defs: FxHashMap<Node, NodeDef<'a>>,
+    /// Definitions for all the [`PlanItem`]s which may need to be printed later
+    /// (with the exception of [`PlanItem::AllCxInterned`], which is special-cased).
+    item_defs: FxHashMap<PlanItem, PlanItemDef<'a>>,
 
     /// Either a whole [`Module`], or some other printable type passed to
     /// [`Plan::for_root`]/[`Plan::for_versions`], which gets printed last,
@@ -129,7 +128,7 @@ struct AmbiguousName;
 
 /// Print [`Plan`] top-level entry, an effective reification of SPIR-T's implicit DAG.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Node {
+enum PlanItem {
     /// Definitions for all [`CxInterned`] that need them, grouped together.
     AllCxInterned,
 
@@ -142,10 +141,10 @@ enum Node {
     Func(Func),
 }
 
-impl Node {
+impl PlanItem {
     fn keyword_and_name_prefix(self) -> Result<(&'static str, &'static str), &'static str> {
         match self {
-            Self::AllCxInterned => Err("Node::AllCxInterned"),
+            Self::AllCxInterned => Err("PlanItem::AllCxInterned"),
 
             // FIXME(eddyb) these don't have the same kind of `{name_prefix}{idx}`
             // formatting, so maybe they don't belong in here to begin with?
@@ -158,12 +157,12 @@ impl Node {
     }
 }
 
-/// Definition of a [`Node`] (i.e. a reference pointing into a [`Module`]).
+/// Definition of a [`PlanItem`] (i.e. a reference pointing into a [`Module`]).
 ///
-/// Note: [`Node::AllCxInterned`] does *not* have its own `NodeDef` variant,
+/// Note: [`PlanItem::AllCxInterned`] does *not* have its own `PlanItemDef` variant,
 /// as it *must* be specially handled instead.
 #[derive(Copy, Clone, derive_more::From)]
-enum NodeDef<'a> {
+enum PlanItemDef<'a> {
     ModuleDialect(&'a ModuleDialect),
     ModuleDebugInfo(&'a ModuleDebugInfo),
     GlobalVar(&'a GlobalVarDecl),
@@ -171,7 +170,7 @@ enum NodeDef<'a> {
 }
 
 /// Anything interned in [`Context`], that might need to be printed once
-/// (as part of [`Node::AllCxInterned`]) and referenced multiple times.
+/// (as part of [`PlanItem::AllCxInterned`]) and referenced multiple times.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum CxInterned {
     Type(Type),
@@ -189,7 +188,7 @@ impl CxInterned {
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum Use {
-    Node(Node),
+    PlanItem(PlanItem),
 
     CxInterned(CxInterned),
 
@@ -198,13 +197,13 @@ enum Use {
     // FIXME(eddyb) these are `Value`'s variants except `Const`, maybe `Use`
     // should just use `Value` and assert it's never `Const`?
     RegionInput { region: Region, input_idx: u32 },
-    ControlNodeOutput { control_node: ControlNode, output_idx: u32 },
+    NodeOutput { node: Node, output_idx: u32 },
     DataInstOutput(DataInst),
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
     AlignmentAnchorForRegion(Region),
-    AlignmentAnchorForControlNode(ControlNode),
+    AlignmentAnchorForNode(Node),
     AlignmentAnchorForDataInst(DataInst),
 }
 
@@ -213,9 +212,7 @@ impl From<Value> for Use {
         match value {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
             Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
-            Value::ControlNodeOutput { control_node, output_idx } => {
-                Use::ControlNodeOutput { control_node, output_idx }
-            }
+            Value::NodeOutput { node, output_idx } => Use::NodeOutput { node, output_idx },
             Value::DataInstOutput(inst) => Use::DataInstOutput(inst),
         }
     }
@@ -229,16 +226,16 @@ impl Use {
 
     fn keyword_and_name_prefix(self) -> (&'static str, &'static str) {
         match self {
-            Self::Node(node) => node.keyword_and_name_prefix().unwrap(),
+            Self::PlanItem(item) => item.keyword_and_name_prefix().unwrap(),
             Self::CxInterned(interned) => interned.keyword_and_name_prefix(),
             Self::RegionLabel(_) => ("label", "L"),
 
-            Self::RegionInput { .. } | Self::ControlNodeOutput { .. } | Self::DataInstOutput(_) => {
+            Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput(_) => {
                 ("", "v")
             }
 
             Self::AlignmentAnchorForRegion(_)
-            | Self::AlignmentAnchorForControlNode(_)
+            | Self::AlignmentAnchorForNode(_)
             | Self::AlignmentAnchorForDataInst(_) => ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX),
         }
     }
@@ -293,7 +290,7 @@ impl<'a> Plan<'a> {
 
             plan.versions.push(PlanVersion {
                 name: version_name.into(),
-                node_defs: FxHashMap::default(),
+                item_defs: FxHashMap::default(),
                 root: version_root,
             });
 
@@ -353,61 +350,63 @@ impl<'a> Plan<'a> {
             }
         }
 
-        // Group all `CxInterned`s in a single top-level `Node`.
-        *self.use_counts.entry(Use::Node(Node::AllCxInterned)).or_default() += 1;
+        // Group all `CxInterned`s in a single top-level `PlanItem`.
+        *self.use_counts.entry(Use::PlanItem(PlanItem::AllCxInterned)).or_default() += 1;
 
         *self.use_counts.entry(use_kind).or_default() += 1;
     }
 
-    /// Add `node` to the plan, after all of its dependencies.
+    /// Add `item` to the plan, after all of its dependencies.
     ///
     /// Only the first call recurses into the definition, subsequent calls only
     /// update its (internally tracked) "use count".
-    fn use_node<D: Visit>(&mut self, node: Node, node_def: &'a D)
+    fn use_item<D: Visit>(&mut self, item: PlanItem, item_def: &'a D)
     where
-        NodeDef<'a>: From<&'a D>,
+        PlanItemDef<'a>: From<&'a D>,
     {
-        if let Some(use_count) = self.use_counts.get_mut(&Use::Node(node)) {
+        if let Some(use_count) = self.use_counts.get_mut(&Use::PlanItem(item)) {
             *use_count += 1;
             return;
         }
 
         let current_version = self.versions.last_mut().unwrap();
-        match current_version.node_defs.entry(node) {
+        match current_version.item_defs.entry(item) {
             Entry::Occupied(entry) => {
-                let old_ptr_eq_new = match (*entry.get(), NodeDef::from(node_def)) {
-                    (NodeDef::ModuleDialect(old), NodeDef::ModuleDialect(new)) => {
+                let old_ptr_eq_new = match (*entry.get(), PlanItemDef::from(item_def)) {
+                    (PlanItemDef::ModuleDialect(old), PlanItemDef::ModuleDialect(new)) => {
                         std::ptr::eq(old, new)
                     }
-                    (NodeDef::ModuleDebugInfo(old), NodeDef::ModuleDebugInfo(new)) => {
+                    (PlanItemDef::ModuleDebugInfo(old), PlanItemDef::ModuleDebugInfo(new)) => {
                         std::ptr::eq(old, new)
                     }
-                    (NodeDef::GlobalVar(old), NodeDef::GlobalVar(new)) => std::ptr::eq(old, new),
-                    (NodeDef::Func(old), NodeDef::Func(new)) => std::ptr::eq(old, new),
+                    (PlanItemDef::GlobalVar(old), PlanItemDef::GlobalVar(new)) => {
+                        std::ptr::eq(old, new)
+                    }
+                    (PlanItemDef::Func(old), PlanItemDef::Func(new)) => std::ptr::eq(old, new),
                     _ => false,
                 };
 
                 // HACK(eddyb) this avoids infinite recursion - we can't insert
-                // into `use_counts` before `node_def.visit_with(self)` because
+                // into `use_counts` before `item_def.visit_with(self)` because
                 // we want dependencies to come before dependends, so recursion
                 // from the visitor (recursive `Func`s, or `visit_foo` calling
-                // `use_node` which calls the same `visit_foo` method again)
+                // `use_item` which calls the same `visit_foo` method again)
                 // ends up here, and we have to both allow it and early-return.
                 assert!(
                     old_ptr_eq_new,
-                    "print: same `{}` node has multiple distinct definitions in `Plan`",
-                    node.keyword_and_name_prefix().map_or_else(|s| s, |(_, s)| s)
+                    "print: same `{}` item has multiple distinct definitions in `Plan`",
+                    item.keyword_and_name_prefix().map_or_else(|s| s, |(_, s)| s)
                 );
                 return;
             }
             Entry::Vacant(entry) => {
-                entry.insert(NodeDef::from(node_def));
+                entry.insert(PlanItemDef::from(item_def));
             }
         }
 
-        node_def.visit_with(self);
+        item_def.visit_with(self);
 
-        *self.use_counts.entry(Use::Node(node)).or_default() += 1;
+        *self.use_counts.entry(Use::PlanItem(item)).or_default() += 1;
     }
 }
 
@@ -473,7 +472,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
 
     fn visit_global_var_use(&mut self, gv: GlobalVar) {
         if let Some(module) = self.current_module {
-            self.use_node(Node::GlobalVar(gv), &module.global_vars[gv]);
+            self.use_item(PlanItem::GlobalVar(gv), &module.global_vars[gv]);
         } else {
             // FIXME(eddyb) should this be a hard error?
         }
@@ -481,7 +480,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
 
     fn visit_func_use(&mut self, func: Func) {
         if let Some(module) = self.current_module {
-            self.use_node(Node::Func(func), &module.funcs[func]);
+            self.use_item(PlanItem::Func(func), &module.funcs[func]);
         } else {
             // FIXME(eddyb) should this be a hard error?
         }
@@ -499,10 +498,10 @@ impl<'a> Visitor<'a> for Plan<'a> {
         self.current_module = old_module;
     }
     fn visit_module_dialect(&mut self, dialect: &'a ModuleDialect) {
-        self.use_node(Node::ModuleDialect, dialect);
+        self.use_item(PlanItem::ModuleDialect, dialect);
     }
     fn visit_module_debug_info(&mut self, debug_info: &'a ModuleDebugInfo) {
-        self.use_node(Node::ModuleDebugInfo, debug_info);
+        self.use_item(PlanItem::ModuleDebugInfo, debug_info);
     }
 
     fn visit_attr(&mut self, attr: &'a Attr) {
@@ -623,10 +622,10 @@ impl Plan<'_> {
     ) -> (Versions<pretty::FragmentPostLayout>, Versions<pretty::FragmentPostLayout>) {
         let printer = Printer::new(self);
         (
-            self.print_all_nodes_and_or_root(&printer, true, false).map_pretty_fragments(
+            self.print_all_items_and_or_root(&printer, true, false).map_pretty_fragments(
                 |fragment| fragment.layout_with_max_line_width(MAX_LINE_WIDTH),
             ),
-            self.print_all_nodes_and_or_root(&printer, false, true).map_pretty_fragments(
+            self.print_all_items_and_or_root(&printer, false, true).map_pretty_fragments(
                 |fragment| fragment.layout_with_max_line_width(MAX_LINE_WIDTH),
             ),
         )
@@ -756,15 +755,15 @@ impl<'a> Printer<'a> {
                 // HACK(eddyb) these are assigned later.
                 if let Use::RegionLabel(_)
                 | Use::RegionInput { .. }
-                | Use::ControlNodeOutput { .. }
+                | Use::NodeOutput { .. }
                 | Use::DataInstOutput(_) = use_kind
                 {
                     return (use_kind, UseStyle::Inline);
                 }
 
                 // HACK(eddyb) these are "global" to the whole print `Plan`.
-                if let Use::Node(
-                    Node::AllCxInterned | Node::ModuleDialect | Node::ModuleDebugInfo,
+                if let Use::PlanItem(
+                    PlanItem::AllCxInterned | PlanItem::ModuleDialect | PlanItem::ModuleDebugInfo,
                 ) = use_kind
                 {
                     return (use_kind, UseStyle::Anon { parent_func: None, idx: 0 });
@@ -778,11 +777,11 @@ impl<'a> Printer<'a> {
                             CxInterned::Const(ct) => cx[ct].attrs,
                         });
                     }
-                    Use::Node(node) => {
+                    Use::PlanItem(item) => {
                         for version in &plan.versions {
-                            let attrs = match version.node_defs.get(&node) {
-                                Some(NodeDef::GlobalVar(gv_decl)) => gv_decl.attrs,
-                                Some(NodeDef::Func(func_decl)) => func_decl.attrs,
+                            let attrs = match version.item_defs.get(&item) {
+                                Some(PlanItemDef::GlobalVar(gv_decl)) => gv_decl.attrs,
+                                Some(PlanItemDef::Func(func_decl)) => func_decl.attrs,
                                 _ => continue,
                             };
                             deduped_attrs_across_versions.insert(attrs);
@@ -790,10 +789,10 @@ impl<'a> Printer<'a> {
                     }
                     Use::RegionLabel(_)
                     | Use::RegionInput { .. }
-                    | Use::ControlNodeOutput { .. }
+                    | Use::NodeOutput { .. }
                     | Use::DataInstOutput(_)
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForControlNode(_)
+                    | Use::AlignmentAnchorForNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => unreachable!(),
                 }
 
@@ -860,14 +859,14 @@ impl<'a> Printer<'a> {
                                 }
                             }
                     }
-                    Use::Node(_) => false,
+                    Use::PlanItem(_) => false,
 
                     Use::RegionLabel(_)
                     | Use::RegionInput { .. }
-                    | Use::ControlNodeOutput { .. }
+                    | Use::NodeOutput { .. }
                     | Use::DataInstOutput(_)
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForControlNode(_)
+                    | Use::AlignmentAnchorForNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => {
                         unreachable!()
                     }
@@ -879,18 +878,20 @@ impl<'a> Printer<'a> {
                     let counter = match use_kind {
                         Use::CxInterned(CxInterned::Type(_)) => &mut ac.types,
                         Use::CxInterned(CxInterned::Const(_)) => &mut ac.consts,
-                        Use::Node(Node::GlobalVar(_)) => &mut ac.global_vars,
-                        Use::Node(Node::Func(_)) => &mut ac.funcs,
+                        Use::PlanItem(PlanItem::GlobalVar(_)) => &mut ac.global_vars,
+                        Use::PlanItem(PlanItem::Func(_)) => &mut ac.funcs,
 
-                        Use::Node(
-                            Node::AllCxInterned | Node::ModuleDialect | Node::ModuleDebugInfo,
+                        Use::PlanItem(
+                            PlanItem::AllCxInterned
+                            | PlanItem::ModuleDialect
+                            | PlanItem::ModuleDebugInfo,
                         )
                         | Use::RegionLabel(_)
                         | Use::RegionInput { .. }
-                        | Use::ControlNodeOutput { .. }
+                        | Use::NodeOutput { .. }
                         | Use::DataInstOutput(_)
                         | Use::AlignmentAnchorForRegion(_)
-                        | Use::AlignmentAnchorForControlNode(_)
+                        | Use::AlignmentAnchorForNode(_)
                         | Use::AlignmentAnchorForDataInst(_) => {
                             unreachable!()
                         }
@@ -904,12 +905,12 @@ impl<'a> Printer<'a> {
             .collect();
 
         let all_funcs = plan.use_counts.keys().filter_map(|&use_kind| match use_kind {
-            Use::Node(Node::Func(func)) => Some(func),
+            Use::PlanItem(PlanItem::Func(func)) => Some(func),
             _ => None,
         });
         for func in all_funcs {
             assert!(matches!(
-                use_styles.get(&Use::Node(Node::Func(func))),
+                use_styles.get(&Use::PlanItem(PlanItem::Func(func))),
                 Some(UseStyle::Anon { .. } | UseStyle::Named { .. })
             ));
 
@@ -927,10 +928,10 @@ impl<'a> Printer<'a> {
                 FxIndexMap::default();
 
             let func_def_bodies_across_versions = plan.versions.iter().filter_map(|version| {
-                match version.node_defs.get(&Node::Func(func))? {
-                    NodeDef::Func(FuncDecl { def: DeclDef::Present(func_def_body), .. }) => {
-                        Some(func_def_body)
-                    }
+                match version.item_defs.get(&PlanItem::Func(func))? {
+                    PlanItemDef::Func(FuncDecl {
+                        def: DeclDef::Present(func_def_body), ..
+                    }) => Some(func_def_body),
 
                     _ => None,
                 }
@@ -959,14 +960,14 @@ impl<'a> Printer<'a> {
                         );
                     }
 
-                    for func_at_control_node in func_def_body.at(*children) {
-                        let control_node = func_at_control_node.position;
+                    for func_at_node in func_def_body.at(*children) {
+                        let node = func_at_node.position;
 
-                        define(Use::AlignmentAnchorForControlNode(control_node), None);
+                        define(Use::AlignmentAnchorForNode(node), None);
 
-                        let ControlNodeDef { kind, outputs } = func_at_control_node.def();
+                        let NodeDef { kind, outputs } = func_at_node.def();
 
-                        if let ControlNodeKind::Block { insts } = *kind {
+                        if let NodeKind::Block { insts } = *kind {
                             for func_at_inst in func_def_body.at(insts) {
                                 define(
                                     Use::AlignmentAnchorForDataInst(func_at_inst.position),
@@ -984,10 +985,7 @@ impl<'a> Printer<'a> {
 
                         for (i, output_decl) in outputs.iter().enumerate() {
                             define(
-                                Use::ControlNodeOutput {
-                                    control_node,
-                                    output_idx: i.try_into().unwrap(),
-                                },
+                                Use::NodeOutput { node, output_idx: i.try_into().unwrap() },
                                 Some(output_decl.attrs),
                             );
                         }
@@ -1027,12 +1025,12 @@ impl<'a> Printer<'a> {
                         (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::RegionInput { .. }
-                    | Use::ControlNodeOutput { .. }
-                    | Use::DataInstOutput(_) => (&mut value_counter, use_styles.get_mut(&use_kind)),
+                    Use::RegionInput { .. } | Use::NodeOutput { .. } | Use::DataInstOutput(_) => {
+                        (&mut value_counter, use_styles.get_mut(&use_kind))
+                    }
 
                     Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForControlNode(_)
+                    | Use::AlignmentAnchorForNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => (
                         &mut alignment_anchor_counter,
                         Some(use_styles.entry(use_kind).or_insert(UseStyle::Inline)),
@@ -1504,7 +1502,7 @@ impl Use {
                 };
 
                 // HACK(eddyb) these are "global" to the whole print `Plan`.
-                if let Use::Node(Node::ModuleDialect | Node::ModuleDebugInfo) = self {
+                if let Use::PlanItem(PlanItem::ModuleDialect | PlanItem::ModuleDebugInfo) = self {
                     assert_eq!((is_def, name_prefix, suffix), (true, "", Suffix::Num(0)));
                     return mk_anchor(keyword.into(), vec![(None, keyword.into())]).into();
                 }
@@ -1513,7 +1511,7 @@ impl Use {
                 if let Some(func) = parent_func {
                     // Disambiguate intra-function anchors (labels/values) by
                     // prepending a prefix of the form `F123.`.
-                    let func = Use::Node(Node::Func(func));
+                    let func = Use::PlanItem(PlanItem::Func(func));
                     write!(anchor, "{}", func.keyword_and_name_prefix().1).unwrap();
                     suffix_of(&printer.use_styles[&func]).write_escaped_to(&mut anchor).unwrap();
                     anchor += ".";
@@ -1522,7 +1520,7 @@ impl Use {
                 suffix.write_escaped_to(&mut anchor).unwrap();
 
                 let name = if let Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForControlNode(_)
+                | Self::AlignmentAnchorForNode(_)
                 | Self::AlignmentAnchorForDataInst(_) = self
                 {
                     vec![]
@@ -1565,20 +1563,20 @@ impl Use {
                 Self::CxInterned(interned) => {
                     interned.print(printer).insert_name_before_def(pretty::Fragment::default())
                 }
-                Self::Node(node) => printer
+                Self::PlanItem(item) => printer
                     .error_style()
                     .apply(format!(
                         "/* undefined {} */_",
-                        node.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
+                        item.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
                 Self::RegionLabel(_)
                 | Self::RegionInput { .. }
-                | Self::ControlNodeOutput { .. }
+                | Self::NodeOutput { .. }
                 | Self::DataInstOutput(_) => "_".into(),
 
                 Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForControlNode(_)
+                | Self::AlignmentAnchorForNode(_)
                 | Self::AlignmentAnchorForDataInst(_) => unreachable!(),
             },
         }
@@ -1612,59 +1610,59 @@ impl Print for Const {
 impl Print for GlobalVar {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        Use::Node(Node::GlobalVar(*self)).print(printer)
+        Use::PlanItem(PlanItem::GlobalVar(*self)).print(printer)
     }
 }
 impl Print for Func {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        Use::Node(Node::Func(*self)).print(printer)
+        Use::PlanItem(PlanItem::Func(*self)).print(printer)
     }
 }
 
-// NOTE(eddyb) the `Print` impl for `Node` is for the top-level definition,
+// NOTE(eddyb) the `Print` impl for `PlanItem` is for the top-level definition,
 // *not* any uses (which go through the `Print` impls above).
 
 impl Print for Plan<'_> {
     type Output = Versions<pretty::Fragment>;
     fn print(&self, printer: &Printer<'_>) -> Versions<pretty::Fragment> {
-        self.print_all_nodes_and_or_root(printer, true, true)
+        self.print_all_items_and_or_root(printer, true, true)
     }
 }
 
 impl Plan<'_> {
-    fn print_all_nodes_and_or_root(
+    fn print_all_items_and_or_root(
         &self,
         printer: &Printer<'_>,
-        print_all_nodes: bool,
+        print_all_items: bool,
         print_root: bool,
     ) -> Versions<pretty::Fragment> {
-        enum NodeOrRoot {
-            Node(Node),
+        enum PlanItemOrRoot {
+            PlanItem(PlanItem),
             Root,
         }
 
-        let all_nodes = printer
+        let all_items = printer
             .use_styles
             .keys()
             .filter_map(|&use_kind| match use_kind {
-                Use::Node(node) => Some(node),
+                Use::PlanItem(item) => Some(item),
                 _ => None,
             })
-            .map(NodeOrRoot::Node);
-        let root = [NodeOrRoot::Root].into_iter();
-        let all_nodes_and_or_root = Some(all_nodes)
-            .filter(|_| print_all_nodes)
+            .map(PlanItemOrRoot::PlanItem);
+        let root = [PlanItemOrRoot::Root].into_iter();
+        let all_items_and_or_root = Some(all_items)
+            .filter(|_| print_all_items)
             .into_iter()
             .flatten()
             .chain(Some(root).filter(|_| print_root).into_iter().flatten());
 
-        let per_node_versions_with_repeat_count =
-            all_nodes_and_or_root.map(|node_or_root| -> SmallVec<[_; 1]> {
-                // Only print `Node::AllCxInterned` once (it doesn't really have
-                // per-version node definitions in the first place, anyway).
-                if let NodeOrRoot::Node(node @ Node::AllCxInterned) = node_or_root {
-                    node.keyword_and_name_prefix().unwrap_err();
+        let per_item_versions_with_repeat_count =
+            all_items_and_or_root.map(|item_or_root| -> SmallVec<[_; 1]> {
+                // Only print `PlanItem::AllCxInterned` once (it doesn't really have
+                // per-version item definitions in the first place, anyway).
+                if let PlanItemOrRoot::PlanItem(item @ PlanItem::AllCxInterned) = item_or_root {
+                    item.keyword_and_name_prefix().unwrap_err();
 
                     return [(CxInterned::print_all(printer), self.versions.len())]
                         .into_iter()
@@ -1673,16 +1671,17 @@ impl Plan<'_> {
 
                 self.versions
                     .iter()
-                    .map(move |version| match node_or_root {
-                        NodeOrRoot::Node(node) => version
-                            .node_defs
-                            .get(&node)
+                    .map(move |version| match item_or_root {
+                        PlanItemOrRoot::PlanItem(item) => version
+                            .item_defs
+                            .get(&item)
                             .map(|def| {
-                                def.print(printer)
-                                    .insert_name_before_def(Use::Node(node).print_as_def(printer))
+                                def.print(printer).insert_name_before_def(
+                                    Use::PlanItem(item).print_as_def(printer),
+                                )
                             })
                             .unwrap_or_default(),
-                        NodeOrRoot::Root => version.root.print(printer),
+                        PlanItemOrRoot::Root => version.root.print(printer),
                     })
                     .dedup_with_count()
                     .map(|(repeat_count, fragment)| {
@@ -1695,10 +1694,10 @@ impl Plan<'_> {
                     .collect()
             });
 
-        // Unversioned, flatten the nodes.
+        // Unversioned, flatten the items.
         if self.versions.len() == 1 && self.versions[0].name.is_empty() {
             Versions::Single(pretty::Fragment::new(
-                per_node_versions_with_repeat_count
+                per_item_versions_with_repeat_count
                     .map(|mut versions_with_repeat_count| {
                         versions_with_repeat_count.pop().unwrap().0
                     })
@@ -1713,7 +1712,7 @@ impl Plan<'_> {
         } else {
             Versions::Multiple {
                 version_names: self.versions.iter().map(|v| v.name.clone()).collect(),
-                per_row_versions_with_repeat_count: per_node_versions_with_repeat_count.collect(),
+                per_row_versions_with_repeat_count: per_item_versions_with_repeat_count.collect(),
             }
         }
     }
@@ -1749,7 +1748,7 @@ impl Print for Module {
     }
 }
 
-impl Print for NodeDef<'_> {
+impl Print for PlanItemDef<'_> {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
         match self {
@@ -2847,7 +2846,7 @@ impl Print for FuncDecl {
                             ])
                         })
                         .intersperse({
-                            // Separate (top-level) control nodes with empty lines.
+                            // Separate (top-level) nodes with empty lines.
                             // FIXME(eddyb) have an explicit `pretty::Node`
                             // for "vertical gap" instead.
                             "\n\n".into()
@@ -2902,30 +2901,27 @@ impl Print for FuncAt<'_, Region> {
     }
 }
 
-impl Print for FuncAt<'_, EntityListIter<ControlNode>> {
+impl Print for FuncAt<'_, EntityListIter<Node>> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         pretty::Fragment::new(
-            self.map(|func_at_control_node| func_at_control_node.print(printer))
+            self.map(|func_at_node| func_at_node.print(printer))
                 .intersperse(pretty::Node::ForceLineSeparation.into()),
         )
     }
 }
 
-impl Print for FuncAt<'_, ControlNode> {
+impl Print for FuncAt<'_, Node> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let control_node = self.position;
-        let ControlNodeDef { kind, outputs } = self.def();
+        let node = self.position;
+        let NodeDef { kind, outputs } = self.def();
 
         let outputs_header = if !outputs.is_empty() {
             let mut outputs = outputs.iter().enumerate().map(|(output_idx, output)| {
                 output.print(printer).insert_name_before_def(
-                    Value::ControlNodeOutput {
-                        control_node,
-                        output_idx: output_idx.try_into().unwrap(),
-                    }
-                    .print_as_def(printer),
+                    Value::NodeOutput { node, output_idx: output_idx.try_into().unwrap() }
+                        .print_as_def(printer),
                 )
             });
             let outputs_lhs = if outputs.len() == 1 {
@@ -2942,8 +2938,8 @@ impl Print for FuncAt<'_, ControlNode> {
         // appropriate here, but it's harder to spot at a glance.
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
-        let control_node_body = match kind {
-            ControlNodeKind::Block { insts } => {
+        let node_body = match kind {
+            NodeKind::Block { insts } => {
                 assert!(outputs.is_empty());
 
                 pretty::Fragment::new(
@@ -2953,14 +2949,13 @@ impl Print for FuncAt<'_, ControlNode> {
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
             }
-            ControlNodeKind::Select { kind, scrutinee, cases } => kind
-                .print_with_scrutinee_and_cases(
-                    printer,
-                    kw_style,
-                    *scrutinee,
-                    cases.iter().map(|&case| self.at(case).print(printer)),
-                ),
-            ControlNodeKind::Loop { initial_inputs, body, repeat_condition } => {
+            NodeKind::Select { kind, scrutinee, cases } => kind.print_with_scrutinee_and_cases(
+                printer,
+                kw_style,
+                *scrutinee,
+                cases.iter().map(|&case| self.at(case).print(printer)),
+            ),
+            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
                 assert!(outputs.is_empty());
 
                 let inputs = &self.at(*body).def().inputs;
@@ -3038,7 +3033,7 @@ impl Print for FuncAt<'_, ControlNode> {
                     repeat_condition.print(printer),
                 ])
             }
-            ControlNodeKind::ExitInvocation {
+            NodeKind::ExitInvocation {
                 kind: cfg::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
                 inputs,
             } => printer.pretty_spv_inst(
@@ -3049,9 +3044,9 @@ impl Print for FuncAt<'_, ControlNode> {
             ),
         };
         pretty::Fragment::new([
-            Use::AlignmentAnchorForControlNode(self.position).print_as_def(printer),
+            Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
             outputs_header,
-            control_node_body,
+            node_body,
         ])
     }
 }
@@ -3068,7 +3063,7 @@ impl Print for RegionInputDecl {
     }
 }
 
-impl Print for ControlNodeOutputDecl {
+impl Print for NodeOutputDecl {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
         let Self { attrs, ty } = *self;

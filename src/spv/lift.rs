@@ -4,11 +4,11 @@ use crate::func_at::FuncAt;
 use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeKind,
-    ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind,
-    DeclDef, EntityList, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet,
-    GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Region,
-    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
+    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey, Exportee, Func,
+    FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module,
+    ModuleDebugInfo, ModuleDialect, Node, NodeKind, NodeOutputDecl, Region, RegionInputDecl,
+    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -265,7 +265,7 @@ struct FuncLifting<'a> {
 /// and the target [`Region`] itself has phis for its `inputs`.
 enum RegionInputsSource {
     FuncParams,
-    LoopHeaderPhis(ControlNode),
+    LoopHeaderPhis(Node),
 }
 
 /// Any of the possible points in structured or unstructured SPIR-T control-flow,
@@ -275,8 +275,8 @@ enum CfgPoint {
     RegionEntry(Region),
     RegionExit(Region),
 
-    ControlNodeEntry(ControlNode),
-    ControlNodeExit(ControlNode),
+    NodeEntry(Node),
+    NodeExit(Node),
 }
 
 struct BlockLifting<'a> {
@@ -385,7 +385,7 @@ impl<'a> NeedsIdsCollector<'a> {
 }
 
 /// Helper type for deep traversal of the CFG (as a graph of [`CfgPoint`]s), which
-/// tracks the necessary context for navigating a [`Region`]/[`ControlNode`].
+/// tracks the necessary context for navigating a [`Region`]/[`Node`].
 #[derive(Copy, Clone)]
 struct CfgCursor<'p, P = CfgPoint> {
     point: P,
@@ -394,7 +394,7 @@ struct CfgCursor<'p, P = CfgPoint> {
 
 enum ControlParent {
     Region(Region),
-    ControlNode(ControlNode),
+    Node(Node),
 }
 
 impl<'p> FuncAt<'_, CfgCursor<'p>> {
@@ -403,45 +403,42 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
     fn unique_successor(self) -> Option<CfgCursor<'p>> {
         let cursor = self.position;
         match cursor.point {
-            // Entering a `Region` enters its first `ControlNode` child,
+            // Entering a `Region` enters its first `Node` child,
             // or exits the region right away (if it has no children).
             CfgPoint::RegionEntry(region) => Some(CfgCursor {
                 point: match self.at(region).def().children.iter().first {
-                    Some(first_child) => CfgPoint::ControlNodeEntry(first_child),
+                    Some(first_child) => CfgPoint::NodeEntry(first_child),
                     None => CfgPoint::RegionExit(region),
                 },
                 parent: cursor.parent,
             }),
 
-            // Exiting a `Region` exits its parent `ControlNode`.
+            // Exiting a `Region` exits its parent `Node`.
             CfgPoint::RegionExit(_) => cursor.parent.map(|parent| match parent.point {
                 ControlParent::Region(_) => unreachable!(),
-                ControlParent::ControlNode(parent_control_node) => CfgCursor {
-                    point: CfgPoint::ControlNodeExit(parent_control_node),
-                    parent: parent.parent,
-                },
+                ControlParent::Node(parent_node) => {
+                    CfgCursor { point: CfgPoint::NodeExit(parent_node), parent: parent.parent }
+                }
             }),
 
-            // Entering a `ControlNode` depends entirely on the `ControlNodeKind`.
-            CfgPoint::ControlNodeEntry(control_node) => match self.at(control_node).def().kind {
-                ControlNodeKind::Block { .. } => Some(CfgCursor {
-                    point: CfgPoint::ControlNodeExit(control_node),
-                    parent: cursor.parent,
-                }),
+            // Entering a `Node` depends entirely on the `NodeKind`.
+            CfgPoint::NodeEntry(node) => match self.at(node).def().kind {
+                NodeKind::Block { .. } => {
+                    Some(CfgCursor { point: CfgPoint::NodeExit(node), parent: cursor.parent })
+                }
 
-                ControlNodeKind::Select { .. }
-                | ControlNodeKind::Loop { .. }
-                | ControlNodeKind::ExitInvocation { .. } => None,
+                NodeKind::Select { .. }
+                | NodeKind::Loop { .. }
+                | NodeKind::ExitInvocation { .. } => None,
             },
 
-            // Exiting a `ControlNode` chains to a sibling/parent.
-            CfgPoint::ControlNodeExit(control_node) => {
-                Some(match self.control_nodes[control_node].next_in_list() {
+            // Exiting a `Node` chains to a sibling/parent.
+            CfgPoint::NodeExit(node) => {
+                Some(match self.nodes[node].next_in_list() {
                     // Enter the next sibling in the `Region`, if one exists.
-                    Some(next_control_node) => CfgCursor {
-                        point: CfgPoint::ControlNodeEntry(next_control_node),
-                        parent: cursor.parent,
-                    },
+                    Some(next_node) => {
+                        CfgCursor { point: CfgPoint::NodeEntry(next_node), parent: cursor.parent }
+                    }
 
                     // Exit the parent `Region`.
                     None => {
@@ -451,7 +448,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                                 point: CfgPoint::RegionExit(parent_region),
                                 parent: parent.parent,
                             },
-                            ControlParent::ControlNode(_) => unreachable!(),
+                            ControlParent::Node(_) => unreachable!(),
                         }
                     }
                 })
@@ -482,8 +479,8 @@ impl FuncAt<'_, Region> {
     ) -> Result<(), E> {
         let region = self.position;
         f(CfgCursor { point: CfgPoint::RegionEntry(region), parent })?;
-        for func_at_control_node in self.at_children() {
-            func_at_control_node.rev_post_order_try_for_each_inner(f, &CfgCursor {
+        for func_at_node in self.at_children() {
+            func_at_node.rev_post_order_try_for_each_inner(f, &CfgCursor {
                 point: ControlParent::Region(region),
                 parent,
             })?;
@@ -492,28 +489,28 @@ impl FuncAt<'_, Region> {
     }
 }
 
-impl FuncAt<'_, ControlNode> {
+impl FuncAt<'_, Node> {
     fn rev_post_order_try_for_each_inner<E>(
         self,
         f: &mut impl FnMut(CfgCursor<'_>) -> Result<(), E>,
         parent: &CfgCursor<'_, ControlParent>,
     ) -> Result<(), E> {
         let child_regions: &[_] = match &self.def().kind {
-            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &[],
-            ControlNodeKind::Select { cases, .. } => cases,
-            ControlNodeKind::Loop { body, .. } => slice::from_ref(body),
+            NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => &[],
+            NodeKind::Select { cases, .. } => cases,
+            NodeKind::Loop { body, .. } => slice::from_ref(body),
         };
 
-        let control_node = self.position;
+        let node = self.position;
         let parent = Some(parent);
-        f(CfgCursor { point: CfgPoint::ControlNodeEntry(control_node), parent })?;
+        f(CfgCursor { point: CfgPoint::NodeEntry(node), parent })?;
         for &region in child_regions {
             self.at(region).rev_post_order_try_for_each_inner(
                 f,
-                Some(&CfgCursor { point: ControlParent::ControlNode(control_node), parent }),
+                Some(&CfgCursor { point: ControlParent::Node(node), parent }),
             )?;
         }
-        f(CfgCursor { point: CfgPoint::ControlNodeExit(control_node), parent })
+        f(CfgCursor { point: CfgPoint::NodeExit(node), parent })
     }
 }
 
@@ -576,20 +573,18 @@ impl<'a> FuncLifting<'a> {
                 }
                 CfgPoint::RegionExit(_) => SmallVec::new(),
 
-                CfgPoint::ControlNodeEntry(control_node) => {
-                    match &func_def_body.at(control_node).def().kind {
+                CfgPoint::NodeEntry(node) => {
+                    match &func_def_body.at(node).def().kind {
                         // The backedge of a SPIR-V structured loop points to
                         // the "loop header", i.e. the `Entry` of the `Loop`,
                         // so that's where `body` `inputs` phis have to go.
-                        ControlNodeKind::Loop { initial_inputs, body, .. } => {
+                        NodeKind::Loop { initial_inputs, body, .. } => {
                             let loop_body_def = func_def_body.at(*body).def();
                             let loop_body_inputs = &loop_body_def.inputs;
 
                             if !loop_body_inputs.is_empty() {
-                                region_inputs_source.insert(
-                                    *body,
-                                    RegionInputsSource::LoopHeaderPhis(control_node),
-                                );
+                                region_inputs_source
+                                    .insert(*body, RegionInputsSource::LoopHeaderPhis(node));
                             }
 
                             loop_body_inputs
@@ -610,12 +605,12 @@ impl<'a> FuncLifting<'a> {
                         _ => SmallVec::new(),
                     }
                 }
-                CfgPoint::ControlNodeExit(control_node) => func_def_body
-                    .at(control_node)
+                CfgPoint::NodeExit(node) => func_def_body
+                    .at(node)
                     .def()
                     .outputs
                     .iter()
-                    .map(|&ControlNodeOutputDecl { attrs, ty }| {
+                    .map(|&NodeOutputDecl { attrs, ty }| {
                         Ok(Phi {
                             attrs,
                             ty,
@@ -629,12 +624,10 @@ impl<'a> FuncLifting<'a> {
             };
 
             let insts = match point {
-                CfgPoint::ControlNodeEntry(control_node) => {
-                    match func_def_body.at(control_node).def().kind {
-                        ControlNodeKind::Block { insts } => [insts].into_iter().collect(),
-                        _ => SmallVec::new(),
-                    }
-                }
+                CfgPoint::NodeEntry(node) => match func_def_body.at(node).def().kind {
+                    NodeKind::Block { insts } => [insts].into_iter().collect(),
+                    _ => SmallVec::new(),
+                },
                 _ => SmallVec::new(),
             };
 
@@ -680,15 +673,15 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Entering a `ControlNode` with child `Region`s (or diverging).
-                (CfgPoint::ControlNodeEntry(control_node), None) => {
-                    let control_node_def = func_def_body.at(control_node).def();
-                    match &control_node_def.kind {
-                        ControlNodeKind::Block { .. } => {
+                // Entering a `Node` with child `Region`s (or diverging).
+                (CfgPoint::NodeEntry(node), None) => {
+                    let node_def = func_def_body.at(node).def();
+                    match &node_def.kind {
+                        NodeKind::Block { .. } => {
                             unreachable!()
                         }
 
-                        ControlNodeKind::Select { kind, scrutinee, cases } => Terminator {
+                        NodeKind::Select { kind, scrutinee, cases } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::SelectBranch(kind.clone())),
                             inputs: [*scrutinee].into_iter().collect(),
@@ -697,10 +690,10 @@ impl<'a> FuncLifting<'a> {
                                 .map(|&case| CfgPoint::RegionEntry(case))
                                 .collect(),
                             target_phi_values: FxIndexMap::default(),
-                            merge: Some(Merge::Selection(CfgPoint::ControlNodeExit(control_node))),
+                            merge: Some(Merge::Selection(CfgPoint::NodeExit(node))),
                         },
 
-                        ControlNodeKind::Loop { initial_inputs: _, body, repeat_condition: _ } => {
+                        NodeKind::Loop { initial_inputs: _, body, repeat_condition: _ } => {
                             Terminator {
                                 attrs: AttrSet::default(),
                                 kind: Cow::Owned(cfg::ControlInstKind::Branch),
@@ -708,7 +701,7 @@ impl<'a> FuncLifting<'a> {
                                 targets: [CfgPoint::RegionEntry(*body)].into_iter().collect(),
                                 target_phi_values: FxIndexMap::default(),
                                 merge: Some(Merge::Loop {
-                                    loop_merge: CfgPoint::ControlNodeExit(control_node),
+                                    loop_merge: CfgPoint::NodeExit(node),
                                     // NOTE(eddyb) see the note on `Merge::Loop`'s
                                     // `loop_continue` field - in particular, for
                                     // SPIR-T loops, we *could* pick any point
@@ -721,7 +714,7 @@ impl<'a> FuncLifting<'a> {
                             }
                         }
 
-                        ControlNodeKind::ExitInvocation { kind, inputs } => Terminator {
+                        NodeKind::ExitInvocation { kind, inputs } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::ExitInvocation(kind.clone())),
                             inputs: inputs.clone(),
@@ -732,23 +725,23 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Exiting a `Region` to the parent `ControlNode`.
+                // Exiting a `Region` to the parent `Node`.
                 (CfgPoint::RegionExit(region), Some(parent_exit_cursor)) => {
                     let region_outputs = Some(&func_def_body.at(region).def().outputs[..])
                         .filter(|outputs| !outputs.is_empty());
 
                     let parent_exit = parent_exit_cursor.point;
                     let parent_node = match parent_exit {
-                        CfgPoint::ControlNodeExit(parent_node) => parent_node,
+                        CfgPoint::NodeExit(parent_node) => parent_node,
                         _ => unreachable!(),
                     };
 
                     match func_def_body.at(parent_node).def().kind {
-                        ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => {
+                        NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => {
                             unreachable!()
                         }
 
-                        ControlNodeKind::Select { .. } => Terminator {
+                        NodeKind::Select { .. } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::Branch),
                             inputs: [].into_iter().collect(),
@@ -760,8 +753,8 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
-                            let backedge = CfgPoint::ControlNodeEntry(parent_node);
+                        NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
+                            let backedge = CfgPoint::NodeEntry(parent_node);
                             let target_phi_values = region_outputs
                                 .map(|outputs| (backedge, outputs))
                                 .into_iter()
@@ -816,7 +809,7 @@ impl<'a> FuncLifting<'a> {
                 },
 
                 // Impossible cases, they always return `(_, Some(_))`.
-                (CfgPoint::RegionEntry(_) | CfgPoint::ControlNodeExit(_), None) => {
+                (CfgPoint::RegionEntry(_) | CfgPoint::NodeExit(_), None) => {
                     unreachable!()
                 }
             };
@@ -1090,7 +1083,7 @@ impl LazyInst<'_, '_> {
                 match parent_func.region_inputs_source.get(&region) {
                     Some(RegionInputsSource::FuncParams) => parent_func.param_ids[input_idx],
                     Some(&RegionInputsSource::LoopHeaderPhis(loop_node)) => {
-                        parent_func.blocks[&CfgPoint::ControlNodeEntry(loop_node)].phis[input_idx]
+                        parent_func.blocks[&CfgPoint::NodeEntry(loop_node)].phis[input_idx]
                             .result_id
                     }
                     None => {
@@ -1098,8 +1091,8 @@ impl LazyInst<'_, '_> {
                     }
                 }
             }
-            Value::ControlNodeOutput { control_node, output_idx } => {
-                parent_func.blocks[&CfgPoint::ControlNodeExit(control_node)].phis
+            Value::NodeOutput { node, output_idx } => {
+                parent_func.blocks[&CfgPoint::NodeExit(node)].phis
                     [usize::try_from(output_idx).unwrap()]
                 .result_id
             }

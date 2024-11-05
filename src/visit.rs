@@ -3,12 +3,11 @@
 use crate::func_at::FuncAt;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode, ControlNodeDef,
-    ControlNodeKind, ControlNodeOutputDecl, DataInstDef, DataInstForm, DataInstFormDef,
-    DataInstKind, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Region, RegionDef, RegionInputDecl, SelectionKind, Type,
-    TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstForm,
+    DataInstFormDef, DataInstKind, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func,
+    FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
+    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef,
+    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -62,8 +61,8 @@ pub trait Visitor<'a>: Sized {
     fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
         func_at_region.inner_visit_with(self);
     }
-    fn visit_control_node_def(&mut self, func_at_control_node: FuncAt<'a, ControlNode>) {
-        func_at_control_node.inner_visit_with(self);
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
+        func_at_node.inner_visit_with(self);
     }
     fn visit_data_inst_def(&mut self, data_inst_def: &'a DataInstDef) {
         data_inst_def.inner_visit_with(self);
@@ -453,27 +452,27 @@ impl InnerVisit for RegionInputDecl {
 
 // FIXME(eddyb) this can't implement `InnerVisit` because of the `&'a self`
 // requirement, whereas this has `'a` in `self: FuncAt<'a, ...>`.
-impl<'a> FuncAt<'a, EntityListIter<ControlNode>> {
+impl<'a> FuncAt<'a, EntityListIter<Node>> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        for func_at_control_node in self {
-            visitor.visit_control_node_def(func_at_control_node);
+        for func_at_node in self {
+            visitor.visit_node_def(func_at_node);
         }
     }
 }
 
 // FIXME(eddyb) this can't implement `InnerVisit` because of the `&'a self`
-// requirement, whereas this has `'a` in `self: FuncAt<'a, ControlNode>`.
-impl<'a> FuncAt<'a, ControlNode> {
+// requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
+impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let ControlNodeDef { kind, outputs } = self.def();
+        let NodeDef { kind, outputs } = self.def();
 
         match kind {
-            ControlNodeKind::Block { insts } => {
+            NodeKind::Block { insts } => {
                 for func_at_inst in self.at(*insts) {
                     visitor.visit_data_inst_def(func_at_inst.def());
                 }
             }
-            ControlNodeKind::Select {
+            NodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
                 scrutinee,
                 cases,
@@ -483,17 +482,14 @@ impl<'a> FuncAt<'a, ControlNode> {
                     visitor.visit_region_def(self.at(case));
                 }
             }
-            ControlNodeKind::Loop { initial_inputs, body, repeat_condition } => {
+            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
                 for v in initial_inputs {
                     visitor.visit_value_use(v);
                 }
                 visitor.visit_region_def(self.at(*body));
                 visitor.visit_value_use(repeat_condition);
             }
-            ControlNodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(_),
-                inputs,
-            } => {
+            NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
                 for v in inputs {
                     visitor.visit_value_use(v);
                 }
@@ -505,7 +501,7 @@ impl<'a> FuncAt<'a, ControlNode> {
     }
 }
 
-impl InnerVisit for ControlNodeOutputDecl {
+impl InnerVisit for NodeOutputDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         let Self { attrs, ty } = *self;
 
@@ -580,7 +576,7 @@ impl InnerVisit for Value {
         match *self {
             Self::Const(ct) => visitor.visit_const_use(ct),
             Self::RegionInput { region: _, input_idx: _ }
-            | Self::ControlNodeOutput { control_node: _, output_idx: _ }
+            | Self::NodeOutput { node: _, output_idx: _ }
             | Self::DataInstOutput(_) => {}
         }
     }

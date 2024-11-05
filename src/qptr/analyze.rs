@@ -7,9 +7,9 @@ use super::{QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage, shapes};
 use crate::func_at::FuncAt;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, ControlNode, ControlNodeKind,
-    DataInst, DataInstForm, DataInstKind, DeclDef, Diag, EntityList, ExportKey, Exportee, Func,
-    FxIndexMap, GlobalVar, Module, OrdAssertEq, Type, TypeKind, Value,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInst, DataInstForm,
+    DataInstKind, DeclDef, Diag, EntityList, ExportKey, Exportee, Func, FxIndexMap, GlobalVar,
+    Module, Node, NodeKind, OrdAssertEq, Type, TypeKind, Value,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -787,9 +787,8 @@ impl<'a> InferUsage<'a> {
                                 &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
                                     .attrs
                             }
-                            Value::ControlNodeOutput { control_node, output_idx } => {
-                                &mut func_def_body.at_mut(control_node).def().outputs
-                                    [output_idx as usize]
+                            Value::NodeOutput { node, output_idx } => {
+                                &mut func_def_body.at_mut(node).def().outputs[output_idx as usize]
                                     .attrs
                             }
                             Value::DataInstOutput(data_inst) => {
@@ -885,7 +884,7 @@ impl<'a> InferUsage<'a> {
                             &mut param_usages[input_idx as usize]
                         }
                         // FIXME(eddyb) implement
-                        Value::RegionInput { .. } | Value::ControlNodeOutput { .. } => {
+                        Value::RegionInput { .. } | Value::NodeOutput { .. } => {
                             usage_or_err_attrs_to_attach.push((
                                 ptr,
                                 Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
@@ -1255,10 +1254,10 @@ impl Visitor<'_> for CollectAllDataInsts {
     fn visit_global_var_use(&mut self, _: GlobalVar) {}
     fn visit_func_use(&mut self, _: Func) {}
 
-    fn visit_control_node_def(&mut self, func_at_control_node: FuncAt<'_, ControlNode>) {
-        if let ControlNodeKind::Block { insts } = func_at_control_node.def().kind {
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
+        if let NodeKind::Block { insts } = func_at_node.def().kind {
             self.0.push(insts);
         }
-        func_at_control_node.inner_visit_with(self);
+        func_at_node.inner_visit_with(self);
     }
 }

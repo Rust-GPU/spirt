@@ -13,7 +13,7 @@
 //! be taken to preserve the correctness of such implicit dataflow across all
 //! transformations, and it's overall far more fragile than the local dataflow
 //! of e.g. phi nodes (or their alternative "block arguments"), or in SPIR-T's
-//! case, `Region` inputs and `ControlNode` outputs (inspired by RVSDG,
+//! case, `Region` inputs and `Node` outputs (inspired by RVSDG,
 //! which has even stricter isolation/locality in its regions).
 
 use crate::{FxIndexMap, FxIndexSet};

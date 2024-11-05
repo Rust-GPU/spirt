@@ -7,10 +7,10 @@ use crate::func_at::FuncAtMut;
 use crate::qptr::{QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
-    ControlNodeKind, DataInst, DataInstDef, DataInstFormDef, DataInstKind, DeclDef, Diag,
-    DiagLevel, EntityDefs, EntityOrientedDenseMap, Func, FuncDecl, FxIndexMap, GlobalVar,
-    GlobalVarDecl, Module, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
+    DataInstDef, DataInstFormDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs,
+    EntityOrientedDenseMap, Func, FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node,
+    NodeKind, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -410,14 +410,14 @@ struct DeferredPtrNoop {
     /// except in the case of `QPtrOp::BufferData`.
     output_pointee_layout: TypeLayout,
 
-    parent_block: ControlNode,
+    parent_block: Node,
 }
 
 impl LiftToSpvPtrInstsInFunc<'_> {
     fn try_lift_data_inst_def(
         &mut self,
         mut func_at_data_inst: FuncAtMut<'_, DataInst>,
-        parent_block: ControlNode,
+        parent_block: Node,
     ) -> Result<Transformed<DataInstDef>, LiftError> {
         let wk = self.lifter.wk;
         let cx = &self.lifter.cx;
@@ -812,15 +812,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         .define(cx, access_chain_data_inst_def.into());
 
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                    // due to the need to borrow `control_nodes` and `data_insts`
+                    // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
                     let data_inst = func_at_data_inst.position;
                     let func = func_at_data_inst.reborrow().at(());
-                    match &mut func.control_nodes[parent_block].kind {
-                        ControlNodeKind::Block { insts } => {
+                    match &mut func.nodes[parent_block].kind {
+                        NodeKind::Block { insts } => {
                             insts.insert_before(access_chain_data_inst, data_inst, func.data_insts);
                         }
                         _ => unreachable!(),
@@ -887,15 +887,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         .define(cx, access_chain_data_inst_def.into());
 
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                    // due to the need to borrow `control_nodes` and `data_insts`
+                    // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
                     let data_inst = func_at_data_inst.position;
                     let func = func_at_data_inst.reborrow().at(());
-                    match &mut func.control_nodes[parent_block].kind {
-                        ControlNodeKind::Block { insts } => {
+                    match &mut func.nodes[parent_block].kind {
+                        NodeKind::Block { insts } => {
                             insts.insert_before(access_chain_data_inst, data_inst, func.data_insts);
                         }
                         _ => unreachable!(),
@@ -1100,24 +1100,21 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
     }
 
     // HACK(eddyb) while we want to transform `DataInstDef`s, we can't inject
-    // adjacent instructions without access to the parent `ControlNodeKind::Block`,
+    // adjacent instructions without access to the parent `NodeKind::Block`,
     // and to fix this would likely require list nodes to carry some handle to
     // the list they're part of, either the whole semantic parent, or something
     // more contrived, where lists are actually allocated entities of their own,
     // perhaps something where an `EntityListDefs<DataInstDef>` contains both:
     // - an `EntityDefs<EntityListNode<DataInstDef>>` (keyed by `DataInst`)
     // - an `EntityDefs<EntityListDef<DataInst>>` (keyed by `EntityList<DataInst>`)
-    fn in_place_transform_control_node_def(
-        &mut self,
-        mut func_at_control_node: FuncAtMut<'_, ControlNode>,
-    ) {
-        func_at_control_node.reborrow().inner_in_place_transform_with(self);
+    fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
+        func_at_node.reborrow().inner_in_place_transform_with(self);
 
-        let control_node = func_at_control_node.position;
-        if let ControlNodeKind::Block { insts } = func_at_control_node.reborrow().def().kind {
-            let mut func_at_inst_iter = func_at_control_node.reborrow().at(insts).into_iter();
+        let node = func_at_node.position;
+        if let NodeKind::Block { insts } = func_at_node.reborrow().def().kind {
+            let mut func_at_inst_iter = func_at_node.reborrow().at(insts).into_iter();
             while let Some(mut func_at_inst) = func_at_inst_iter.next() {
-                let mut lifted = self.try_lift_data_inst_def(func_at_inst.reborrow(), control_node);
+                let mut lifted = self.try_lift_data_inst_def(func_at_inst.reborrow(), node);
                 if let Ok(Transformed::Unchanged) = lifted {
                     let data_inst_def = func_at_inst.reborrow().def();
                     let data_inst_form_def = &self.lifter.cx[data_inst_def.form];
@@ -1184,13 +1181,13 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             for (inst, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
                 if self.data_inst_use_counts.get(inst).is_none() {
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                    // due to the need to borrow `control_nodes` and `data_insts`
+                    // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
-                    match &mut func_def_body.control_nodes[ptr_noop.parent_block].kind {
-                        ControlNodeKind::Block { insts } => {
+                    match &mut func_def_body.nodes[ptr_noop.parent_block].kind {
+                        NodeKind::Block { insts } => {
                             insts.remove(inst, &mut func_def_body.data_insts);
                         }
                         _ => unreachable!(),

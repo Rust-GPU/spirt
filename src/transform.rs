@@ -3,12 +3,12 @@
 use crate::func_at::FuncAtMut;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode, ControlNodeDef,
-    ControlNodeKind, ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef,
-    DataInstKind, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstDef,
+    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityListIter, ExportKey, Exportee,
+    Func, FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import,
+    Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq,
+    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    cfg, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -205,11 +205,8 @@ pub trait Transformer: Sized {
     fn in_place_transform_func_decl(&mut self, func_decl: &mut FuncDecl) {
         func_decl.inner_in_place_transform_with(self);
     }
-    fn in_place_transform_control_node_def(
-        &mut self,
-        mut func_at_control_node: FuncAtMut<'_, ControlNode>,
-    ) {
-        func_at_control_node.inner_in_place_transform_with(self);
+    fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
+        func_at_node.inner_in_place_transform_with(self);
     }
     fn in_place_transform_data_inst_def(&mut self, mut func_at_data_inst: FuncAtMut<'_, DataInst>) {
         func_at_data_inst.inner_in_place_transform_with(self);
@@ -574,7 +571,7 @@ impl InnerInPlaceTransform for FuncDefBody {
 impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         // HACK(eddyb) handle the fields of `Region` separately, to
-        // allow reborrowing `FuncAtMut` (for recursing into `ControlNode`s).
+        // allow reborrowing `FuncAtMut` (for recursing into `Node`s).
         let RegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
         for input in inputs {
             input.inner_transform_with(transformer).apply_to(input);
@@ -603,49 +600,46 @@ impl InnerTransform for RegionInputDecl {
     }
 }
 
-impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<ControlNode>> {
+impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<Node>> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         let mut iter = self.reborrow();
-        while let Some(func_at_control_node) = iter.next() {
-            transformer.in_place_transform_control_node_def(func_at_control_node);
+        while let Some(func_at_node) = iter.next() {
+            transformer.in_place_transform_node_def(func_at_node);
         }
     }
 }
 
-impl FuncAtMut<'_, ControlNode> {
+impl FuncAtMut<'_, Node> {
     fn child_regions(&mut self) -> &mut [Region] {
         match &mut self.reborrow().def().kind {
-            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &mut [][..],
+            NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => &mut [][..],
 
-            ControlNodeKind::Select { cases, .. } => cases,
-            ControlNodeKind::Loop { body, .. } => slice::from_mut(body),
+            NodeKind::Select { cases, .. } => cases,
+            NodeKind::Loop { body, .. } => slice::from_mut(body),
         }
     }
 }
 
-impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
+impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         // HACK(eddyb) handle pre-child-regions parts of `kind` separately to
         // allow reborrowing `FuncAtMut` (for the child region recursion).
         match &mut self.reborrow().def().kind {
-            &mut ControlNodeKind::Block { insts } => {
+            &mut NodeKind::Block { insts } => {
                 let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
                 while let Some(func_at_inst) = func_at_inst_iter.next() {
                     transformer.in_place_transform_data_inst_def(func_at_inst);
                 }
             }
-            ControlNodeKind::Select {
+            NodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
                 scrutinee,
                 cases: _,
             } => {
                 transformer.transform_value_use(scrutinee).apply_to(scrutinee);
             }
-            ControlNodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
-            | ControlNodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(_),
-                inputs,
-            } => {
+            NodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
+            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
                 for v in inputs {
                     transformer.transform_value_use(v).apply_to(v);
                 }
@@ -659,18 +653,16 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
             self.reborrow().at(child_region).inner_in_place_transform_with(transformer);
         }
 
-        let ControlNodeDef { kind, outputs } = self.reborrow().def();
+        let NodeDef { kind, outputs } = self.reborrow().def();
 
         match kind {
             // Fully handled above, before recursing into any child regions.
-            ControlNodeKind::Block { insts: _ }
-            | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ }
-            | ControlNodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(_),
-                inputs: _,
-            } => {}
+            NodeKind::Block { insts: _ }
+            | NodeKind::Select { kind: _, scrutinee: _, cases: _ }
+            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs: _ } => {
+            }
 
-            ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
+            NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
                 transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
             }
         };
@@ -681,7 +673,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
     }
 }
 
-impl InnerTransform for ControlNodeOutputDecl {
+impl InnerTransform for NodeOutputDecl {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         let Self { attrs, ty } = self;
 
@@ -770,7 +762,7 @@ impl InnerTransform for Value {
             } => Self::Const(ct)),
 
             Self::RegionInput { region: _, input_idx: _ }
-            | Self::ControlNodeOutput { control_node: _, output_idx: _ }
+            | Self::NodeOutput { node: _, output_idx: _ }
             | Self::DataInstOutput(_) => Transformed::Unchanged,
         }
     }

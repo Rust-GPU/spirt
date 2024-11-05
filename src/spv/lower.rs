@@ -3,10 +3,10 @@
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
-    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNodeDef, ControlNodeKind,
-    DataInstDef, DataInstFormDef, DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey,
-    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody,
-    Import, InternedStr, Module, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstFormDef,
+    DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
+    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
     TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
@@ -741,7 +741,7 @@ impl Module {
                         let body = regions.define(&cx, RegionDef::default());
                         DeclDef::Present(FuncDefBody {
                             regions,
-                            control_nodes: Default::default(),
+                            nodes: Default::default(),
                             data_insts: Default::default(),
                             body,
                             unstructured_cfg: Some(cfg::ControlFlowGraph::default()),
@@ -1207,7 +1207,7 @@ impl Module {
                         return Err(invalid("block lacks terminator instruction"));
                     }
 
-                    // A `Region` (using an empty `Block` `ControlNode`
+                    // A `Region` (using an empty `Block` `Node`
                     // as its sole child) was defined earlier,
                     // to be able to have an entry in `local_id_defs`.
                     let region = match local_id_defs[&result_id.unwrap()] {
@@ -1561,32 +1561,29 @@ impl Module {
                         None => func_def_body.data_insts.define(&cx, data_inst_def.into()),
                     };
 
-                    let current_block_control_node = current_block_region_def
+                    let current_block_node = current_block_region_def
                         .children
                         .iter()
                         .last
                         .filter(|&last_node| {
-                            matches!(
-                                func_def_body.control_nodes[last_node].kind,
-                                ControlNodeKind::Block { .. }
-                            )
+                            matches!(func_def_body.nodes[last_node].kind, NodeKind::Block { .. })
                         })
                         .unwrap_or_else(|| {
-                            let block_node = func_def_body.control_nodes.define(
+                            let block_node = func_def_body.nodes.define(
                                 &cx,
-                                ControlNodeDef {
-                                    kind: ControlNodeKind::Block { insts: EntityList::empty() },
+                                NodeDef {
+                                    kind: NodeKind::Block { insts: EntityList::empty() },
                                     outputs: SmallVec::new(),
                                 }
                                 .into(),
                             );
                             current_block_region_def
                                 .children
-                                .insert_last(block_node, &mut func_def_body.control_nodes);
+                                .insert_last(block_node, &mut func_def_body.nodes);
                             block_node
                         });
-                    match &mut func_def_body.control_nodes[current_block_control_node].kind {
-                        ControlNodeKind::Block { insts } => {
+                    match &mut func_def_body.nodes[current_block_node].kind {
+                        NodeKind::Block { insts } => {
                             insts.insert_last(inst, &mut func_def_body.data_insts);
                         }
                         _ => unreachable!(),
