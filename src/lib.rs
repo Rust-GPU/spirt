@@ -51,7 +51,7 @@
 // HACK(eddyb) using `(struct.Context.html)` to link `Context`, not `context::Context`.
 //! * [`Context`](struct.Context.html): handles interning ([`Type`]s, [`Const`]s, etc.) and allocating entity handles
 //! * [`Module`]: owns [`Func`]s and [`GlobalVar`]s (rooted by [`exports`](Module::exports))
-//! * [`FuncDefBody`]: owns [`ControlRegion`]s and [DataInst]s (rooted by [`body`](FuncDefBody::body))
+//! * [`FuncDefBody`]: owns [`Region`]s and [DataInst]s (rooted by [`body`](FuncDefBody::body))
 //!
 //! ##### Utilities and passes
 //! * [`print`](mod@print): pretty-printer with (styled and hyperlinked) HTML output
@@ -479,7 +479,7 @@ pub enum TypeKind {
     /// attached as `Attr`s on those `Value`s (see [`Attr::QPtr`]).
     //
     // FIXME(eddyb) a "refinement system" that's orthogonal from types, and kept
-    // separately in e.g. `ControlRegionInputDecl`, might be a better approach?
+    // separately in e.g. `RegionInputDecl`, might be a better approach?
     QPtr,
 
     SpvInst {
@@ -624,18 +624,18 @@ pub struct FuncParam {
 // FIXME(eddyb) `FuncDefBody`/`func_def_body` are too long, find shorter names.
 #[derive(Clone)]
 pub struct FuncDefBody {
-    pub control_regions: EntityDefs<ControlRegion>,
+    pub regions: EntityDefs<Region>,
     pub control_nodes: EntityDefs<ControlNode>,
     pub data_insts: EntityDefs<DataInst>,
 
-    /// The [`ControlRegion`] representing the whole body of the function.
+    /// The [`Region`] representing the whole body of the function.
     ///
     /// Function parameters are provided via `body.inputs`, i.e. they can be
-    /// only accessed with `Value::ControlRegionInputs { region: body, idx }`.
+    /// only accessed with `Value::RegionInputs { region: body, idx }`.
     ///
     /// When `unstructured_cfg` is `None`, this includes the structured return
     /// of the function, with `body.outputs` as the returned values.
-    pub body: ControlRegion,
+    pub body: Region,
 
     /// The unstructured (part of the) control-flow graph of the function.
     ///
@@ -648,19 +648,19 @@ pub struct FuncDefBody {
     pub unstructured_cfg: Option<cfg::ControlFlowGraph>,
 }
 
-/// Entity handle for a [`ControlRegionDef`](crate::ControlRegionDef)
+/// Entity handle for a [`RegionDef`](crate::RegionDef)
 /// (a control-flow region).
 ///
-/// A [`ControlRegion`] ("control-flow region") is a linear chain of [`ControlNode`]s,
+/// A [`Region`] ("control-flow region") is a linear chain of [`ControlNode`]s,
 /// describing a single-entry single-exit (SESE) control-flow "region" (subgraph)
 /// in a function's control-flow graph (CFG).
 ///
 /// # Control-flow
 ///
 /// In SPIR-T, two forms of control-flow are used:
-/// * "structured": [`ControlRegion`]s and [`ControlNode`]s in a "mutual tree"
-///   * i.e. each such [`ControlRegion`] can only appear in exactly one [`ControlNode`],
-///     and each [`ControlNode`] can only appear in exactly one [`ControlRegion`]
+/// * "structured": [`Region`]s and [`ControlNode`]s in a "mutual tree"
+///   * i.e. each such [`Region`] can only appear in exactly one [`ControlNode`],
+///     and each [`ControlNode`] can only appear in exactly one [`Region`]
 ///   * a region is either the function's body, or used as part of [`ControlNode`]
 ///     (e.g. the "then" case of an `if`-`else`), itself part of a larger region
 ///   * when inside a region, reaching any other part of the function (or any
@@ -670,16 +670,16 @@ pub struct FuncDefBody {
 ///       [`ControlNode`], or function (the latter being a "structured return")
 ///     * "divergent": execution gets stuck in the region (an infinite loop),
 ///       or is aborted (e.g. `OpTerminateInvocation` from SPIR-V)
-/// * "unstructured": [`ControlRegion`]s which connect to other [`ControlRegion`]s
+/// * "unstructured": [`Region`]s which connect to other [`Region`]s
 ///   using [`cfg::ControlInst`](crate::cfg::ControlInst)s (as described by a
 ///   [`cfg::ControlFlowGraph`](crate::cfg::ControlFlowGraph))
 ///
-/// When a function's entire body can be described by a single [`ControlRegion`],
+/// When a function's entire body can be described by a single [`Region`],
 /// that function is said to have (entirely) "structured control-flow".
 ///
 /// Mixing "structured" and "unstructured" control-flow is supported because:
 /// * during structurization, it allows structured subgraphs to remain connected
-///   by the same CFG edges that were connecting smaller [`ControlRegion`]s before
+///   by the same CFG edges that were connecting smaller [`Region`]s before
 /// * structurization doesn't have to fail in the cases it doesn't fully support
 ///   yet, but can instead result in a "maximally structured" function
 ///
@@ -705,7 +705,7 @@ pub struct FuncDefBody {
 ///   (i.e. in all possible execution paths, the definition precedes all uses)
 ///
 /// But unlike SPIR-V, SPIR-T's structured control-flow has implications for SSA:
-/// * dominance is simpler, so values defined in a [`ControlRegion`](crate::ControlRegion) can be used:
+/// * dominance is simpler, so values defined in a [`Region`](crate::Region) can be used:
 ///   * later in that region, including in the region's `outputs`
 ///     (which allows "exporting" values out to the rest of the function)
 ///   * outside that region, but *only* if the parent [`ControlNode`](crate::ControlNode)
@@ -728,37 +728,37 @@ pub struct FuncDefBody {
 ///     passing values to their target regions
 ///     * all value uses across unstructured control-flow edges (i.e. not in the
 ///       same region containing the value definition) *require* explicit passing,
-///       as unstructured control-flow [`ControlRegion`](crate::ControlRegion)s
+///       as unstructured control-flow [`Region`](crate::Region)s
 ///       do *not* themselves get *any* implied dominance relations from the
 ///       shape of the control-flow graph (unlike most typical CFG+SSA IRs)
-pub use context::ControlRegion;
+pub use context::Region;
 
-/// Definition for a [`ControlRegion`]: a control-flow region.
+/// Definition for a [`Region`]: a control-flow region.
 #[derive(Clone, Default)]
-pub struct ControlRegionDef {
-    /// Inputs to this [`ControlRegion`]:
-    /// * accessed using [`Value::ControlRegionInput`]
+pub struct RegionDef {
+    /// Inputs to this [`Region`]:
+    /// * accessed using [`Value::RegionInput`]
     /// * values provided by the parent:
     ///   * when this is the function body: the function's parameters
-    pub inputs: SmallVec<[ControlRegionInputDecl; 2]>,
+    pub inputs: SmallVec<[RegionInputDecl; 2]>,
 
     pub children: EntityList<ControlNode>,
 
-    /// Output values from this [`ControlRegion`], provided to the parent:
+    /// Output values from this [`Region`], provided to the parent:
     /// * when this is the function body: these are the structured return values
     /// * when this is a `Select` case: these are the values for the parent
     ///   [`ControlNode`]'s outputs (accessed using [`Value::ControlNodeOutput`])
     /// * when this is a `Loop` body: these are the values to be used for the
     ///   next loop iteration's body `inputs`
     ///   * **not** accessible through [`Value::ControlNodeOutput`] on the `Loop`,
-    ///     as it's both confusing regarding [`Value::ControlRegionInput`], and
+    ///     as it's both confusing regarding [`Value::RegionInput`], and
     ///     also there's nothing stopping body-defined values from directly being
     ///     used outside the loop (once that changes, this aspect can be flipped)
     pub outputs: SmallVec<[Value; 2]>,
 }
 
 #[derive(Copy, Clone)]
-pub struct ControlRegionInputDecl {
+pub struct RegionInputDecl {
     pub attrs: AttrSet,
 
     pub ty: Type,
@@ -767,12 +767,12 @@ pub struct ControlRegionInputDecl {
 /// Entity handle for a [`ControlNodeDef`](crate::ControlNodeDef)
 /// (a control-flow operator or leaf).
 ///
-/// See [`ControlRegion`] docs for more on control-flow in SPIR-T.
+/// See [`Region`] docs for more on control-flow in SPIR-T.
 pub use context::ControlNode;
 
 /// Definition for a [`ControlNode`]: a control-flow operator or leaf.
 ///
-/// See [`ControlRegion`] docs for more on control-flow in SPIR-T.
+/// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
 pub struct ControlNodeDef {
     pub kind: ControlNodeKind,
@@ -780,7 +780,7 @@ pub struct ControlNodeDef {
     /// Outputs from this [`ControlNode`]:
     /// * accessed using [`Value::ControlNodeOutput`]
     /// * values provided by `region.outputs`, where `region` is the executed
-    ///   child [`ControlRegion`]:
+    ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
     pub outputs: SmallVec<[ControlNodeOutputDecl; 2]>,
 }
@@ -796,20 +796,20 @@ pub struct ControlNodeOutputDecl {
 pub enum ControlNodeKind {
     /// Linear chain of [`DataInst`]s, executing in sequence.
     ///
-    /// This is only an optimization over keeping [`DataInst`]s in [`ControlRegion`]
+    /// This is only an optimization over keeping [`DataInst`]s in [`Region`]
     /// linear chains directly, or even merging [`DataInst`] with [`ControlNode`].
     Block {
         // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
-        // linked directly into the `ControlRegion` `children` list?
+        // linked directly into the `Region` `children` list?
         insts: EntityList<DataInst>,
     },
 
-    /// Choose one [`ControlRegion`] out of `cases` to execute, based on a single
+    /// Choose one [`Region`] out of `cases` to execute, based on a single
     /// value input (`scrutinee`) interpreted according to [`SelectionKind`].
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: SelectionKind, scrutinee: Value, cases: SmallVec<[ControlRegion; 2]> },
+    Select { kind: SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
 
     /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
     ///
@@ -825,7 +825,7 @@ pub enum ControlNodeKind {
     Loop {
         initial_inputs: SmallVec<[Value; 2]>,
 
-        body: ControlRegion,
+        body: Region,
 
         // FIXME(eddyb) should this be kept in `body.outputs`? (that would not
         // have any ambiguity as to whether it can see `body`-computed values)
@@ -912,19 +912,19 @@ pub enum DataInstKind {
 pub enum Value {
     Const(Const),
 
-    /// One of the inputs to a [`ControlRegion`]:
+    /// One of the inputs to a [`Region`]:
     /// * declared by `region.inputs[input_idx]`
     /// * value provided by the parent of the `region`:
     ///   * when `region` is the function body: `input_idx`th function parameter
-    ControlRegionInput {
-        region: ControlRegion,
+    RegionInput {
+        region: Region,
         input_idx: u32,
     },
 
     /// One of the outputs produced by a [`ControlNode`]:
     /// * declared by `control_node.outputs[output_idx]`
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
-    ///   executed child [`ControlRegion`] (of `control_node`):
+    ///   executed child [`Region`] (of `control_node`):
     ///   * when `control_node` is a `Select`: the case that was chosen
     ControlNodeOutput {
         control_node: ControlNode,

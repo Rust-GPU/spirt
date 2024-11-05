@@ -25,12 +25,12 @@ use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUs
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
-    ControlNodeDef, ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
-    ControlRegionInputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind,
-    DeclDef, Diag, DiagLevel, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, OrdAssertEq, SelectionKind, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, cfg, spv,
+    ControlNodeDef, ControlNodeKind, ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm,
+    DataInstFormDef, DataInstKind, DeclDef, Diag, DiagLevel, DiagMsgPart, EntityListIter,
+    ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
+    GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, OrdAssertEq,
+    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    cfg, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -193,17 +193,17 @@ enum Use {
 
     CxInterned(CxInterned),
 
-    ControlRegionLabel(ControlRegion),
+    RegionLabel(Region),
 
     // FIXME(eddyb) these are `Value`'s variants except `Const`, maybe `Use`
     // should just use `Value` and assert it's never `Const`?
-    ControlRegionInput { region: ControlRegion, input_idx: u32 },
+    RegionInput { region: Region, input_idx: u32 },
     ControlNodeOutput { control_node: ControlNode, output_idx: u32 },
     DataInstOutput(DataInst),
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
-    AlignmentAnchorForControlRegion(ControlRegion),
+    AlignmentAnchorForRegion(Region),
     AlignmentAnchorForControlNode(ControlNode),
     AlignmentAnchorForDataInst(DataInst),
 }
@@ -212,9 +212,7 @@ impl From<Value> for Use {
     fn from(value: Value) -> Self {
         match value {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
-            Value::ControlRegionInput { region, input_idx } => {
-                Use::ControlRegionInput { region, input_idx }
-            }
+            Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
             Value::ControlNodeOutput { control_node, output_idx } => {
                 Use::ControlNodeOutput { control_node, output_idx }
             }
@@ -233,13 +231,13 @@ impl Use {
         match self {
             Self::Node(node) => node.keyword_and_name_prefix().unwrap(),
             Self::CxInterned(interned) => interned.keyword_and_name_prefix(),
-            Self::ControlRegionLabel(_) => ("label", "L"),
+            Self::RegionLabel(_) => ("label", "L"),
 
-            Self::ControlRegionInput { .. }
-            | Self::ControlNodeOutput { .. }
-            | Self::DataInstOutput(_) => ("", "v"),
+            Self::RegionInput { .. } | Self::ControlNodeOutput { .. } | Self::DataInstOutput(_) => {
+                ("", "v")
+            }
 
-            Self::AlignmentAnchorForControlRegion(_)
+            Self::AlignmentAnchorForRegion(_)
             | Self::AlignmentAnchorForControlNode(_)
             | Self::AlignmentAnchorForDataInst(_) => ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX),
         }
@@ -583,8 +581,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
                 for region in cfg.rev_post_order(func_def_body) {
                     if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
                         for &target in &control_inst.targets {
-                            *self.use_counts.entry(Use::ControlRegionLabel(target)).or_default() +=
-                                1;
+                            *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
                         }
                     }
                 }
@@ -650,7 +647,7 @@ pub struct Printer<'a> {
 enum UseStyle {
     /// Refer to the definition by its name prefix and an `idx` (e.g. "T123").
     Anon {
-        /// For intra-function [`Use`]s (i.e. [`Use::ControlRegionLabel`] and values),
+        /// For intra-function [`Use`]s (i.e. [`Use::RegionLabel`] and values),
         /// this disambiguates the parent function (for e.g. anchors).
         parent_func: Option<Func>,
 
@@ -659,7 +656,7 @@ enum UseStyle {
 
     /// Refer to the definition by its name prefix and a `name` (e.g. "T`Foo`").
     Named {
-        /// For intra-function [`Use`]s (i.e. [`Use::ControlRegionLabel`] and values),
+        /// For intra-function [`Use`]s (i.e. [`Use::RegionLabel`] and values),
         /// this disambiguates the parent function (for e.g. anchors).
         parent_func: Option<Func>,
 
@@ -757,8 +754,8 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|(&use_kind, &use_count)| {
                 // HACK(eddyb) these are assigned later.
-                if let Use::ControlRegionLabel(_)
-                | Use::ControlRegionInput { .. }
+                if let Use::RegionLabel(_)
+                | Use::RegionInput { .. }
                 | Use::ControlNodeOutput { .. }
                 | Use::DataInstOutput(_) = use_kind
                 {
@@ -791,11 +788,11 @@ impl<'a> Printer<'a> {
                             deduped_attrs_across_versions.insert(attrs);
                         }
                     }
-                    Use::ControlRegionLabel(_)
-                    | Use::ControlRegionInput { .. }
+                    Use::RegionLabel(_)
+                    | Use::RegionInput { .. }
                     | Use::ControlNodeOutput { .. }
                     | Use::DataInstOutput(_)
-                    | Use::AlignmentAnchorForControlRegion(_)
+                    | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForControlNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => unreachable!(),
                 }
@@ -865,11 +862,11 @@ impl<'a> Printer<'a> {
                     }
                     Use::Node(_) => false,
 
-                    Use::ControlRegionLabel(_)
-                    | Use::ControlRegionInput { .. }
+                    Use::RegionLabel(_)
+                    | Use::RegionInput { .. }
                     | Use::ControlNodeOutput { .. }
                     | Use::DataInstOutput(_)
-                    | Use::AlignmentAnchorForControlRegion(_)
+                    | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForControlNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => {
                         unreachable!()
@@ -888,11 +885,11 @@ impl<'a> Printer<'a> {
                         Use::Node(
                             Node::AllCxInterned | Node::ModuleDialect | Node::ModuleDebugInfo,
                         )
-                        | Use::ControlRegionLabel(_)
-                        | Use::ControlRegionInput { .. }
+                        | Use::RegionLabel(_)
+                        | Use::RegionInput { .. }
                         | Use::ControlNodeOutput { .. }
                         | Use::DataInstOutput(_)
-                        | Use::AlignmentAnchorForControlRegion(_)
+                        | Use::AlignmentAnchorForRegion(_)
                         | Use::AlignmentAnchorForControlNode(_)
                         | Use::AlignmentAnchorForDataInst(_) => {
                             unreachable!()
@@ -946,19 +943,18 @@ impl<'a> Printer<'a> {
                         def.deduped_attrs_across_versions.insert(attrs);
                     }
                 };
-                let visit_region = |func_at_region: FuncAt<'_, ControlRegion>| {
+                let visit_region = |func_at_region: FuncAt<'_, Region>| {
                     let region = func_at_region.position;
 
-                    define(Use::AlignmentAnchorForControlRegion(region), None);
+                    define(Use::AlignmentAnchorForRegion(region), None);
                     // FIXME(eddyb) should labels have names?
-                    define(Use::ControlRegionLabel(region), None);
+                    define(Use::RegionLabel(region), None);
 
-                    let ControlRegionDef { inputs, children, outputs: _ } =
-                        func_def_body.at(region).def();
+                    let RegionDef { inputs, children, outputs: _ } = func_def_body.at(region).def();
 
                     for (i, input_decl) in inputs.iter().enumerate() {
                         define(
-                            Use::ControlRegionInput { region, input_idx: i.try_into().unwrap() },
+                            Use::RegionInput { region, input_idx: i.try_into().unwrap() },
                             Some(input_decl.attrs),
                         );
                     }
@@ -1000,7 +996,7 @@ impl<'a> Printer<'a> {
 
                 // FIXME(eddyb) maybe this should be provided by `visit`.
                 struct VisitAllRegions<F>(F);
-                impl<'a, F: FnMut(FuncAt<'a, ControlRegion>)> Visitor<'a> for VisitAllRegions<F> {
+                impl<'a, F: FnMut(FuncAt<'a, Region>)> Visitor<'a> for VisitAllRegions<F> {
                     // FIXME(eddyb) this is excessive, maybe different kinds of
                     // visitors should exist for module-level and func-level?
                     fn visit_attr_set_use(&mut self, _: AttrSet) {}
@@ -1010,18 +1006,15 @@ impl<'a> Printer<'a> {
                     fn visit_global_var_use(&mut self, _: GlobalVar) {}
                     fn visit_func_use(&mut self, _: Func) {}
 
-                    fn visit_control_region_def(
-                        &mut self,
-                        func_at_control_region: FuncAt<'a, ControlRegion>,
-                    ) {
-                        self.0(func_at_control_region);
-                        func_at_control_region.inner_visit_with(self);
+                    fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
+                        self.0(func_at_region);
+                        func_at_region.inner_visit_with(self);
                     }
                 }
                 func_def_body.inner_visit_with(&mut VisitAllRegions(visit_region));
             }
 
-            let mut control_region_label_counter = 0;
+            let mut region_label_counter = 0;
             let mut value_counter = 0;
             let mut alignment_anchor_counter = 0;
 
@@ -1030,15 +1023,15 @@ impl<'a> Printer<'a> {
             // but only if it's actually used (or is an alignment anchor).
             for (use_kind, def) in intra_func_defs_across_versions {
                 let (counter, use_style_slot) = match use_kind {
-                    Use::ControlRegionLabel(_) => {
-                        (&mut control_region_label_counter, use_styles.get_mut(&use_kind))
+                    Use::RegionLabel(_) => {
+                        (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::ControlRegionInput { .. }
+                    Use::RegionInput { .. }
                     | Use::ControlNodeOutput { .. }
                     | Use::DataInstOutput(_) => (&mut value_counter, use_styles.get_mut(&use_kind)),
 
-                    Use::AlignmentAnchorForControlRegion(_)
+                    Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForControlNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => (
                         &mut alignment_anchor_counter,
@@ -1528,7 +1521,7 @@ impl Use {
                 anchor += name_prefix;
                 suffix.write_escaped_to(&mut anchor).unwrap();
 
-                let name = if let Self::AlignmentAnchorForControlRegion(_)
+                let name = if let Self::AlignmentAnchorForRegion(_)
                 | Self::AlignmentAnchorForControlNode(_)
                 | Self::AlignmentAnchorForDataInst(_) = self
                 {
@@ -1579,12 +1572,12 @@ impl Use {
                         node.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
-                Self::ControlRegionLabel(_)
-                | Self::ControlRegionInput { .. }
+                Self::RegionLabel(_)
+                | Self::RegionInput { .. }
                 | Self::ControlNodeOutput { .. }
                 | Self::DataInstOutput(_) => "_".into(),
 
-                Self::AlignmentAnchorForControlRegion(_)
+                Self::AlignmentAnchorForRegion(_)
                 | Self::AlignmentAnchorForControlNode(_)
                 | Self::AlignmentAnchorForDataInst(_) => unreachable!(),
             },
@@ -2784,7 +2777,7 @@ impl Print for FuncDecl {
                 params.iter().enumerate().map(|(i, param)| {
                     let param_name = match def {
                         DeclDef::Imported(_) => "_".into(),
-                        DeclDef::Present(def) => Value::ControlRegionInput {
+                        DeclDef::Present(def) => Value::RegionInput {
                             region: def.body,
                             input_idx: i.try_into().unwrap(),
                         }
@@ -2812,7 +2805,7 @@ impl Print for FuncDecl {
                     Some(cfg) => cfg
                         .rev_post_order(def)
                         .map(|region| {
-                            let label = Use::ControlRegionLabel(region);
+                            let label = Use::RegionLabel(region);
                             let label_header = if printer.use_styles.contains_key(&label) {
                                 let inputs = &def.at(region).def().inputs;
                                 let label_inputs = if !inputs.is_empty() {
@@ -2820,7 +2813,7 @@ impl Print for FuncDecl {
                                         "(",
                                         inputs.iter().enumerate().map(|(input_idx, input)| {
                                             input.print(printer).insert_name_before_def(
-                                                Value::ControlRegionInput {
+                                                Value::RegionInput {
                                                     region,
                                                     input_idx: input_idx.try_into().unwrap(),
                                                 }
@@ -2882,10 +2875,10 @@ impl Print for FuncParam {
     }
 }
 
-impl Print for FuncAt<'_, ControlRegion> {
+impl Print for FuncAt<'_, Region> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let ControlRegionDef { inputs: _, children, outputs } = self.def();
+        let RegionDef { inputs: _, children, outputs } = self.def();
 
         // NOTE(eddyb) `inputs` are always printed by the parent.
 
@@ -2902,7 +2895,7 @@ impl Print for FuncAt<'_, ControlRegion> {
         };
 
         pretty::Fragment::new([
-            Use::AlignmentAnchorForControlRegion(self.position).print_as_def(printer),
+            Use::AlignmentAnchorForRegion(self.position).print_as_def(printer),
             self.at(*children).into_iter().print(printer),
             outputs_footer,
         ])
@@ -2994,7 +2987,7 @@ impl Print for FuncAt<'_, ControlNode> {
                 let (inputs_header, body_suffix) = if !inputs.is_empty() {
                     let input_decls_and_uses =
                         inputs.iter().enumerate().map(|(input_idx, input)| {
-                            (input, Value::ControlRegionInput {
+                            (input, Value::RegionInput {
                                 region: *body,
                                 input_idx: input_idx.try_into().unwrap(),
                             })
@@ -3063,7 +3056,7 @@ impl Print for FuncAt<'_, ControlNode> {
     }
 }
 
-impl Print for ControlRegionInputDecl {
+impl Print for RegionInputDecl {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
         let Self { attrs, ty } = *self;
@@ -3467,7 +3460,7 @@ impl Print for cfg::ControlInst {
             let mut target = pretty::Fragment::new([
                 kw("branch"),
                 " ".into(),
-                Use::ControlRegionLabel(target_region).print(printer),
+                Use::RegionLabel(target_region).print(printer),
             ]);
             if let Some(inputs) = target_inputs.get(&target_region) {
                 target = pretty::Fragment::new([

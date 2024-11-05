@@ -63,7 +63,7 @@ With the initial focus being on [Rust-GPU]'s usecase, various (otherwise desirab
 * "entity" system for e.g. definitions in a module, instructions in a function, etc.
   * disallows iteration in favor of/forcing the use of efficient indexing
 * structured control-flow "regions" inspired by RVSDG, stricter than SPIR-V
-  (see `ControlRegionDef`'s docs for more details)
+  (see `RegionDef`'s docs for more details)
 
 </td><td>
 
