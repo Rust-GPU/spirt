@@ -12,18 +12,18 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::{
-    Context, ControlNode, ControlNodeDef, DataInst, DataInstDef, EntityDefs, EntityList,
-    EntityListIter, FuncDefBody, Region, RegionDef, Type, Value,
+    Context, DataInst, DataInstDef, EntityDefs, EntityList, EntityListIter, FuncDefBody, Node,
+    NodeDef, Region, RegionDef, Type, Value,
 };
 
 /// Immutable traversal (i.e. visiting) helper for intra-function entities.
 ///
 /// The point/position type `P` should be an entity or a shallow entity wrapper
-/// (e.g. [`EntityList<ControlNode>`]).
+/// (e.g. [`EntityList<Node>`]).
 #[derive(Copy, Clone)]
 pub struct FuncAt<'a, P: Copy> {
     pub regions: &'a EntityDefs<Region>,
-    pub control_nodes: &'a EntityDefs<ControlNode>,
+    pub nodes: &'a EntityDefs<Node>,
     pub data_insts: &'a EntityDefs<DataInst>,
 
     pub position: P,
@@ -34,7 +34,7 @@ impl<'a, P: Copy> FuncAt<'a, P> {
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAt<'a, P2> {
         FuncAt {
             regions: self.regions,
-            control_nodes: self.control_nodes,
+            nodes: self.nodes,
             data_insts: self.data_insts,
             position: new_position,
         }
@@ -46,31 +46,31 @@ impl<'a> FuncAt<'a, Region> {
         &self.regions[self.position]
     }
 
-    pub fn at_children(self) -> FuncAt<'a, EntityList<ControlNode>> {
+    pub fn at_children(self) -> FuncAt<'a, EntityList<Node>> {
         self.at(self.def().children)
     }
 }
 
-impl<'a> IntoIterator for FuncAt<'a, EntityList<ControlNode>> {
-    type IntoIter = FuncAt<'a, EntityListIter<ControlNode>>;
-    type Item = FuncAt<'a, ControlNode>;
+impl<'a> IntoIterator for FuncAt<'a, EntityList<Node>> {
+    type IntoIter = FuncAt<'a, EntityListIter<Node>>;
+    type Item = FuncAt<'a, Node>;
     fn into_iter(self) -> Self::IntoIter {
         self.at(self.position.iter())
     }
 }
 
-impl<'a> Iterator for FuncAt<'a, EntityListIter<ControlNode>> {
-    type Item = FuncAt<'a, ControlNode>;
+impl<'a> Iterator for FuncAt<'a, EntityListIter<Node>> {
+    type Item = FuncAt<'a, Node>;
     fn next(&mut self) -> Option<Self::Item> {
-        let (next, rest) = self.position.split_first(self.control_nodes)?;
+        let (next, rest) = self.position.split_first(self.nodes)?;
         self.position = rest;
         Some(self.at(next))
     }
 }
 
-impl<'a> FuncAt<'a, ControlNode> {
-    pub fn def(self) -> &'a ControlNodeDef {
-        &self.control_nodes[self.position]
+impl<'a> FuncAt<'a, Node> {
+    pub fn def(self) -> &'a NodeDef {
+        &self.nodes[self.position]
     }
 }
 
@@ -113,8 +113,8 @@ impl FuncAt<'_, Value> {
             Value::RegionInput { region, input_idx } => {
                 self.at(region).def().inputs[input_idx as usize].ty
             }
-            Value::ControlNodeOutput { control_node, output_idx } => {
-                self.at(control_node).def().outputs[output_idx as usize].ty
+            Value::NodeOutput { node, output_idx } => {
+                self.at(node).def().outputs[output_idx as usize].ty
             }
             Value::DataInstOutput(inst) => cx[self.at(inst).def().form].output_type.unwrap(),
         }
@@ -124,10 +124,10 @@ impl FuncAt<'_, Value> {
 /// Mutable traversal (i.e. transforming) helper for intra-function entities.
 ///
 /// The point/position type `P` should be an entity or a shallow entity wrapper
-/// (e.g. [`EntityList<ControlNode>`]).
+/// (e.g. [`EntityList<Node>`]).
 pub struct FuncAtMut<'a, P: Copy> {
     pub regions: &'a mut EntityDefs<Region>,
-    pub control_nodes: &'a mut EntityDefs<ControlNode>,
+    pub nodes: &'a mut EntityDefs<Node>,
     pub data_insts: &'a mut EntityDefs<DataInst>,
 
     pub position: P,
@@ -138,7 +138,7 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     pub fn reborrow(&mut self) -> FuncAtMut<'_, P> {
         FuncAtMut {
             regions: self.regions,
-            control_nodes: self.control_nodes,
+            nodes: self.nodes,
             data_insts: self.data_insts,
             position: self.position,
         }
@@ -148,7 +148,7 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAtMut<'a, P2> {
         FuncAtMut {
             regions: self.regions,
-            control_nodes: self.control_nodes,
+            nodes: self.nodes,
             data_insts: self.data_insts,
             position: new_position,
         }
@@ -158,8 +158,8 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     //
     // FIXME(eddyb) maybe find a better name for this?
     pub fn freeze(self) -> FuncAt<'a, P> {
-        let FuncAtMut { regions, control_nodes, data_insts, position } = self;
-        FuncAt { regions, control_nodes, data_insts, position }
+        let FuncAtMut { regions, nodes, data_insts, position } = self;
+        FuncAt { regions, nodes, data_insts, position }
     }
 }
 
@@ -168,32 +168,32 @@ impl<'a> FuncAtMut<'a, Region> {
         &mut self.regions[self.position]
     }
 
-    pub fn at_children(mut self) -> FuncAtMut<'a, EntityList<ControlNode>> {
+    pub fn at_children(mut self) -> FuncAtMut<'a, EntityList<Node>> {
         let children = self.reborrow().def().children;
         self.at(children)
     }
 }
 
 // HACK(eddyb) can't implement `IntoIterator` because `next` borrows `self`.
-impl<'a> FuncAtMut<'a, EntityList<ControlNode>> {
-    pub fn into_iter(self) -> FuncAtMut<'a, EntityListIter<ControlNode>> {
+impl<'a> FuncAtMut<'a, EntityList<Node>> {
+    pub fn into_iter(self) -> FuncAtMut<'a, EntityListIter<Node>> {
         let iter = self.position.iter();
         self.at(iter)
     }
 }
 
 // HACK(eddyb) can't implement `Iterator` because `next` borrows `self`.
-impl FuncAtMut<'_, EntityListIter<ControlNode>> {
-    pub fn next(&mut self) -> Option<FuncAtMut<'_, ControlNode>> {
-        let (next, rest) = self.position.split_first(self.control_nodes)?;
+impl FuncAtMut<'_, EntityListIter<Node>> {
+    pub fn next(&mut self) -> Option<FuncAtMut<'_, Node>> {
+        let (next, rest) = self.position.split_first(self.nodes)?;
         self.position = rest;
         Some(self.reborrow().at(next))
     }
 }
 
-impl<'a> FuncAtMut<'a, ControlNode> {
-    pub fn def(self) -> &'a mut ControlNodeDef {
-        &mut self.control_nodes[self.position]
+impl<'a> FuncAtMut<'a, Node> {
+    pub fn def(self) -> &'a mut NodeDef {
+        &mut self.nodes[self.position]
     }
 }
 
@@ -225,7 +225,7 @@ impl FuncDefBody {
     pub fn at<P: Copy>(&self, position: P) -> FuncAt<'_, P> {
         FuncAt {
             regions: &self.regions,
-            control_nodes: &self.control_nodes,
+            nodes: &self.nodes,
             data_insts: &self.data_insts,
             position,
         }
@@ -235,7 +235,7 @@ impl FuncDefBody {
     pub fn at_mut<P: Copy>(&mut self, position: P) -> FuncAtMut<'_, P> {
         FuncAtMut {
             regions: &mut self.regions,
-            control_nodes: &mut self.control_nodes,
+            nodes: &mut self.nodes,
             data_insts: &mut self.data_insts,
             position,
         }

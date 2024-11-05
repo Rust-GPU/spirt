@@ -2,9 +2,9 @@
 
 use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
-    AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeDef, ControlNodeKind,
-    ControlNodeOutputDecl, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet, Region,
-    RegionDef, SelectionKind, Type, TypeKind, Value, spv,
+    AttrSet, Const, ConstDef, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap,
+    FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, SelectionKind, Type,
+    TypeKind, Value, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -666,7 +666,7 @@ impl<T> DeferredEdgeBundle<T> {
 
 /// A recipe for computing a control-flow-sensitive (boolean) condition [`Value`],
 /// potentially requiring merging through an arbitrary number of `Select`s
-/// (via per-case outputs and [`Value::ControlNodeOutput`], for each `Select`).
+/// (via per-case outputs and [`Value::NodeOutput`], for each `Select`).
 ///
 /// This should largely be equivalent to eagerly generating all region outputs
 /// that might be needed, and then removing the unused ones, but this way we
@@ -686,7 +686,7 @@ enum LazyCond {
 
 enum LazyCondMerge {
     Select {
-        control_node: ControlNode,
+        node: Node,
         // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
         // `LazyCond::{Undef,False,True}`, and that could more efficiently be
         // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Merge`
@@ -956,7 +956,7 @@ impl DeferredEdgeBundleSet {
 /// - merging into a larger region (i.e. its nearest dominator)
 //
 // FIXME(eddyb) consider never having to claim the function body itself,
-// by wrapping the CFG in a `ControlNode` instead.
+// by wrapping the CFG in a `Node` instead.
 struct ClaimedRegion {
     // FIXME(eddyb) find a way to clarify that this can differ from the target
     // of `try_claim_edge_bundle`, and also that `deferred_edges` are from the
@@ -965,10 +965,10 @@ struct ClaimedRegion {
 
     /// The [`Value`]s that `Value::RegionInput { region: structured_body, .. }`
     /// will get on entry into `structured_body`, when this region ends up
-    /// merged into a larger region, or as a child of a new [`ControlNode`].
+    /// merged into a larger region, or as a child of a new [`Node`].
     //
     // FIXME(eddyb) don't replace `Value::RegionInput { region: structured_body, .. }`
-    // with `region_inputs` when `structured_body` ends up a `ControlNode` child,
+    // with `region_inputs` when `structured_body` ends up a `Node` child,
     // but instead make all `Region`s entirely hermetic wrt inputs.
     structured_body_inputs: SmallVec<[Value; 2]>,
 
@@ -1072,7 +1072,7 @@ impl<'a> Structurizer<'a> {
         }
 
         // FIXME(eddyb) it might work much better to have the unstructured CFG
-        // wrapped in a `ControlNode` inside the function body, instead.
+        // wrapped in a `Node` inside the function body, instead.
         let func_body_deferred_edges = {
             let func_entry_pseudo_edge = {
                 let target = self.func_def_body.body;
@@ -1228,7 +1228,7 @@ impl<'a> Structurizer<'a> {
                 backedge;
             let body = target;
 
-            // HACK(eddyb) due to `Loop` `ControlNode`s not being hermetic on
+            // HACK(eddyb) due to `Loop` `Node`s not being hermetic on
             // the output side yet (i.e. they still have SSA-like semantics),
             // it gets wrapped in a `Region`, which can be as hermetic as
             // the loop body itself was originally.
@@ -1241,7 +1241,7 @@ impl<'a> Structurizer<'a> {
             // starting as `initial_inputs` and being replaced with body outputs
             // after every loop iteration.
             //
-            // FIXME(eddyb) `Loop` `ControlNode`s should be changed to be hermetic
+            // FIXME(eddyb) `Loop` `Node`s should be changed to be hermetic
             // and have the loop state be output from the whole node itself,
             // for any outside uses of values defined within the loop body.
             let body_def = self.func_def_body.at_mut(body).def();
@@ -1295,10 +1295,10 @@ impl<'a> Structurizer<'a> {
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
 
             let repeat_condition = self.materialize_lazy_cond(&repeat_condition);
-            let loop_node = self.func_def_body.control_nodes.define(
+            let loop_node = self.func_def_body.nodes.define(
                 self.cx,
-                ControlNodeDef {
-                    kind: ControlNodeKind::Loop { initial_inputs, body, repeat_condition },
+                NodeDef {
+                    kind: NodeKind::Loop { initial_inputs, body, repeat_condition },
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
@@ -1306,9 +1306,7 @@ impl<'a> Structurizer<'a> {
 
             let wrapper_region_def = &mut self.func_def_body.regions[wrapper_region];
             wrapper_region_def.inputs = original_input_decls;
-            wrapper_region_def
-                .children
-                .insert_last(loop_node, &mut self.func_def_body.control_nodes);
+            wrapper_region_def.children.insert_last(loop_node, &mut self.func_def_body.nodes);
 
             // HACK(eddyb) we've treated loop exits as extra "false edges", so
             // here they have to be added to the loop (potentially unlocking
@@ -1372,7 +1370,7 @@ impl<'a> Structurizer<'a> {
             );
 
         // Start with the concatenation of `region` and `control_inst_on_exit`,
-        // always appending `ControlNode`s (including the children of entire
+        // always appending `Node`s (including the children of entire
         // `ClaimedRegion`s) to `region`'s definition itself.
         let mut deferred_edges = {
             let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
@@ -1426,8 +1424,8 @@ impl<'a> Structurizer<'a> {
                     assert_eq!((inputs.len(), target_regions.len()), (0, 0));
 
                     // FIXME(eddyb) this may result in lost optimizations over
-                    // actually encoding it in `ControlNode`/`Region`
-                    // (e.g. a new `ControlNodeKind`, or replacing region `outputs`),
+                    // actually encoding it in `Node`/`Region`
+                    // (e.g. a new `NodeKind`, or replacing region `outputs`),
                     // but it's simpler to handle it like this.
                     //
                     // NOTE(eddyb) actually, this encoding is lossless *during*
@@ -1448,17 +1446,17 @@ impl<'a> Structurizer<'a> {
                 ControlInstKind::ExitInvocation(kind) => {
                     assert_eq!(target_regions.len(), 0);
 
-                    let control_node = self.func_def_body.control_nodes.define(
+                    let node = self.func_def_body.nodes.define(
                         self.cx,
-                        ControlNodeDef {
-                            kind: ControlNodeKind::ExitInvocation { kind, inputs },
+                        NodeDef {
+                            kind: NodeKind::ExitInvocation { kind, inputs },
                             outputs: [].into_iter().collect(),
                         }
                         .into(),
                     );
                     self.func_def_body.regions[region]
                         .children
-                        .insert_last(control_node, &mut self.func_def_body.control_nodes);
+                        .insert_last(node, &mut self.func_def_body.nodes);
 
                     DeferredEdgeBundleSet::Unreachable
                 }
@@ -1558,7 +1556,7 @@ impl<'a> Structurizer<'a> {
         }
     }
 
-    /// Append to `parent_region` a new `Select` [`ControlNode`] built from
+    /// Append to `parent_region` a new `Select` [`Node`] built from
     /// partially structured `cases`, merging all of their `deferred_edges`
     /// together into a combined `DeferredEdgeBundleSet` (which gets returned).
     //
@@ -1602,7 +1600,7 @@ impl<'a> Structurizer<'a> {
         }
 
         // Support lazily defining the `Select` node, as soon as it's necessary
-        // (i.e. to plumb per-case dataflow through `Value::ControlNodeOutput`s),
+        // (i.e. to plumb per-case dataflow through `Value::NodeOutput`s),
         // but also if any of the cases actually have non-empty regions, which
         // is checked after the special-cases (which return w/o a `Select` at all).
         //
@@ -1630,17 +1628,17 @@ impl<'a> Structurizer<'a> {
                     .collect();
                 let scrutinee =
                     scrutinee.unwrap_or_else(|lazy_cond| this.materialize_lazy_cond(lazy_cond));
-                let select_node = this.func_def_body.control_nodes.define(
+                let select_node = this.func_def_body.nodes.define(
                     this.cx,
-                    ControlNodeDef {
-                        kind: ControlNodeKind::Select { kind, scrutinee, cases },
+                    NodeDef {
+                        kind: NodeKind::Select { kind, scrutinee, cases },
                         outputs: [].into_iter().collect(),
                     }
                     .into(),
                 );
                 this.func_def_body.regions[parent_region]
                     .children
-                    .insert_last(select_node, &mut this.func_def_body.control_nodes);
+                    .insert_last(select_node, &mut this.func_def_body.nodes);
                 select_node
             })
         };
@@ -1797,20 +1795,20 @@ impl<'a> Structurizer<'a> {
                     let select_node = get_or_define_select_node(self, &cases);
                     let output_decls = &mut self.func_def_body.at_mut(select_node).def().outputs;
                     let output_idx = output_decls.len();
-                    output_decls.push(ControlNodeOutputDecl { attrs: AttrSet::default(), ty });
+                    output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty });
                     for (case_idx, v) in per_case_target_input.enumerate() {
                         let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
 
                         let case_region = match &self.func_def_body.at(select_node).def().kind {
-                            ControlNodeKind::Select { cases, .. } => cases[case_idx],
+                            NodeKind::Select { cases, .. } => cases[case_idx],
                             _ => unreachable!(),
                         };
                         let outputs = &mut self.func_def_body.at_mut(case_region).def().outputs;
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
                     }
-                    Value::ControlNodeOutput {
-                        control_node: select_node,
+                    Value::NodeOutput {
+                        node: select_node,
                         output_idx: output_idx.try_into().unwrap(),
                     }
                 })
@@ -1833,7 +1831,7 @@ impl<'a> Structurizer<'a> {
                 LazyCond::True
             } else {
                 LazyCond::Merge(Rc::new(LazyCondMerge::Select {
-                    control_node: get_or_define_select_node(self, &cases),
+                    node: get_or_define_select_node(self, &cases),
                     per_case_conds: per_case_conds.cloned().collect(),
                 }))
             };
@@ -1853,7 +1851,7 @@ impl<'a> Structurizer<'a> {
         // `region_input_rewrites`.
         //
         // FIXME(eddyb) don't replace `Value::RegionInput { region, .. }`
-        // with `region_inputs` when the `region` ends up a `ControlNode` child,
+        // with `region_inputs` when the `region` ends up a `Node` child,
         // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
         for case in cases {
@@ -1889,7 +1887,7 @@ impl<'a> Structurizer<'a> {
             // special-case (repalcing with just `cond`), that cannot be expressed
             // currently in `LazyCond` itself (but maybe it should be).
             LazyCond::Merge(merge) => {
-                let LazyCondMerge::Select { control_node, ref per_case_conds } = **merge;
+                let LazyCondMerge::Select { node, ref per_case_conds } = **merge;
 
                 // HACK(eddyb) this won't actually allocate most of the time,
                 // and avoids complications later below, when mutating the cases.
@@ -1898,10 +1896,9 @@ impl<'a> Structurizer<'a> {
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let ControlNodeDef { kind, outputs: output_decls } =
-                    &mut *self.func_def_body.control_nodes[control_node];
+                let NodeDef { kind, outputs: output_decls } = &mut *self.func_def_body.nodes[node];
                 let cases = match kind {
-                    ControlNodeKind::Select { kind, scrutinee, cases } => {
+                    NodeKind::Select { kind, scrutinee, cases } => {
                         assert_eq!(cases.len(), per_case_conds.len());
 
                         if let SelectionKind::BoolCond = kind {
@@ -1924,8 +1921,7 @@ impl<'a> Structurizer<'a> {
                 };
 
                 let output_idx = u32::try_from(output_decls.len()).unwrap();
-                output_decls
-                    .push(ControlNodeOutputDecl { attrs: AttrSet::default(), ty: self.type_bool });
+                output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty: self.type_bool });
 
                 for (&case, cond) in cases.iter().zip_eq(per_case_conds) {
                     let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
@@ -1933,7 +1929,7 @@ impl<'a> Structurizer<'a> {
                     assert_eq!(outputs.len(), output_decls.len());
                 }
 
-                Value::ControlNodeOutput { control_node, output_idx }
+                Value::NodeOutput { node, output_idx }
             }
         }
     }
@@ -1960,7 +1956,7 @@ impl<'a> Structurizer<'a> {
                     mem::take(&mut self.func_def_body.at_mut(structured_body).def().children);
                 self.func_def_body.regions[parent_region]
                     .children
-                    .append(new_children, &mut self.func_def_body.control_nodes);
+                    .append(new_children, &mut self.func_def_body.nodes);
                 deferred_edges
             }
             Err(deferred_edges) => deferred_edges,

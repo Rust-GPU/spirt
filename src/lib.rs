@@ -625,7 +625,7 @@ pub struct FuncParam {
 #[derive(Clone)]
 pub struct FuncDefBody {
     pub regions: EntityDefs<Region>,
-    pub control_nodes: EntityDefs<ControlNode>,
+    pub nodes: EntityDefs<Node>,
     pub data_insts: EntityDefs<DataInst>,
 
     /// The [`Region`] representing the whole body of the function.
@@ -651,23 +651,23 @@ pub struct FuncDefBody {
 /// Entity handle for a [`RegionDef`](crate::RegionDef)
 /// (a control-flow region).
 ///
-/// A [`Region`] ("control-flow region") is a linear chain of [`ControlNode`]s,
+/// A [`Region`] ("control-flow region") is a linear chain of [`Node`]s,
 /// describing a single-entry single-exit (SESE) control-flow "region" (subgraph)
 /// in a function's control-flow graph (CFG).
 ///
 /// # Control-flow
 ///
 /// In SPIR-T, two forms of control-flow are used:
-/// * "structured": [`Region`]s and [`ControlNode`]s in a "mutual tree"
-///   * i.e. each such [`Region`] can only appear in exactly one [`ControlNode`],
-///     and each [`ControlNode`] can only appear in exactly one [`Region`]
-///   * a region is either the function's body, or used as part of [`ControlNode`]
+/// * "structured": [`Region`]s and [`Node`]s in a "mutual tree"
+///   * i.e. each such [`Region`] can only appear in exactly one [`Node`],
+///     and each [`Node`] can only appear in exactly one [`Region`]
+///   * a region is either the function's body, or used as part of [`Node`]
 ///     (e.g. the "then" case of an `if`-`else`), itself part of a larger region
 ///   * when inside a region, reaching any other part of the function (or any
 ///     other function on call stack) requires leaving through the region's
 ///     single exit (also called "merge") point, i.e. its execution is either:
 ///     * "convergent": the region completes and continues into its parent
-///       [`ControlNode`], or function (the latter being a "structured return")
+///       [`Node`], or function (the latter being a "structured return")
 ///     * "divergent": execution gets stuck in the region (an infinite loop),
 ///       or is aborted (e.g. `OpTerminateInvocation` from SPIR-V)
 /// * "unstructured": [`Region`]s which connect to other [`Region`]s
@@ -698,8 +698,8 @@ pub struct FuncDefBody {
 ///
 /// SPIR-T [`Value`](crate::Value)s follow "single static assignment" (SSA), just like SPIR-V:
 /// * inside a function, any new value is produced (or "defined") as an output
-///   of [`DataInst`]/[`ControlNode`], and "uses" of that value are [`Value`](crate::Value)s
-///   variants which refer to the defining [`DataInst`]/[`ControlNode`] directly
+///   of [`DataInst`]/[`Node`], and "uses" of that value are [`Value`](crate::Value)s
+///   variants which refer to the defining [`DataInst`]/[`Node`] directly
 ///   (guaranteeing the "single" and "static" of "SSA", by construction)
 /// * the definition of a value must "dominate" all of its uses
 ///   (i.e. in all possible execution paths, the definition precedes all uses)
@@ -708,10 +708,10 @@ pub struct FuncDefBody {
 /// * dominance is simpler, so values defined in a [`Region`](crate::Region) can be used:
 ///   * later in that region, including in the region's `outputs`
 ///     (which allows "exporting" values out to the rest of the function)
-///   * outside that region, but *only* if the parent [`ControlNode`](crate::ControlNode)
+///   * outside that region, but *only* if the parent [`Node`](crate::Node)
 ///     is a `Loop` (that is, when the region is a loop's body)
 ///     * this is an "emergent" property, stemming from the region having to
-///       execute (at least once) before the parent [`ControlNode`](crate::ControlNode)
+///       execute (at least once) before the parent [`Node`](crate::Node)
 ///       can complete, but is not is not ideal and should eventually be replaced
 ///       with passing all such values through loop (body) `outputs`
 /// * instead of φ ("phi") nodes, SPIR-T uses region `outputs` to merge values
@@ -742,15 +742,15 @@ pub struct RegionDef {
     ///   * when this is the function body: the function's parameters
     pub inputs: SmallVec<[RegionInputDecl; 2]>,
 
-    pub children: EntityList<ControlNode>,
+    pub children: EntityList<Node>,
 
     /// Output values from this [`Region`], provided to the parent:
     /// * when this is the function body: these are the structured return values
     /// * when this is a `Select` case: these are the values for the parent
-    ///   [`ControlNode`]'s outputs (accessed using [`Value::ControlNodeOutput`])
+    ///   [`Node`]'s outputs (accessed using [`Value::NodeOutput`])
     /// * when this is a `Loop` body: these are the values to be used for the
     ///   next loop iteration's body `inputs`
-    ///   * **not** accessible through [`Value::ControlNodeOutput`] on the `Loop`,
+    ///   * **not** accessible through [`Value::NodeOutput`] on the `Loop`,
     ///     as it's both confusing regarding [`Value::RegionInput`], and
     ///     also there's nothing stopping body-defined values from directly being
     ///     used outside the loop (once that changes, this aspect can be flipped)
@@ -764,40 +764,40 @@ pub struct RegionInputDecl {
     pub ty: Type,
 }
 
-/// Entity handle for a [`ControlNodeDef`](crate::ControlNodeDef)
+/// Entity handle for a [`NodeDef`](crate::NodeDef)
 /// (a control-flow operator or leaf).
 ///
 /// See [`Region`] docs for more on control-flow in SPIR-T.
-pub use context::ControlNode;
+pub use context::Node;
 
-/// Definition for a [`ControlNode`]: a control-flow operator or leaf.
+/// Definition for a [`Node`]: a control-flow operator or leaf.
 ///
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
-pub struct ControlNodeDef {
-    pub kind: ControlNodeKind,
+pub struct NodeDef {
+    pub kind: NodeKind,
 
-    /// Outputs from this [`ControlNode`]:
-    /// * accessed using [`Value::ControlNodeOutput`]
+    /// Outputs from this [`Node`]:
+    /// * accessed using [`Value::NodeOutput`]
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
-    pub outputs: SmallVec<[ControlNodeOutputDecl; 2]>,
+    pub outputs: SmallVec<[NodeOutputDecl; 2]>,
 }
 
 #[derive(Copy, Clone)]
-pub struct ControlNodeOutputDecl {
+pub struct NodeOutputDecl {
     pub attrs: AttrSet,
 
     pub ty: Type,
 }
 
 #[derive(Clone)]
-pub enum ControlNodeKind {
+pub enum NodeKind {
     /// Linear chain of [`DataInst`]s, executing in sequence.
     ///
     /// This is only an optimization over keeping [`DataInst`]s in [`Region`]
-    /// linear chains directly, or even merging [`DataInst`] with [`ControlNode`].
+    /// linear chains directly, or even merging [`DataInst`] with [`Node`].
     Block {
         // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
         // linked directly into the `Region` `children` list?
@@ -840,7 +840,7 @@ pub enum ControlNodeKind {
     ExitInvocation {
         kind: cfg::ExitInvocationKind,
 
-        // FIXME(eddyb) centralize `Value` inputs across `ControlNode`s,
+        // FIXME(eddyb) centralize `Value` inputs across `Node`s,
         // and only use stricter types for building/traversing the IR.
         inputs: SmallVec<[Value; 2]>,
     },
@@ -860,8 +860,8 @@ pub use context::DataInst;
 
 /// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
 //
-// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `ControlNodeKind`,
-// but also `DataInst` vs `ControlNode` is a purely artificial distinction.
+// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `NodeKind`,
+// but also `DataInst` vs `Node` is a purely artificial distinction.
 #[derive(Clone)]
 pub struct DataInstDef {
     pub attrs: AttrSet,
@@ -921,13 +921,13 @@ pub enum Value {
         input_idx: u32,
     },
 
-    /// One of the outputs produced by a [`ControlNode`]:
-    /// * declared by `control_node.outputs[output_idx]`
+    /// One of the outputs produced by a [`Node`]:
+    /// * declared by `node.outputs[output_idx]`
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
-    ///   executed child [`Region`] (of `control_node`):
-    ///   * when `control_node` is a `Select`: the case that was chosen
-    ControlNodeOutput {
-        control_node: ControlNode,
+    ///   executed child [`Region`] (of `node`):
+    ///   * when `node` is a `Select`: the case that was chosen
+    NodeOutput {
+        node: Node,
         output_idx: u32,
     },
 
