@@ -4,10 +4,10 @@ use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNodeDef, ControlNodeKind,
-    ControlRegion, ControlRegionDef, ControlRegionInputDecl, DataInstDef, DataInstFormDef,
-    DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
+    DataInstDef, DataInstFormDef, DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey,
+    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody,
+    Import, InternedStr, Module, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -737,10 +737,10 @@ impl Module {
                 let def = match pending_imports.remove(&func_id) {
                     Some(import) => DeclDef::Imported(import),
                     None => {
-                        let mut control_regions = EntityDefs::default();
-                        let body = control_regions.define(&cx, ControlRegionDef::default());
+                        let mut regions = EntityDefs::default();
+                        let body = regions.define(&cx, RegionDef::default());
                         DeclDef::Present(FuncDefBody {
-                            control_regions,
+                            regions,
                             control_nodes: Default::default(),
                             data_insts: Default::default(),
                             body,
@@ -838,7 +838,7 @@ impl Module {
             #[derive(Copy, Clone)]
             enum LocalIdDef {
                 Value(Value),
-                BlockLabel(ControlRegion),
+                BlockLabel(Region),
             }
 
             #[derive(PartialEq, Eq, Hash)]
@@ -862,7 +862,7 @@ impl Module {
             // `OpPhi`s are also collected here, to assign them per-edge.
             let mut phi_to_values = FxIndexMap::<PhiKey, SmallVec<[spv::Id; 1]>>::default();
             // FIXME(eddyb) wouldn't `EntityOrientedDenseMap` make more sense?
-            let mut block_details = FxIndexMap::<ControlRegion, BlockDetails>::default();
+            let mut block_details = FxIndexMap::<Region, BlockDetails>::default();
             let mut has_blocks = false;
             let mut cfgssa_def_map = {
                 // FIXME(eddyb) in theory, this could be a toggle, but there is
@@ -902,10 +902,7 @@ impl Module {
 
                                 DeclDef::Present(def) => def.body,
                             };
-                            LocalIdDef::Value(Value::ControlRegionInput {
-                                region: body,
-                                input_idx: idx,
-                            })
+                            LocalIdDef::Value(Value::RegionInput { region: body, input_idx: idx })
                         } else {
                             let is_entry_block = !has_blocks;
                             has_blocks = true;
@@ -918,13 +915,11 @@ impl Module {
 
                             if opcode == wk.OpLabel {
                                 let block = if is_entry_block {
-                                    // A `ControlRegion` was defined earlier,
+                                    // A `Region` was defined earlier,
                                     // to be able to create the `FuncDefBody`.
                                     func_def_body.body
                                 } else {
-                                    func_def_body
-                                        .control_regions
-                                        .define(&cx, ControlRegionDef::default())
+                                    func_def_body.regions.define(&cx, RegionDef::default())
                                 };
                                 block_details.insert(block, BlockDetails {
                                     label_id: id,
@@ -960,7 +955,7 @@ impl Module {
                                         .push(value_id);
                                 }
 
-                                LocalIdDef::Value(Value::ControlRegionInput {
+                                LocalIdDef::Value(Value::RegionInput {
                                     region: current_block,
                                     input_idx: phi_idx,
                                 })
@@ -1055,7 +1050,7 @@ impl Module {
 
                     if opcode == wk.OpLabel {
                         current_block = match local_id_defs[&result_id.unwrap()] {
-                            LocalIdDef::BlockLabel(control_region) => control_region,
+                            LocalIdDef::BlockLabel(region) => region,
                             LocalIdDef::Value(_) => unreachable!(),
                         };
                         continue;
@@ -1112,14 +1107,14 @@ impl Module {
             }
 
             struct CurrentBlock<'a> {
-                region: ControlRegion,
+                region: Region,
 
                 // FIXME(eddyb) figure out a better name and/or organization for this.
                 details: &'a BlockDetails,
 
                 // HACK(eddyb) this is probably very inefficient but allows easy
                 // access to inter-block-used IDs, in a form directly usable in
-                // the current block (i.e. `ControlRegion` inputs).
+                // the current block (i.e. `Region` inputs).
                 shadowed_local_id_defs: FxIndexMap<spv::Id, LocalIdDef>,
             }
 
@@ -1198,7 +1193,7 @@ impl Module {
                             .at_mut_body()
                             .def()
                             .inputs
-                            .push(ControlRegionInputDecl { attrs, ty });
+                            .push(RegionInputDecl { attrs, ty });
                     }
                     continue;
                 }
@@ -1212,7 +1207,7 @@ impl Module {
                         return Err(invalid("block lacks terminator instruction"));
                     }
 
-                    // A `ControlRegion` (using an empty `Block` `ControlNode`
+                    // A `Region` (using an empty `Block` `ControlNode`
                     // as its sole child) was defined earlier,
                     // to be able to have an entry in `local_id_defs`.
                     let region = match local_id_defs[&result_id.unwrap()] {
@@ -1239,10 +1234,9 @@ impl Module {
                 let current_block = current_block.as_mut().ok_or_else(|| {
                     invalid("out of order: not expected before the function's blocks")
                 })?;
-                let current_block_control_region_def =
-                    &mut func_def_body.control_regions[current_block.region];
+                let current_block_region_def = &mut func_def_body.regions[current_block.region];
 
-                // HACK(eddyb) the `ControlRegion` inputs for inter-block uses
+                // HACK(eddyb) the `Region` inputs for inter-block uses
                 // have to be inserted just after all the `OpPhi`s' region inputs,
                 // or right away (e.g. on `OpLabel`) when there are no `OpPhi`s,
                 // so the easiest place to insert them is before handling the
@@ -1251,22 +1245,19 @@ impl Module {
                     && current_block.shadowed_local_id_defs.is_empty()
                     && !current_block.details.cfgssa_inter_block_uses.is_empty()
                 {
-                    assert!(current_block_control_region_def.children.is_empty());
+                    assert!(current_block_region_def.children.is_empty());
 
                     current_block.shadowed_local_id_defs.extend(
                         current_block.details.cfgssa_inter_block_uses.iter().map(
                             |(&used_id, &ty)| {
-                                let input_idx = current_block_control_region_def
+                                let input_idx =
+                                    current_block_region_def.inputs.len().try_into().unwrap();
+                                current_block_region_def
                                     .inputs
-                                    .len()
-                                    .try_into()
-                                    .unwrap();
-                                current_block_control_region_def
-                                    .inputs
-                                    .push(ControlRegionInputDecl { attrs: AttrSet::default(), ty });
+                                    .push(RegionInputDecl { attrs: AttrSet::default(), ty });
                                 (
                                     used_id,
-                                    LocalIdDef::Value(Value::ControlRegionInput {
+                                    LocalIdDef::Value(Value::RegionInput {
                                         region: current_block.region,
                                         input_idx,
                                     }),
@@ -1424,16 +1415,16 @@ impl Module {
                             target_inputs,
                         });
                 } else if opcode == wk.OpPhi {
-                    if !current_block_control_region_def.children.is_empty() {
+                    if !current_block_region_def.children.is_empty() {
                         return Err(invalid(
                             "out of order: `OpPhi`s should come before \
                              the rest of the block's instructions",
                         ));
                     }
 
-                    current_block_control_region_def
+                    current_block_region_def
                         .inputs
-                        .push(ControlRegionInputDecl { attrs, ty: result_type.unwrap() });
+                        .push(RegionInputDecl { attrs, ty: result_type.unwrap() });
                 } else if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
                     let is_second_to_last_in_block = lookahead_raw_inst(2)
                         .map_or(true, |next_raw_inst| {
@@ -1570,7 +1561,7 @@ impl Module {
                         None => func_def_body.data_insts.define(&cx, data_inst_def.into()),
                     };
 
-                    let current_block_control_node = current_block_control_region_def
+                    let current_block_control_node = current_block_region_def
                         .children
                         .iter()
                         .last
@@ -1589,7 +1580,7 @@ impl Module {
                                 }
                                 .into(),
                             );
-                            current_block_control_region_def
+                            current_block_region_def
                                 .children
                                 .insert_last(block_node, &mut func_def_body.control_nodes);
                             block_node

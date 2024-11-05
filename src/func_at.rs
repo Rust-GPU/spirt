@@ -12,8 +12,8 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::{
-    Context, ControlNode, ControlNodeDef, ControlRegion, ControlRegionDef, DataInst, DataInstDef,
-    EntityDefs, EntityList, EntityListIter, FuncDefBody, Type, Value,
+    Context, ControlNode, ControlNodeDef, DataInst, DataInstDef, EntityDefs, EntityList,
+    EntityListIter, FuncDefBody, Region, RegionDef, Type, Value,
 };
 
 /// Immutable traversal (i.e. visiting) helper for intra-function entities.
@@ -22,7 +22,7 @@ use crate::{
 /// (e.g. [`EntityList<ControlNode>`]).
 #[derive(Copy, Clone)]
 pub struct FuncAt<'a, P: Copy> {
-    pub control_regions: &'a EntityDefs<ControlRegion>,
+    pub regions: &'a EntityDefs<Region>,
     pub control_nodes: &'a EntityDefs<ControlNode>,
     pub data_insts: &'a EntityDefs<DataInst>,
 
@@ -33,7 +33,7 @@ impl<'a, P: Copy> FuncAt<'a, P> {
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAt<'a, P2> {
         FuncAt {
-            control_regions: self.control_regions,
+            regions: self.regions,
             control_nodes: self.control_nodes,
             data_insts: self.data_insts,
             position: new_position,
@@ -41,9 +41,9 @@ impl<'a, P: Copy> FuncAt<'a, P> {
     }
 }
 
-impl<'a> FuncAt<'a, ControlRegion> {
-    pub fn def(self) -> &'a ControlRegionDef {
-        &self.control_regions[self.position]
+impl<'a> FuncAt<'a, Region> {
+    pub fn def(self) -> &'a RegionDef {
+        &self.regions[self.position]
     }
 
     pub fn at_children(self) -> FuncAt<'a, EntityList<ControlNode>> {
@@ -110,7 +110,7 @@ impl FuncAt<'_, Value> {
     pub fn type_of(self, cx: &Context) -> Type {
         match self.position {
             Value::Const(ct) => cx[ct].ty,
-            Value::ControlRegionInput { region, input_idx } => {
+            Value::RegionInput { region, input_idx } => {
                 self.at(region).def().inputs[input_idx as usize].ty
             }
             Value::ControlNodeOutput { control_node, output_idx } => {
@@ -126,7 +126,7 @@ impl FuncAt<'_, Value> {
 /// The point/position type `P` should be an entity or a shallow entity wrapper
 /// (e.g. [`EntityList<ControlNode>`]).
 pub struct FuncAtMut<'a, P: Copy> {
-    pub control_regions: &'a mut EntityDefs<ControlRegion>,
+    pub regions: &'a mut EntityDefs<Region>,
     pub control_nodes: &'a mut EntityDefs<ControlNode>,
     pub data_insts: &'a mut EntityDefs<DataInst>,
 
@@ -137,7 +137,7 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     /// Emulate a "reborrow", which is automatic only for `&mut` types.
     pub fn reborrow(&mut self) -> FuncAtMut<'_, P> {
         FuncAtMut {
-            control_regions: self.control_regions,
+            regions: self.regions,
             control_nodes: self.control_nodes,
             data_insts: self.data_insts,
             position: self.position,
@@ -147,7 +147,7 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAtMut<'a, P2> {
         FuncAtMut {
-            control_regions: self.control_regions,
+            regions: self.regions,
             control_nodes: self.control_nodes,
             data_insts: self.data_insts,
             position: new_position,
@@ -158,14 +158,14 @@ impl<'a, P: Copy> FuncAtMut<'a, P> {
     //
     // FIXME(eddyb) maybe find a better name for this?
     pub fn freeze(self) -> FuncAt<'a, P> {
-        let FuncAtMut { control_regions, control_nodes, data_insts, position } = self;
-        FuncAt { control_regions, control_nodes, data_insts, position }
+        let FuncAtMut { regions, control_nodes, data_insts, position } = self;
+        FuncAt { regions, control_nodes, data_insts, position }
     }
 }
 
-impl<'a> FuncAtMut<'a, ControlRegion> {
-    pub fn def(self) -> &'a mut ControlRegionDef {
-        &mut self.control_regions[self.position]
+impl<'a> FuncAtMut<'a, Region> {
+    pub fn def(self) -> &'a mut RegionDef {
+        &mut self.regions[self.position]
     }
 
     pub fn at_children(mut self) -> FuncAtMut<'a, EntityList<ControlNode>> {
@@ -224,7 +224,7 @@ impl FuncDefBody {
     /// Start immutably traversing the function at `position`.
     pub fn at<P: Copy>(&self, position: P) -> FuncAt<'_, P> {
         FuncAt {
-            control_regions: &self.control_regions,
+            regions: &self.regions,
             control_nodes: &self.control_nodes,
             data_insts: &self.data_insts,
             position,
@@ -234,7 +234,7 @@ impl FuncDefBody {
     /// Start mutably traversing the function at `position`.
     pub fn at_mut<P: Copy>(&mut self, position: P) -> FuncAtMut<'_, P> {
         FuncAtMut {
-            control_regions: &mut self.control_regions,
+            regions: &mut self.regions,
             control_nodes: &mut self.control_nodes,
             data_insts: &mut self.data_insts,
             position,
@@ -242,12 +242,12 @@ impl FuncDefBody {
     }
 
     /// Shorthand for `func_def_body.at(func_def_body.body)`.
-    pub fn at_body(&self) -> FuncAt<'_, ControlRegion> {
+    pub fn at_body(&self) -> FuncAt<'_, Region> {
         self.at(self.body)
     }
 
     /// Shorthand for `func_def_body.at_mut(func_def_body.body)`.
-    pub fn at_mut_body(&mut self) -> FuncAtMut<'_, ControlRegion> {
+    pub fn at_mut_body(&mut self) -> FuncAtMut<'_, Region> {
         self.at_mut(self.body)
     }
 }

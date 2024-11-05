@@ -5,11 +5,10 @@ use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeKind,
-    ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey, Exportee, Func,
-    FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
-    cfg,
+    ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind,
+    DeclDef, EntityList, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet,
+    GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Region,
+    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -251,7 +250,7 @@ struct FuncLifting<'a> {
     param_ids: SmallVec<[spv::Id; 4]>,
 
     // FIXME(eddyb) use `EntityOrientedDenseMap` here.
-    region_inputs_source: FxHashMap<ControlRegion, RegionInputsSource>,
+    region_inputs_source: FxHashMap<Region, RegionInputsSource>,
     // FIXME(eddyb) use `EntityOrientedDenseMap` here.
     data_inst_output_ids: FxHashMap<DataInst, spv::Id>,
 
@@ -259,11 +258,11 @@ struct FuncLifting<'a> {
     blocks: FxIndexMap<CfgPoint, BlockLifting<'a>>,
 }
 
-/// What determines the values for [`Value::ControlRegionInput`]s, for a specific
+/// What determines the values for [`Value::RegionInput`]s, for a specific
 /// region (effectively the subset of "region parents" that support inputs).
 ///
 /// Note that this is not used when a [`cfg::ControlInst`] has `target_inputs`,
-/// and the target [`ControlRegion`] itself has phis for its `inputs`.
+/// and the target [`Region`] itself has phis for its `inputs`.
 enum RegionInputsSource {
     FuncParams,
     LoopHeaderPhis(ControlNode),
@@ -273,8 +272,8 @@ enum RegionInputsSource {
 /// that may require a separate SPIR-V basic block.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum CfgPoint {
-    RegionEntry(ControlRegion),
-    RegionExit(ControlRegion),
+    RegionEntry(Region),
+    RegionExit(Region),
 
     ControlNodeEntry(ControlNode),
     ControlNodeExit(ControlNode),
@@ -300,7 +299,7 @@ struct Phi {
 }
 
 /// Similar to [`cfg::ControlInst`], except:
-/// * `targets` use [`CfgPoint`]s instead of [`ControlRegion`]s, to be able to
+/// * `targets` use [`CfgPoint`]s instead of [`Region`]s, to be able to
 ///   reach any of the SPIR-V blocks being created during lifting
 /// * φ ("phi") values can be provided for targets regardless of "which side" of
 ///   the structured control-flow they are for ("region input" vs "node output")
@@ -386,7 +385,7 @@ impl<'a> NeedsIdsCollector<'a> {
 }
 
 /// Helper type for deep traversal of the CFG (as a graph of [`CfgPoint`]s), which
-/// tracks the necessary context for navigating a [`ControlRegion`]/[`ControlNode`].
+/// tracks the necessary context for navigating a [`Region`]/[`ControlNode`].
 #[derive(Copy, Clone)]
 struct CfgCursor<'p, P = CfgPoint> {
     point: P,
@@ -394,7 +393,7 @@ struct CfgCursor<'p, P = CfgPoint> {
 }
 
 enum ControlParent {
-    Region(ControlRegion),
+    Region(Region),
     ControlNode(ControlNode),
 }
 
@@ -404,7 +403,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
     fn unique_successor(self) -> Option<CfgCursor<'p>> {
         let cursor = self.position;
         match cursor.point {
-            // Entering a `ControlRegion` enters its first `ControlNode` child,
+            // Entering a `Region` enters its first `ControlNode` child,
             // or exits the region right away (if it has no children).
             CfgPoint::RegionEntry(region) => Some(CfgCursor {
                 point: match self.at(region).def().children.iter().first {
@@ -414,7 +413,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 parent: cursor.parent,
             }),
 
-            // Exiting a `ControlRegion` exits its parent `ControlNode`.
+            // Exiting a `Region` exits its parent `ControlNode`.
             CfgPoint::RegionExit(_) => cursor.parent.map(|parent| match parent.point {
                 ControlParent::Region(_) => unreachable!(),
                 ControlParent::ControlNode(parent_control_node) => CfgCursor {
@@ -438,13 +437,13 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
             // Exiting a `ControlNode` chains to a sibling/parent.
             CfgPoint::ControlNodeExit(control_node) => {
                 Some(match self.control_nodes[control_node].next_in_list() {
-                    // Enter the next sibling in the `ControlRegion`, if one exists.
+                    // Enter the next sibling in the `Region`, if one exists.
                     Some(next_control_node) => CfgCursor {
                         point: CfgPoint::ControlNodeEntry(next_control_node),
                         parent: cursor.parent,
                     },
 
-                    // Exit the parent `ControlRegion`.
+                    // Exit the parent `Region`.
                     None => {
                         let parent = cursor.parent.unwrap();
                         match cursor.parent.unwrap().point {
@@ -461,8 +460,8 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
     }
 }
 
-impl FuncAt<'_, ControlRegion> {
-    /// Traverse every [`CfgPoint`] (deeply) contained in this [`ControlRegion`],
+impl FuncAt<'_, Region> {
+    /// Traverse every [`CfgPoint`] (deeply) contained in this [`Region`],
     /// in reverse post-order (RPO), with `f` receiving each [`CfgPoint`]
     /// in turn (wrapped in [`CfgCursor`], for further traversal flexibility),
     /// and being able to stop iteration by returning `Err`.
@@ -562,7 +561,7 @@ impl<'a> FuncLifting<'a> {
                             .def()
                             .inputs
                             .iter()
-                            .map(|&ControlRegionInputDecl { attrs, ty }| {
+                            .map(|&RegionInputDecl { attrs, ty }| {
                                 Ok(Phi {
                                     attrs,
                                     ty,
@@ -596,7 +595,7 @@ impl<'a> FuncLifting<'a> {
                             loop_body_inputs
                                 .iter()
                                 .enumerate()
-                                .map(|(i, &ControlRegionInputDecl { attrs, ty })| {
+                                .map(|(i, &RegionInputDecl { attrs, ty })| {
                                     Ok(Phi {
                                         attrs,
                                         ty,
@@ -641,7 +640,7 @@ impl<'a> FuncLifting<'a> {
 
             // Get the terminator, or reconstruct it from structured control-flow.
             let terminator = match (point, func_def_body.at(point_cursor).unique_successor()) {
-                // Exiting a `ControlRegion` w/o a structured parent.
+                // Exiting a `Region` w/o a structured parent.
                 (CfgPoint::RegionExit(region), None) => {
                     let unstructured_terminator = func_def_body
                         .unstructured_cfg
@@ -681,7 +680,7 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Entering a `ControlNode` with child `ControlRegion`s (or diverging).
+                // Entering a `ControlNode` with child `Region`s (or diverging).
                 (CfgPoint::ControlNodeEntry(control_node), None) => {
                     let control_node_def = func_def_body.at(control_node).def();
                     match &control_node_def.kind {
@@ -733,7 +732,7 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Exiting a `ControlRegion` to the parent `ControlNode`.
+                // Exiting a `Region` to the parent `ControlNode`.
                 (CfgPoint::RegionExit(region), Some(parent_exit_cursor)) => {
                     let region_outputs = Some(&func_def_body.at(region).def().outputs[..])
                         .filter(|outputs| !outputs.is_empty());
@@ -805,7 +804,7 @@ impl<'a> FuncLifting<'a> {
                     }
                 }
 
-                // Siblings in the same `ControlRegion` (including the
+                // Siblings in the same `Region` (including the
                 // implied edge from a `Block`'s `Entry` to its `Exit`).
                 (_, Some(succ_cursor)) => Terminator {
                     attrs: AttrSet::default(),
@@ -1086,7 +1085,7 @@ impl LazyInst<'_, '_> {
 
                 _ => ids.globals[&Global::Const(ct)],
             },
-            Value::ControlRegionInput { region, input_idx } => {
+            Value::RegionInput { region, input_idx } => {
                 let input_idx = usize::try_from(input_idx).unwrap();
                 match parent_func.region_inputs_source.get(&region) {
                     Some(RegionInputsSource::FuncParams) => parent_func.param_ids[input_idx],

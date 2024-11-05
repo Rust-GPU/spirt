@@ -783,7 +783,7 @@ impl<'a> InferUsage<'a> {
                     for (v, usage) in usage_or_err_attrs_to_attach {
                         let attrs = match v {
                             Value::Const(_) => unreachable!(),
-                            Value::ControlRegionInput { region, input_idx } => {
+                            Value::RegionInput { region, input_idx } => {
                                 &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
                                     .attrs
                             }
@@ -879,13 +879,13 @@ impl<'a> InferUsage<'a> {
                             // FIXME(eddyb) may be relevant?
                             _ => unreachable!(),
                         },
-                        Value::ControlRegionInput { region, input_idx }
+                        Value::RegionInput { region, input_idx }
                             if region == func_def_body.body =>
                         {
                             &mut param_usages[input_idx as usize]
                         }
                         // FIXME(eddyb) implement
-                        Value::ControlRegionInput { .. } | Value::ControlNodeOutput { .. } => {
+                        Value::RegionInput { .. } | Value::ControlNodeOutput { .. } => {
                             usage_or_err_attrs_to_attach.push((
                                 ptr,
                                 Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),

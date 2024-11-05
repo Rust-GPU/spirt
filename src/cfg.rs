@@ -3,8 +3,8 @@
 use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeDef, ControlNodeKind,
-    ControlNodeOutputDecl, ControlRegion, ControlRegionDef, EntityOrientedDenseMap, FuncDefBody,
-    FxIndexMap, FxIndexSet, SelectionKind, Type, TypeKind, Value, spv,
+    ControlNodeOutputDecl, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet, Region,
+    RegionDef, SelectionKind, Type, TypeKind, Value, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -12,15 +12,15 @@ use std::mem;
 use std::rc::Rc;
 
 /// The control-flow graph (CFG) of a function, as control-flow instructions
-/// ([`ControlInst`]s) attached to [`ControlRegion`]s, as an "action on exit", i.e.
+/// ([`ControlInst`]s) attached to [`Region`]s, as an "action on exit", i.e.
 /// "terminator" (while intra-region control-flow is strictly structured).
 #[derive(Clone, Default)]
 pub struct ControlFlowGraph {
-    pub control_inst_on_exit_from: EntityOrientedDenseMap<ControlRegion, ControlInst>,
+    pub control_inst_on_exit_from: EntityOrientedDenseMap<Region, ControlInst>,
 
     // HACK(eddyb) this currently only comes from `OpLoopMerge`, and cannot be
     // inferred (because implies too strong of an ownership/uniqueness notion).
-    pub loop_merge_to_loop_header: FxIndexMap<ControlRegion, ControlRegion>,
+    pub loop_merge_to_loop_header: FxIndexMap<Region, Region>,
 }
 
 #[derive(Clone)]
@@ -32,15 +32,15 @@ pub struct ControlInst {
     pub inputs: SmallVec<[Value; 2]>,
 
     // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub targets: SmallVec<[ControlRegion; 4]>,
+    pub targets: SmallVec<[Region; 4]>,
 
     /// `target_inputs[region][input_idx]` is the [`Value`] that
-    /// `Value::ControlRegionInput { region, input_idx }` will get on entry,
+    /// `Value::RegionInput { region, input_idx }` will get on entry,
     /// where `region` must be appear at least once in `targets` - this is a
     /// separate map instead of being part of `targets` because it reflects the
     /// limitations of φ ("phi") nodes, which (unlike "basic block arguments")
     /// cannot tell apart multiple edges with the same source and destination.
-    pub target_inputs: FxIndexMap<ControlRegion, SmallVec<[Value; 2]>>,
+    pub target_inputs: FxIndexMap<Region, SmallVec<[Value; 2]>>,
 }
 
 #[derive(Clone)]
@@ -74,7 +74,7 @@ pub enum ExitInvocationKind {
 }
 
 impl ControlFlowGraph {
-    /// Iterate over all [`ControlRegion`]s making up `func_def_body`'s CFG, in
+    /// Iterate over all [`Region`]s making up `func_def_body`'s CFG, in
     /// reverse post-order (RPO).
     ///
     /// RPO iteration over a CFG provides certain guarantees, most importantly
@@ -82,7 +82,7 @@ impl ControlFlowGraph {
     pub fn rev_post_order(
         &self,
         func_def_body: &FuncDefBody,
-    ) -> impl DoubleEndedIterator<Item = ControlRegion> {
+    ) -> impl DoubleEndedIterator<Item = Region> {
         let mut post_order = SmallVec::<[_; 8]>::new();
         self.traverse_whole_func(func_def_body, &mut TraversalState {
             incoming_edge_counts: EntityOrientedDenseMap::new(),
@@ -102,7 +102,7 @@ impl ControlFlowGraph {
 // HACK(eddyb) this only serves to disallow accessing `private_count` field of
 // `IncomingEdgeCount`.
 mod sealed {
-    /// Opaque newtype for the count of incoming edges (into a [`ControlRegion`](crate::ControlRegion)).
+    /// Opaque newtype for the count of incoming edges (into a [`Region`](crate::Region)).
     ///
     /// The private field prevents direct mutation or construction, forcing the
     /// use of [`IncomingEdgeCount::ONE`] and addition operations to produce some
@@ -129,8 +129,8 @@ mod sealed {
 }
 use sealed::IncomingEdgeCount;
 
-struct TraversalState<PreVisit: FnMut(ControlRegion), PostVisit: FnMut(ControlRegion)> {
-    incoming_edge_counts: EntityOrientedDenseMap<ControlRegion, IncomingEdgeCount>,
+struct TraversalState<PreVisit: FnMut(Region), PostVisit: FnMut(Region)> {
+    incoming_edge_counts: EntityOrientedDenseMap<Region, IncomingEdgeCount>,
     pre_order_visit: PreVisit,
     post_order_visit: PostVisit,
 
@@ -142,7 +142,7 @@ impl ControlFlowGraph {
     fn traverse_whole_func(
         &self,
         func_def_body: &FuncDefBody,
-        state: &mut TraversalState<impl FnMut(ControlRegion), impl FnMut(ControlRegion)>,
+        state: &mut TraversalState<impl FnMut(Region), impl FnMut(Region)>,
     ) {
         let func_at_body = func_def_body.at_body();
 
@@ -155,8 +155,8 @@ impl ControlFlowGraph {
 
     fn traverse(
         &self,
-        region: ControlRegion,
-        state: &mut TraversalState<impl FnMut(ControlRegion), impl FnMut(ControlRegion)>,
+        region: Region,
+        state: &mut TraversalState<impl FnMut(Region), impl FnMut(Region)>,
     ) {
         // FIXME(eddyb) `EntityOrientedDenseMap` should have an `entry` API.
         if let Some(existing_count) = state.incoming_edge_counts.get_mut(region) {
@@ -214,15 +214,15 @@ struct LoopFinder<'a> {
     cfg: &'a ControlFlowGraph,
 
     // FIXME(eddyb) this feels a bit inefficient (are many-exit loops rare?).
-    loop_header_to_exit_targets: FxIndexMap<ControlRegion, FxIndexSet<ControlRegion>>,
+    loop_header_to_exit_targets: FxIndexMap<Region, FxIndexSet<Region>>,
 
     /// SCC accumulation stack, where CFG nodes collect during the depth-first
     /// traversal, and are only popped when their "SCC root" (loop header) is
     /// (note that multiple SCCs on the stack does *not* indicate SCC nesting,
     /// but rather a path between two SCCs, i.e. a loop *following* another).
-    scc_stack: Vec<ControlRegion>,
+    scc_stack: Vec<Region>,
     /// Per-CFG-node traversal state (often just pointing to a `scc_stack` slot).
-    scc_state: EntityOrientedDenseMap<ControlRegion, SccState>,
+    scc_state: EntityOrientedDenseMap<Region, SccState>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -295,7 +295,7 @@ impl<'a> LoopFinder<'a> {
     // FIXME(eddyb) name of the function is a bit clunky wrt its return type.
     fn find_earliest_scc_root_of(
         &mut self,
-        node: ControlRegion,
+        node: Region,
     ) -> (Option<SccStackIdx>, EventualCfgExits) {
         let state_entry = self.scc_state.entry(node);
         if let Some(state) = &state_entry {
@@ -464,36 +464,34 @@ pub struct Structurizer<'a> {
     func_def_body: &'a mut FuncDefBody,
 
     // FIXME(eddyb) this feels a bit inefficient (are many-exit loops rare?).
-    loop_header_to_exit_targets: FxIndexMap<ControlRegion, FxIndexSet<ControlRegion>>,
+    loop_header_to_exit_targets: FxIndexMap<Region, FxIndexSet<Region>>,
 
     // HACK(eddyb) this also tracks all of `loop_header_to_exit_targets`, as
     // "false edges" from every loop header to each exit target of that loop,
     // which structurizing that loop consumes to "unlock" its own exits.
-    incoming_edge_counts_including_loop_exits:
-        EntityOrientedDenseMap<ControlRegion, IncomingEdgeCount>,
+    incoming_edge_counts_including_loop_exits: EntityOrientedDenseMap<Region, IncomingEdgeCount>,
 
     /// `structurize_region_state[region]` tracks `.structurize_region(region)`
     /// progress/results (see also [`StructurizeRegionState`]'s docs).
     //
     // FIXME(eddyb) use `EntityOrientedDenseMap` (which lacks iteration by design).
-    structurize_region_state: FxIndexMap<ControlRegion, StructurizeRegionState>,
+    structurize_region_state: FxIndexMap<Region, StructurizeRegionState>,
 
     /// Accumulated rewrites (caused by e.g. `target_inputs`s, but not only),
-    /// i.e.: `Value::ControlRegionInput { region, input_idx }` must be
-    /// rewritten based on `control_region_input_rewrites[region]`, as either
+    /// i.e.: `Value::RegionInput { region, input_idx }` must be
+    /// rewritten based on `region_input_rewrites[region]`, as either
     /// the original `region` wasn't reused, or its inputs were renumbered.
-    control_region_input_rewrites:
-        EntityOrientedDenseMap<ControlRegion, ControlRegionInputRewrites>,
+    region_input_rewrites: EntityOrientedDenseMap<Region, RegionInputRewrites>,
 }
 
-/// How all `Value::ControlRegionInput { region, input_idx }` for a `region`
-/// must be rewritten (see also `control_region_input_rewrites` docs).
-enum ControlRegionInputRewrites {
+/// How all `Value::RegionInput { region, input_idx }` for a `region`
+/// must be rewritten (see also `region_input_rewrites` docs).
+enum RegionInputRewrites {
     /// Complete replacement with another value (which can take any form), as
     /// `region` wasn't kept in its original form in the final structured IR.
     ///
     /// **Note**: such replacement can be chained, i.e. a replacement value can
-    /// be `Value::ControlRegionInput { region: other_region, .. }`, and then
+    /// be `Value::RegionInput { region: other_region, .. }`, and then
     /// `other_region` itself may have its inputs written.
     ReplaceWith(SmallVec<[Value; 2]>),
 
@@ -510,11 +508,11 @@ enum ControlRegionInputRewrites {
     RenumberOrReplaceWith(SmallVec<[Result<u32, Value>; 2]>),
 }
 
-impl ControlRegionInputRewrites {
+impl RegionInputRewrites {
     // HACK(eddyb) this is here because it depends on a field of `Structurizer`
     // and borrowing issues ensue if it's made a method of `Structurizer`.
     fn rewrite_all(
-        rewrites: &EntityOrientedDenseMap<ControlRegion, Self>,
+        rewrites: &EntityOrientedDenseMap<Region, Self>,
     ) -> impl crate::transform::Transformer + '_ {
         // FIXME(eddyb) maybe this should be provided by `transform`.
         use crate::transform::*;
@@ -527,7 +525,7 @@ impl ControlRegionInputRewrites {
 
         ReplaceValueWith(move |v| {
             let mut new_v = v;
-            while let Value::ControlRegionInput { region, input_idx } = new_v {
+            while let Value::RegionInput { region, input_idx } = new_v {
                 match rewrites.get(region) {
                     // NOTE(eddyb) this needs to be able to apply multiple replacements,
                     // due to the input potentially having redundantly chained `OpPhi`s.
@@ -536,14 +534,14 @@ impl ControlRegionInputRewrites {
                     // final value inside `rewrites` while replacements are being made,
                     // to avoid going through a chain more than once (and some of these
                     // replacements could also be applied early).
-                    Some(ControlRegionInputRewrites::ReplaceWith(replacements)) => {
+                    Some(RegionInputRewrites::ReplaceWith(replacements)) => {
                         new_v = replacements[input_idx as usize];
                     }
-                    Some(ControlRegionInputRewrites::RenumberOrReplaceWith(
+                    Some(RegionInputRewrites::RenumberOrReplaceWith(
                         renumbering_and_replacements,
                     )) => match renumbering_and_replacements[input_idx as usize] {
                         Ok(new_idx) => {
-                            new_v = Value::ControlRegionInput { region, input_idx: new_idx };
+                            new_v = Value::RegionInput { region, input_idx: new_idx };
                             break;
                         }
                         Err(replacement) => new_v = replacement,
@@ -601,7 +599,7 @@ struct IncomingEdgeBundle<T> {
     target: T,
     accumulated_count: IncomingEdgeCount,
 
-    /// The [`Value`]s that `Value::ControlRegionInput { region, .. }` will get
+    /// The [`Value`]s that `Value::RegionInput { region, .. }` will get
     /// on entry into `region`, through this "edge bundle".
     target_inputs: SmallVec<[Value; 2]>,
 }
@@ -698,10 +696,10 @@ enum LazyCondMerge {
 }
 
 /// A target for one of the edge bundles in a [`DeferredEdgeBundleSet`], mostly
-/// separate from [`ControlRegion`] to allow expressing returns as well.
+/// separate from [`Region`] to allow expressing returns as well.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum DeferredTarget {
-    Region(ControlRegion),
+    Region(Region),
 
     /// Structured "return" out of the function (with `target_inputs` used for
     /// the function body `output`s, i.e. inputs of [`ControlInstKind::Return`]).
@@ -951,7 +949,7 @@ impl DeferredEdgeBundleSet {
 }
 
 /// A successfully "claimed" (via `try_claim_edge_bundle`) partially structurized
-/// CFG subgraph (i.e. set of [`ControlRegion`]s previously connected by CFG edges),
+/// CFG subgraph (i.e. set of [`Region`]s previously connected by CFG edges),
 /// which is effectively owned by the "claimer" and **must** be used for:
 /// - the whole function body (if `deferred_edges` only contains `Return`)
 /// - one of the cases of a `Select` node
@@ -963,15 +961,15 @@ struct ClaimedRegion {
     // FIXME(eddyb) find a way to clarify that this can differ from the target
     // of `try_claim_edge_bundle`, and also that `deferred_edges` are from the
     // perspective of being "inside" `structured_body` (wrt hermeticity).
-    structured_body: ControlRegion,
+    structured_body: Region,
 
-    /// The [`Value`]s that `Value::ControlRegionInput { region: structured_body, .. }`
+    /// The [`Value`]s that `Value::RegionInput { region: structured_body, .. }`
     /// will get on entry into `structured_body`, when this region ends up
     /// merged into a larger region, or as a child of a new [`ControlNode`].
     //
-    // FIXME(eddyb) don't replace `Value::ControlRegionInput { region: structured_body, .. }`
+    // FIXME(eddyb) don't replace `Value::RegionInput { region: structured_body, .. }`
     // with `region_inputs` when `structured_body` ends up a `ControlNode` child,
-    // but instead make all `ControlRegion`s entirely hermetic wrt inputs.
+    // but instead make all `Region`s entirely hermetic wrt inputs.
     structured_body_inputs: SmallVec<[Value; 2]>,
 
     /// The transitive targets which couldn't be claimed into `structured_body`
@@ -1063,7 +1061,7 @@ impl<'a> Structurizer<'a> {
             incoming_edge_counts_including_loop_exits,
 
             structurize_region_state: FxIndexMap::default(),
-            control_region_input_rewrites: EntityOrientedDenseMap::new(),
+            region_input_rewrites: EntityOrientedDenseMap::new(),
         }
     }
 
@@ -1154,20 +1152,20 @@ impl<'a> Structurizer<'a> {
         }
 
         // The last step of structurization is applying rewrites accumulated
-        // while structurizing (i.e. `control_region_input_rewrites`).
+        // while structurizing (i.e. `region_input_rewrites`).
         //
         // FIXME(eddyb) obsolete this by fully taking advantage of hermeticity,
-        // and only replacing `Value::ControlRegionInput { region, .. }` within
+        // and only replacing `Value::RegionInput { region, .. }` within
         // `region`'s children, shallowly, whenever `region` gets claimed.
-        self.func_def_body.inner_in_place_transform_with(
-            &mut ControlRegionInputRewrites::rewrite_all(&self.control_region_input_rewrites),
-        );
+        self.func_def_body.inner_in_place_transform_with(&mut RegionInputRewrites::rewrite_all(
+            &self.region_input_rewrites,
+        ));
     }
 
     fn try_claim_edge_bundle(
         &mut self,
-        edge_bundle: IncomingEdgeBundle<ControlRegion>,
-    ) -> Result<ClaimedRegion, IncomingEdgeBundle<ControlRegion>> {
+        edge_bundle: IncomingEdgeBundle<Region>,
+    ) -> Result<ClaimedRegion, IncomingEdgeBundle<Region>> {
         let target = edge_bundle.target;
 
         // Always attempt structurization before checking the `IncomingEdgeCount`,
@@ -1232,12 +1230,11 @@ impl<'a> Structurizer<'a> {
 
             // HACK(eddyb) due to `Loop` `ControlNode`s not being hermetic on
             // the output side yet (i.e. they still have SSA-like semantics),
-            // it gets wrapped in a `ControlRegion`, which can be as hermetic as
+            // it gets wrapped in a `Region`, which can be as hermetic as
             // the loop body itself was originally.
             // NOTE(eddyb) both input declarations and the child `Loop` node are
             // added later down below, after the `Loop` node is created.
-            let wrapper_region =
-                self.func_def_body.control_regions.define(self.cx, ControlRegionDef::default());
+            let wrapper_region = self.func_def_body.regions.define(self.cx, RegionDef::default());
 
             // Any loop body region inputs, which must receive values from both
             // the loop entry and the backedge, become explicit "loop state",
@@ -1258,32 +1255,30 @@ impl<'a> Structurizer<'a> {
             // feasible to move `body`'s children into a new region without
             // wasting it completely (i.e. can't swap with `wrapper_region`).
             let mut initial_inputs = SmallVec::<[_; 2]>::new();
-            let body_input_rewrites = ControlRegionInputRewrites::RenumberOrReplaceWith(
+            let body_input_rewrites = RegionInputRewrites::RenumberOrReplaceWith(
                 backedge
                     .target_inputs
                     .into_iter()
                     .enumerate()
                     .map(|(original_idx, mut backedge_value)| {
-                        ControlRegionInputRewrites::rewrite_all(
-                            &self.control_region_input_rewrites,
-                        )
-                        .transform_value_use(&backedge_value)
-                        .apply_to(&mut backedge_value);
+                        RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
+                            .transform_value_use(&backedge_value)
+                            .apply_to(&mut backedge_value);
 
                         let original_idx = u32::try_from(original_idx).unwrap();
                         if backedge_value
-                            == (Value::ControlRegionInput { region: body, input_idx: original_idx })
+                            == (Value::RegionInput { region: body, input_idx: original_idx })
                         {
                             // FIXME(eddyb) does this have to be general purpose,
                             // or could this be handled as `None` with a single
-                            // `wrapper_region` per `ControlRegionInputRewrites`?
-                            Err(Value::ControlRegionInput {
+                            // `wrapper_region` per `RegionInputRewrites`?
+                            Err(Value::RegionInput {
                                 region: wrapper_region,
                                 input_idx: original_idx,
                             })
                         } else {
                             let renumbered_idx = u32::try_from(body_def.inputs.len()).unwrap();
-                            initial_inputs.push(Value::ControlRegionInput {
+                            initial_inputs.push(Value::RegionInput {
                                 region: wrapper_region,
                                 input_idx: original_idx,
                             });
@@ -1294,7 +1289,7 @@ impl<'a> Structurizer<'a> {
                     })
                     .collect(),
             );
-            self.control_region_input_rewrites.insert(body, body_input_rewrites);
+            self.region_input_rewrites.insert(body, body_input_rewrites);
 
             assert_eq!(initial_inputs.len(), body_def.inputs.len());
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
@@ -1309,7 +1304,7 @@ impl<'a> Structurizer<'a> {
                 .into(),
             );
 
-            let wrapper_region_def = &mut self.func_def_body.control_regions[wrapper_region];
+            let wrapper_region_def = &mut self.func_def_body.regions[wrapper_region];
             wrapper_region_def.inputs = original_input_decls;
             wrapper_region_def
                 .children
@@ -1347,7 +1342,7 @@ impl<'a> Structurizer<'a> {
     /// done through, `self.structurize_region_state[region]`.
     ///
     /// See also [`StructurizeRegionState`]'s docs.
-    fn structurize_region(&mut self, region: ControlRegion) {
+    fn structurize_region(&mut self, region: Region) {
         {
             let old_state =
                 self.structurize_region_state.insert(region, StructurizeRegionState::InProgress);
@@ -1431,7 +1426,7 @@ impl<'a> Structurizer<'a> {
                     assert_eq!((inputs.len(), target_regions.len()), (0, 0));
 
                     // FIXME(eddyb) this may result in lost optimizations over
-                    // actually encoding it in `ControlNode`/`ControlRegion`
+                    // actually encoding it in `ControlNode`/`Region`
                     // (e.g. a new `ControlNodeKind`, or replacing region `outputs`),
                     // but it's simpler to handle it like this.
                     //
@@ -1461,7 +1456,7 @@ impl<'a> Structurizer<'a> {
                         }
                         .into(),
                     );
-                    self.func_def_body.control_regions[region]
+                    self.func_def_body.regions[region]
                         .children
                         .insert_last(control_node, &mut self.func_def_body.control_nodes);
 
@@ -1570,7 +1565,7 @@ impl<'a> Structurizer<'a> {
     // FIXME(eddyb) handle `unreachable` cases losslessly.
     fn structurize_select_into(
         &mut self,
-        parent_region: ControlRegion,
+        parent_region: Region,
         kind: SelectionKind,
         scrutinee: Result<Value, &LazyCond>,
         mut cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
@@ -1622,10 +1617,9 @@ impl<'a> Structurizer<'a> {
                     .map(|case| {
                         let case_region = match case {
                             &Ok(ClaimedRegion { structured_body, .. }) => structured_body,
-                            Err(_) => this
-                                .func_def_body
-                                .control_regions
-                                .define(this.cx, ControlRegionDef::default()),
+                            Err(_) => {
+                                this.func_def_body.regions.define(this.cx, RegionDef::default())
+                            }
                         };
 
                         // FIXME(eddyb) should these be asserts that it's already empty?
@@ -1644,7 +1638,7 @@ impl<'a> Structurizer<'a> {
                     }
                     .into(),
                 );
-                this.func_def_body.control_regions[parent_region]
+                this.func_def_body.regions[parent_region]
                     .children
                     .insert_last(select_node, &mut this.func_def_body.control_nodes);
                 select_node
@@ -1683,12 +1677,12 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        // FIXME(eddyb) `control_region_input_rewrites` mappings, generated
+        // FIXME(eddyb) `region_input_rewrites` mappings, generated
         // for every `ClaimedRegion` that has been merged into a larger region,
         // only get applied after structurization fully completes, but here it's
         // very useful to have the fully resolved values across all `cases`'
         // incoming/outgoing edges (note, however, that within outgoing edges,
-        // i.e. `case_deferred_edges`' `target_inputs`, `Value::ControlRegionInput`
+        // i.e. `case_deferred_edges`' `target_inputs`, `Value::RegionInput`
         // are not resolved using the contents of `case_structured_body_inputs`,
         // which is kept hermetic until just before `structurize_select` returns).
         for case in &mut cases {
@@ -1704,7 +1698,7 @@ impl<'a> Structurizer<'a> {
                     .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs),
             );
             for v in all_values {
-                ControlRegionInputRewrites::rewrite_all(&self.control_region_input_rewrites)
+                RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
                     .transform_value_use(v)
                     .apply_to(v);
             }
@@ -1765,7 +1759,7 @@ impl<'a> Structurizer<'a> {
                                     ..
                                 }) => match v {
                                     Value::Const(_) => Ok(v),
-                                    Value::ControlRegionInput { region, input_idx }
+                                    Value::RegionInput { region, input_idx }
                                         if region == *structured_body =>
                                     {
                                         Ok(structured_body_inputs[input_idx as usize])
@@ -1856,18 +1850,18 @@ impl<'a> Structurizer<'a> {
         let deferred_edges = deferred_edges.collect();
 
         // Only as the very last step, can per-case `region_inputs` be added to
-        // `control_region_input_rewrites`.
+        // `region_input_rewrites`.
         //
-        // FIXME(eddyb) don't replace `Value::ControlRegionInput { region, .. }`
+        // FIXME(eddyb) don't replace `Value::RegionInput { region, .. }`
         // with `region_inputs` when the `region` ends up a `ControlNode` child,
-        // but instead make all `ControlRegion`s entirely hermetic wrt inputs.
+        // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
         for case in cases {
             if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
                 if !structured_body_inputs.is_empty() {
-                    self.control_region_input_rewrites.insert(
+                    self.region_input_rewrites.insert(
                         structured_body,
-                        ControlRegionInputRewrites::ReplaceWith(structured_body_inputs),
+                        RegionInputRewrites::ReplaceWith(structured_body_inputs),
                     );
                     self.func_def_body.at_mut(structured_body).def().inputs.clear();
                 }
@@ -1934,8 +1928,7 @@ impl<'a> Structurizer<'a> {
                     .push(ControlNodeOutputDecl { attrs: AttrSet::default(), ty: self.type_bool });
 
                 for (&case, cond) in cases.iter().zip_eq(per_case_conds) {
-                    let ControlRegionDef { outputs, .. } =
-                        &mut self.func_def_body.control_regions[case];
+                    let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
                     outputs.push(cond);
                     assert_eq!(outputs.len(), output_decls.len());
                 }
@@ -1952,20 +1945,20 @@ impl<'a> Structurizer<'a> {
     // weird (and on top of that, the append direction can be tricky to express).
     fn append_maybe_claimed_region(
         &mut self,
-        parent_region: ControlRegion,
+        parent_region: Region,
         maybe_claimed_region: Result<ClaimedRegion, DeferredEdgeBundleSet>,
     ) -> DeferredEdgeBundleSet {
         match maybe_claimed_region {
             Ok(ClaimedRegion { structured_body, structured_body_inputs, deferred_edges }) => {
                 if !structured_body_inputs.is_empty() {
-                    self.control_region_input_rewrites.insert(
+                    self.region_input_rewrites.insert(
                         structured_body,
-                        ControlRegionInputRewrites::ReplaceWith(structured_body_inputs),
+                        RegionInputRewrites::ReplaceWith(structured_body_inputs),
                     );
                 }
                 let new_children =
                     mem::take(&mut self.func_def_body.at_mut(structured_body).def().children);
-                self.func_def_body.control_regions[parent_region]
+                self.func_def_body.regions[parent_region]
                     .children
                     .append(new_children, &mut self.func_def_body.control_nodes);
                 deferred_edges
@@ -1982,7 +1975,7 @@ impl<'a> Structurizer<'a> {
     /// despite it having a single call site (in a loop in `structurize_func`).
     fn rebuild_cfg_from_unclaimed_region_deferred_edges(
         &mut self,
-        region: ControlRegion,
+        region: Region,
         mut deferred_edges: DeferredEdgeBundleSet,
     ) {
         assert!(
@@ -2020,13 +2013,11 @@ impl<'a> Structurizer<'a> {
                 }
 
                 // Either more branches, or a deferred return, are needed, so
-                // the "else" case must be a `ControlRegion` that itself can
+                // the "else" case must be a `Region` that itself can
                 // have a `ControlInst` attached to it later on.
                 _ => {
-                    let new_empty_region = self
-                        .func_def_body
-                        .control_regions
-                        .define(self.cx, ControlRegionDef::default());
+                    let new_empty_region =
+                        self.func_def_body.regions.define(self.cx, RegionDef::default());
                     control_source = Some(new_empty_region);
                     Some((new_empty_region, [].into_iter().collect()))
                 }

@@ -54,7 +54,7 @@ pub enum QPtrAttr {
     },
 
     /// When applied to a `QPtr`-typed `GlobalVar`, `DataInst`,
-    /// `ControlRegionInputDecl` or `ControlNodeOutputDecl`, this tracks all the
+    /// `RegionInputDecl` or `ControlNodeOutputDecl`, this tracks all the
     /// ways in which the pointer may be used (see `QPtrUsage`).
     Usage(OrdAssertEq<QPtrUsage>),
 }

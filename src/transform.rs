@@ -4,11 +4,11 @@ use crate::func_at::FuncAtMut;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode, ControlNodeDef,
-    ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
-    ControlRegionInputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind,
-    DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
-    GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
-    OrdAssertEq, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    ControlNodeKind, ControlNodeOutputDecl, DataInst, DataInstDef, DataInstForm, DataInstFormDef,
+    DataInstKind, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, cfg, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -571,25 +571,25 @@ impl InnerInPlaceTransform for FuncDefBody {
     }
 }
 
-impl InnerInPlaceTransform for FuncAtMut<'_, ControlRegion> {
+impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        // HACK(eddyb) handle the fields of `ControlRegion` separately, to
+        // HACK(eddyb) handle the fields of `Region` separately, to
         // allow reborrowing `FuncAtMut` (for recursing into `ControlNode`s).
-        let ControlRegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
+        let RegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
         for input in inputs {
             input.inner_transform_with(transformer).apply_to(input);
         }
 
         self.reborrow().at_children().into_iter().inner_in_place_transform_with(transformer);
 
-        let ControlRegionDef { inputs: _, children: _, outputs } = self.reborrow().def();
+        let RegionDef { inputs: _, children: _, outputs } = self.reborrow().def();
         for v in outputs {
             transformer.transform_value_use(v).apply_to(v);
         }
     }
 }
 
-impl InnerTransform for ControlRegionInputDecl {
+impl InnerTransform for RegionInputDecl {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         let Self { attrs, ty } = self;
 
@@ -613,7 +613,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<ControlNode>> {
 }
 
 impl FuncAtMut<'_, ControlNode> {
-    fn child_regions(&mut self) -> &mut [ControlRegion] {
+    fn child_regions(&mut self) -> &mut [Region] {
         match &mut self.reborrow().def().kind {
             ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &mut [][..],
 
@@ -769,7 +769,7 @@ impl InnerTransform for Value {
                 ct -> transformer.transform_const_use(*ct),
             } => Self::Const(ct)),
 
-            Self::ControlRegionInput { region: _, input_idx: _ }
+            Self::RegionInput { region: _, input_idx: _ }
             | Self::ControlNodeOutput { control_node: _, output_idx: _ }
             | Self::DataInstOutput(_) => Transformed::Unchanged,
         }
