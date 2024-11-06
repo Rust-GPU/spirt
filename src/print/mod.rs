@@ -25,11 +25,11 @@ use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUs
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
-    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel,
-    DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
-    FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
-    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    DataInstDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel, DiagMsgPart, EntityListIter,
+    ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
+    GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef,
+    NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type,
+    TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -462,12 +462,6 @@ impl<'a> Visitor<'a> for Plan<'a> {
     }
     fn visit_const_use(&mut self, ct: Const) {
         self.use_interned(CxInterned::Const(ct));
-    }
-    fn visit_data_inst_form_use(&mut self, data_inst_form: DataInstForm) {
-        // NOTE(eddyb) this contains no deduplication because each `DataInstDef`
-        // will be pretty-printed separately, so everything in its `form` also
-        // needs to get use counts incremented separately per-`DataInstDef`.
-        self.visit_data_inst_form_def(&self.cx[data_inst_form]);
     }
 
     fn visit_global_var_use(&mut self, gv: GlobalVar) {
@@ -974,7 +968,7 @@ impl<'a> Printer<'a> {
                                     None,
                                 );
                                 let inst_def = func_at_inst.def();
-                                if cx[inst_def.form].output_type.is_some() {
+                                if inst_def.output_type.is_some() {
                                     define(
                                         Use::DataInstOutput(func_at_inst.position),
                                         Some(inst_def.attrs),
@@ -1000,7 +994,6 @@ impl<'a> Printer<'a> {
                     fn visit_attr_set_use(&mut self, _: AttrSet) {}
                     fn visit_type_use(&mut self, _: Type) {}
                     fn visit_const_use(&mut self, _: Const) {}
-                    fn visit_data_inst_form_use(&mut self, _: DataInstForm) {}
                     fn visit_global_var_use(&mut self, _: GlobalVar) {}
                     fn visit_func_use(&mut self, _: Func) {}
 
@@ -3153,11 +3146,9 @@ impl Print for NodeOutputDecl {
 impl Print for FuncAt<'_, DataInst> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let DataInstDef { attrs, form, inputs } = self.def();
+        let DataInstDef { attrs, kind, inputs, output_type } = self.def();
 
         let attrs = attrs.print(printer);
-
-        let DataInstFormDef { kind, output_type } = &printer.cx[*form];
 
         let mut output_use_to_print_as_lhs =
             output_type.map(|_| Use::DataInstOutput(self.position));

@@ -3,11 +3,11 @@
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
-    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstFormDef,
-    DataInstKind, DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func,
-    FuncDecl, FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import,
-    InternedStr, Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind,
-    Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
+    DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
+    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -820,18 +820,6 @@ impl Module {
             return Err(invalid("OpFunction without matching OpFunctionEnd"));
         }
 
-        // HACK(eddyb) `OpNop` is useful for defining `DataInst`s before they're
-        // actually lowered (to be able to refer to their outputs `Value`s).
-        let mut cached_op_nop_form = None;
-        let mut get_op_nop_form = || {
-            *cached_op_nop_form.get_or_insert_with(|| {
-                cx.intern(DataInstFormDef {
-                    kind: DataInstKind::SpvInst(wk.OpNop.into()),
-                    output_type: None,
-                })
-            })
-        };
-
         // Process function bodies, having seen the whole module.
         for func_body in pending_func_bodies {
             let FuncBody { func_id, func, insts: raw_insts } = func_body;
@@ -969,9 +957,9 @@ impl Module {
                                     &cx,
                                     DataInstDef {
                                         attrs: AttrSet::default(),
-                                        // FIXME(eddyb) cache this form locally.
-                                        form: get_op_nop_form(),
+                                        kind: DataInstKind::SpvInst(wk.OpNop.into()),
                                         inputs: [].into_iter().collect(),
+                                        output_type: None,
                                     }
                                     .into(),
                                 );
@@ -1523,19 +1511,7 @@ impl Module {
 
                     let data_inst_def = DataInstDef {
                         attrs,
-                        form: cx.intern(DataInstFormDef {
-                            kind,
-                            output_type: result_id
-                                .map(|_| {
-                                    result_type.ok_or_else(|| {
-                                        invalid(
-                                            "expected value-producing instruction, \
-                                             with a result type",
-                                        )
-                                    })
-                                })
-                                .transpose()?,
-                        }),
+                        kind,
                         inputs: ids
                             .iter()
                             .map(|&id| {
@@ -1549,6 +1525,16 @@ impl Module {
                                 }
                             })
                             .collect::<io::Result<_>>()?,
+                        output_type: result_id
+                            .map(|_| {
+                                result_type.ok_or_else(|| {
+                                    invalid(
+                                        "expected value-producing instruction, \
+                                         with a result type",
+                                    )
+                                })
+                            })
+                            .transpose()?,
                     };
                     let inst = match result_id {
                         Some(id) => match local_id_defs[&id] {

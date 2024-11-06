@@ -3,12 +3,12 @@
 use crate::func_at::FuncAt;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstForm,
-    DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey,
-    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody,
-    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl,
-    OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, cfg, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstKind,
+    DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
+    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
+    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -20,7 +20,6 @@ pub trait Visitor<'a>: Sized {
     fn visit_attr_set_use(&mut self, attrs: AttrSet);
     fn visit_type_use(&mut self, ty: Type);
     fn visit_const_use(&mut self, ct: Const);
-    fn visit_data_inst_form_use(&mut self, data_inst_form: DataInstForm);
 
     // Module-stored entity leaves (no default provided).
     fn visit_global_var_use(&mut self, gv: GlobalVar);
@@ -67,9 +66,6 @@ pub trait Visitor<'a>: Sized {
     }
     fn visit_data_inst_def(&mut self, data_inst_def: &'a DataInstDef) {
         data_inst_def.inner_visit_with(self);
-    }
-    fn visit_data_inst_form_def(&mut self, data_inst_form_def: &'a DataInstFormDef) {
-        data_inst_form_def.inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -521,21 +517,22 @@ impl InnerVisit for NodeOutputDecl {
 
 impl InnerVisit for DataInstDef {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, form, inputs } = self;
+        let Self { attrs, kind, inputs, output_type } = self;
 
         visitor.visit_attr_set_use(*attrs);
-        visitor.visit_data_inst_form_use(*form);
+        kind.inner_visit_with(visitor);
         for v in inputs {
             visitor.visit_value_use(v);
+        }
+        if let Some(ty) = *output_type {
+            visitor.visit_type_use(ty);
         }
     }
 }
 
-impl InnerVisit for DataInstFormDef {
+impl InnerVisit for DataInstKind {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { kind, output_type } = self;
-
-        match kind {
+        match self {
             &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
             DataInstKind::QPtr(op) => match *op {
                 QPtrOp::FuncLocalVar(_)
@@ -548,9 +545,6 @@ impl InnerVisit for DataInstFormDef {
                 | QPtrOp::Store => {}
             },
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
-        if let Some(ty) = *output_type {
-            visitor.visit_type_use(ty);
         }
     }
 }
