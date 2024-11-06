@@ -1,7 +1,5 @@
 use crate::visit::{InnerVisit, Visitor};
-use crate::{
-    AttrSet, Const, Context, DataInstForm, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type, cfg,
-};
+use crate::{AttrSet, Const, Context, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type, cfg};
 
 /// Apply the [`cfg::Structurizer`] algorithm to all function definitions in `module`.
 pub fn structurize_func_cfgs(module: &mut Module) {
@@ -14,7 +12,6 @@ pub fn structurize_func_cfgs(module: &mut Module) {
 
         seen_types: FxIndexSet::default(),
         seen_consts: FxIndexSet::default(),
-        seen_data_inst_forms: FxIndexSet::default(),
         seen_global_vars: FxIndexSet::default(),
         seen_funcs: FxIndexSet::default(),
     };
@@ -37,7 +34,6 @@ struct ReachableUseCollector<'a> {
     // FIXME(eddyb) build some automation to avoid ever repeating these.
     seen_types: FxIndexSet<Type>,
     seen_consts: FxIndexSet<Const>,
-    seen_data_inst_forms: FxIndexSet<DataInstForm>,
     seen_global_vars: FxIndexSet<GlobalVar>,
     seen_funcs: FxIndexSet<Func>,
 }
@@ -55,11 +51,6 @@ impl Visitor<'_> for ReachableUseCollector<'_> {
     fn visit_const_use(&mut self, ct: Const) {
         if self.seen_consts.insert(ct) {
             self.visit_const_def(&self.cx[ct]);
-        }
-    }
-    fn visit_data_inst_form_use(&mut self, data_inst_form: DataInstForm) {
-        if self.seen_data_inst_forms.insert(data_inst_form) {
-            self.visit_data_inst_form_def(&self.cx[data_inst_form]);
         }
     }
 

@@ -8,8 +8,8 @@ use crate::qptr::{QPtrAttr, QPtrOp, shapes};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind,
-    OrdAssertEq, Type, TypeKind, TypeOrConst, Value, spv,
+    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Type, TypeKind,
+    TypeOrConst, Value, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -232,19 +232,6 @@ impl Transformer for EraseSpvPtrs<'_> {
             Transformed::Unchanged
         }
     }
-
-    // FIXME(eddyb) because this is now interned, it might be better to
-    // temporarily track the old output types in a map, and not actually
-    // intern the non-`qptr`-output `qptr.*` instructions, only to replace
-    // the output type with `qptr` here.
-    fn transform_data_inst_form_use(
-        &mut self,
-        data_inst_form: DataInstForm,
-    ) -> Transformed<DataInstForm> {
-        // FIXME(eddyb) maybe cache this remap (in `LowerFromSpvPtrs`, globally).
-        self.transform_data_inst_form_def(&self.lowerer.cx[data_inst_form])
-            .map(|data_inst_form_def| self.lowerer.cx.intern(data_inst_form_def))
-    }
 }
 
 struct LowerFromSpvPtrInstsInFunc<'a> {
@@ -409,9 +396,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let func = func_at_data_inst_frozen.at(());
 
         let mut attrs = data_inst_def.attrs;
-        let DataInstFormDef { ref kind, output_type } = cx[data_inst_def.form];
+        let output_type = data_inst_def.output_type;
 
-        let spv_inst = match kind {
+        let spv_inst = match &data_inst_def.kind {
             DataInstKind::SpvInst(spv_inst) => spv_inst,
             _ => return Ok(Transformed::Unchanged),
         };
@@ -549,11 +536,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     cx,
                     DataInstDef {
                         attrs: Default::default(),
-                        form: cx.intern(DataInstFormDef {
-                            kind,
-                            output_type: Some(self.lowerer.qptr_type()),
-                        }),
+                        kind,
                         inputs,
+                        output_type: Some(self.lowerer.qptr_type()),
                     }
                     .into(),
                 );
@@ -600,11 +585,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let (new_kind, new_inputs) = replacement_kind_and_inputs;
         Ok(Transformed::Changed(DataInstDef {
             attrs,
-            // FIXME(eddyb) because this is now interned, it might be better to
-            // temporarily track the old output types in a map, and not actually
-            // intern the non-`qptr`-output `qptr.*` instructions.
-            form: cx.intern(DataInstFormDef { kind: new_kind, output_type }),
+            kind: new_kind,
             inputs: new_inputs,
+            output_type,
         }))
     }
 
@@ -617,12 +600,11 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         let func_at_data_inst_frozen = func_at_data_inst.reborrow().freeze();
         let data_inst_def = func_at_data_inst_frozen.def();
-        let data_inst_form_def = &cx[data_inst_def.form];
 
         // FIXME(eddyb) is this a good convention?
         let func = func_at_data_inst_frozen.at(());
 
-        match data_inst_form_def.kind {
+        match data_inst_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
             DataInstKind::FuncCall(_) | DataInstKind::QPtr(_) => return,
 
@@ -643,7 +625,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 );
             }
         }
-        if let Some(output_type) = data_inst_form_def.output_type {
+        if let Some(output_type) = data_inst_def.output_type {
             if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type) {
                 old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
                     QPtrAttr::FromSpvPtrOutput {

@@ -116,7 +116,7 @@ impl FuncAt<'_, Value> {
             Value::NodeOutput { node, output_idx } => {
                 self.at(node).def().outputs[output_idx as usize].ty
             }
-            Value::DataInstOutput(inst) => cx[self.at(inst).def().form].output_type.unwrap(),
+            Value::DataInstOutput(inst) => self.at(inst).def().output_type.unwrap(),
         }
     }
 }

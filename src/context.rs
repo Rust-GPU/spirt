@@ -888,7 +888,6 @@ interners! {
         crate::AttrSetDef,
         crate::TypeDef,
         crate::ConstDef,
-        crate::DataInstFormDef,
     }
 
     // FIXME(eddyb) consider a more uniform naming scheme than the combination
@@ -897,7 +896,6 @@ interners! {
     AttrSet default(crate::AttrSetDef::default()) => crate::AttrSetDef,
     Type => crate::TypeDef,
     Const => crate::ConstDef,
-    DataInstForm => crate::DataInstFormDef,
 }
 
 impl<I: sealed::Interned> InternInCx<I> for I::Def

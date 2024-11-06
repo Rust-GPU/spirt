@@ -4,11 +4,11 @@ use crate::func_at::FuncAtMut;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey,
-    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody,
-    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl,
-    OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, cfg, spv,
+    DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
+    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
+    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -145,12 +145,6 @@ pub trait Transformer: Sized {
     fn transform_const_use(&mut self, _ct: Const) -> Transformed<Const> {
         Transformed::Unchanged
     }
-    fn transform_data_inst_form_use(
-        &mut self,
-        _data_inst_form: DataInstForm,
-    ) -> Transformed<DataInstForm> {
-        Transformed::Unchanged
-    }
 
     // Module-stored entity leaves (noop default behavior).
     fn transform_global_var_use(&mut self, _gv: GlobalVar) -> Transformed<GlobalVar> {
@@ -177,12 +171,6 @@ pub trait Transformer: Sized {
     }
     fn transform_const_def(&mut self, ct_def: &ConstDef) -> Transformed<ConstDef> {
         ct_def.inner_transform_with(self)
-    }
-    fn transform_data_inst_form_def(
-        &mut self,
-        data_inst_form_def: &DataInstFormDef,
-    ) -> Transformed<DataInstFormDef> {
-        data_inst_form_def.inner_transform_with(self)
     }
     fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
         v.inner_transform_with(self)
@@ -711,43 +699,35 @@ impl InnerTransform for NodeOutputDecl {
 
 impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let DataInstDef { attrs, form, inputs } = self.reborrow().def();
+        let DataInstDef { attrs, kind, inputs, output_type } = self.reborrow().def();
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        transformer.transform_data_inst_form_use(*form).apply_to(form);
+        kind.inner_in_place_transform_with(transformer);
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
+        }
+        if let Some(output_type) = output_type {
+            transformer.transform_type_use(*output_type).apply_to(output_type);
         }
     }
 }
 
-impl InnerTransform for DataInstFormDef {
-    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { kind, output_type } = self;
-
-        transform!({
-            kind -> match kind {
-                DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).map(DataInstKind::FuncCall),
-                DataInstKind::QPtr(op) => match op {
-                    QPtrOp::FuncLocalVar(_)
-                    | QPtrOp::HandleArrayIndex
-                    | QPtrOp::BufferData
-                    | QPtrOp::BufferDynLen { .. }
-                    | QPtrOp::Offset(_)
-                    | QPtrOp::DynOffset { .. }
-                    | QPtrOp::Load
-                    | QPtrOp::Store => Transformed::Unchanged,
-                },
-                DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => Transformed::Unchanged,
+impl InnerInPlaceTransform for DataInstKind {
+    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
+        match self {
+            DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
+            DataInstKind::QPtr(op) => match op {
+                QPtrOp::FuncLocalVar(_)
+                | QPtrOp::HandleArrayIndex
+                | QPtrOp::BufferData
+                | QPtrOp::BufferDynLen { .. }
+                | QPtrOp::Offset(_)
+                | QPtrOp::DynOffset { .. }
+                | QPtrOp::Load
+                | QPtrOp::Store => {}
             },
-            // FIXME(eddyb) this should be replaced with an impl of `InnerTransform`
-            // for `Option<T>` or some other helper, to avoid "manual transpose".
-            output_type -> output_type.map(|ty| transformer.transform_type_use(ty))
-                .map_or(Transformed::Unchanged, |t| t.map(Some)),
-        } => Self {
-            kind,
-            output_type,
-        })
+            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
+        }
     }
 }
 

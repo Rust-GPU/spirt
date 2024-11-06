@@ -5,10 +5,10 @@ use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey,
-    Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody,
-    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey, Exportee, Func, FuncDecl, FuncParam,
+    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl,
+    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -99,7 +99,6 @@ struct NeedsIdsCollector<'a> {
     debug_strings: BTreeSet<&'a str>,
 
     globals: FxIndexSet<Global>,
-    data_inst_forms_seen: FxIndexSet<DataInstForm>,
     global_vars_seen: FxIndexSet<GlobalVar>,
     funcs: FxIndexSet<Func>,
 }
@@ -169,11 +168,6 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             }
         }
     }
-    fn visit_data_inst_form_use(&mut self, data_inst_form: DataInstForm) {
-        if self.data_inst_forms_seen.insert(data_inst_form) {
-            self.visit_data_inst_form_def(&self.cx[data_inst_form]);
-        }
-    }
 
     fn visit_global_var_use(&mut self, gv: GlobalVar) {
         if self.global_vars_seen.insert(gv) {
@@ -214,9 +208,9 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         attr.inner_visit_with(self);
     }
 
-    fn visit_data_inst_form_def(&mut self, data_inst_form_def: &DataInstFormDef) {
+    fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
         #[allow(clippy::match_same_arms)]
-        match data_inst_form_def.kind {
+        match data_inst_def.kind {
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::QPtr(_) => {
@@ -230,7 +224,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
             }
         }
-        data_inst_form_def.inner_visit_with(self);
+        data_inst_def.inner_visit_with(self);
     }
 }
 
@@ -359,7 +353,6 @@ impl<'a> NeedsIdsCollector<'a> {
             ext_inst_imports,
             debug_strings,
             globals,
-            data_inst_forms_seen: _,
             global_vars_seen: _,
             funcs,
         } = self;
@@ -959,7 +952,7 @@ impl<'a> FuncLifting<'a> {
             .values()
             .flat_map(|block| block.insts.iter().copied())
             .flat_map(|insts| func_def_body.at(insts))
-            .filter(|&func_at_inst| cx[func_at_inst.def().form].output_type.is_some())
+            .filter(|&func_at_inst| func_at_inst.def().output_type.is_some())
             .map(|func_at_inst| func_at_inst.position);
 
         Ok(Self {
@@ -1227,8 +1220,7 @@ impl LazyInst<'_, '_> {
                     .collect(),
             },
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
-                let DataInstFormDef { kind, output_type } = &cx[data_inst_def.form];
-                let (inst, extra_initial_id_operand) = match kind {
+                let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
                     // Disallowed while visiting.
                     DataInstKind::QPtr(_) => unreachable!(),
 
@@ -1247,7 +1239,9 @@ impl LazyInst<'_, '_> {
                 };
                 spv::InstWithIds {
                     without_ids: inst,
-                    result_type_id: output_type.map(|ty| ids.globals[&Global::Type(ty)]),
+                    result_type_id: data_inst_def
+                        .output_type
+                        .map(|ty| ids.globals[&Global::Type(ty)]),
                     result_id,
                     ids: extra_initial_id_operand
                         .into_iter()
@@ -1354,7 +1348,6 @@ impl Module {
             ext_inst_imports: BTreeSet::new(),
             debug_strings: BTreeSet::new(),
             globals: FxIndexSet::default(),
-            data_inst_forms_seen: FxIndexSet::default(),
             global_vars_seen: FxIndexSet::default(),
             funcs: FxIndexSet::default(),
         };
@@ -1427,12 +1420,10 @@ impl Module {
                                         let data_inst_def = func_at_inst.def();
                                         LazyInst::DataInst {
                                             parent_func: func_lifting,
-                                            result_id: cx[data_inst_def.form].output_type.map(
-                                                |_| {
-                                                    func_lifting.data_inst_output_ids
-                                                        [&func_at_inst.position]
-                                                },
-                                            ),
+                                            result_id: data_inst_def.output_type.map(|_| {
+                                                func_lifting.data_inst_output_ids
+                                                    [&func_at_inst.position]
+                                            }),
                                             data_inst_def,
                                         }
                                     }),

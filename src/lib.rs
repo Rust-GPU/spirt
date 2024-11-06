@@ -934,26 +934,10 @@ pub use context::DataInst;
 pub struct DataInstDef {
     pub attrs: AttrSet,
 
-    pub form: DataInstForm,
+    pub kind: DataInstKind,
 
     // FIXME(eddyb) change the inline size of this to fit most instructions.
     pub inputs: SmallVec<[Value; 2]>,
-}
-
-/// Interned handle for a [`DataInstFormDef`](crate::DataInstFormDef)
-/// (a "form", or "template", for [`DataInstDef`](crate::DataInstDef)s).
-pub use context::DataInstForm;
-
-/// "Form" (or "template") definition for [`DataInstFormDef`]s, which includes
-/// most of their common *static* information (notably excluding `attrs`, as
-/// they vary more often due to handling diagnostics, debuginfo, refinement etc.).
-//
-// FIXME(eddyb) now that this is interned, try to find all the code that was
-// working around needing to borrow `DataInstKind`, just because it was owned
-// by a `FuncDefBody` (instead of interned in the `Context`).
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DataInstFormDef {
-    pub kind: DataInstKind,
 
     pub output_type: Option<Type>,
 }
