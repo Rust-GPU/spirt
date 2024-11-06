@@ -4,10 +4,10 @@ use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstFormDef,
-    DataInstKind, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, print,
+    DataInstKind, DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func,
+    FuncDecl, FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import,
+    InternedStr, Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -185,8 +185,8 @@ impl Module {
         let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
-        let mut current_debug_line = None;
-        let mut current_block_id = None; // HACK(eddyb) for `current_debug_line` resets.
+        let mut current_dbg_src_loc = None;
+        let mut current_block_id = None; // HACK(eddyb) for `current_dbg_src_loc` resets.
         let mut id_defs = FxHashMap::default();
         let mut pending_func_bodies = vec![];
         let mut current_func_body = None;
@@ -199,10 +199,13 @@ impl Module {
 
             // Handle line debuginfo early, as it doesn't have its own section,
             // but rather can go almost anywhere among globals and functions.
+            //
+            // FIXME(eddyb) also support debuginfo "extended instruction sets"
+            // (e.g. `OpenCL.DebugInfo.100`, `NonSemantic.Shader.DebugInfo.100`)
             if [wk.OpLine, wk.OpNoLine].contains(&opcode) {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
-                current_debug_line = if opcode == wk.OpLine {
+                current_dbg_src_loc = if opcode == wk.OpLine {
                     match (&inst.imms[..], &inst.ids[..]) {
                         (
                             &[spv::Imm::Short(l_kind, line), spv::Imm::Short(c_kind, col)],
@@ -217,7 +220,12 @@ impl Module {
                                     )));
                                 }
                             };
-                            Some((file_path, line, col))
+                            Some(DbgSrcLoc {
+                                file_path,
+                                start_line_col: (line, col),
+                                end_line_col: (line, col),
+                                inlined_callee_name_and_call_site: None,
+                            })
                         }
                         _ => unreachable!(),
                     }
@@ -241,20 +249,15 @@ impl Module {
                 current_block_id
             };
             if current_block_id != new_block_id {
-                current_debug_line = None;
+                current_dbg_src_loc = None;
             }
             current_block_id = new_block_id;
 
             let mut attrs =
                 inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
 
-            if let Some((file_path, line, col)) = current_debug_line {
-                // FIXME(eddyb) use `get_or_insert_default` once that's stabilized.
-                attrs.attrs.insert(Attr::SpvDebugLine {
-                    file_path: crate::OrdAssertEq(file_path),
-                    line,
-                    col,
-                });
+            if let Some(dbg_src_loc) = current_dbg_src_loc {
+                attrs.set_dbg_src_loc(dbg_src_loc);
             }
 
             // Take certain bitflags operands out of the instruction and rewrite

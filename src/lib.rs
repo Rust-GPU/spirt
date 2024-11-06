@@ -287,6 +287,7 @@ pub use context::AttrSet;
 /// Definition for an [`AttrSet`]: a set of [`Attr`]s.
 #[derive(Default, PartialEq, Eq, Hash)]
 pub struct AttrSetDef {
+    // FIXME(eddyb) consider "persistent datastructures" (e.g. the `im` crate).
     // FIXME(eddyb) use `BTreeMap<Attr, AttrValue>` and split some of the params
     // between the `Attr` and `AttrValue` based on specified uniquness.
     // FIXME(eddyb) don't put debuginfo in here, but rather at use sites
@@ -298,7 +299,34 @@ pub struct AttrSetDef {
 }
 
 impl AttrSetDef {
-    pub fn push_diag(&mut self, diag: Diag) {
+    pub fn dbg_src_loc(&self) -> Option<DbgSrcLoc> {
+        // FIXME(eddyb) seriously consider moving to `BTreeMap` (see above).
+        // HACK(eddyb) this assumes `Attr::DbgSrcLoc` is the first of `Attr`!
+        match self.attrs.first() {
+            Some(&Attr::DbgSrcLoc(OrdAssertEq(dbg_src_loc))) => Some(dbg_src_loc),
+            _ => None,
+        }
+    }
+
+    pub fn set_dbg_src_loc(&mut self, dbg_src_loc: DbgSrcLoc) {
+        // FIXME(eddyb) seriously consider moving to `BTreeMap` (see above).
+        // HACK(eddyb) this assumes `Attr::DbgSrcLoc` is the first of `Attr`!
+        if let Some(Attr::DbgSrcLoc(_)) = self.attrs.first() {
+            self.attrs.pop_first().unwrap();
+        }
+        self.attrs.insert(Attr::DbgSrcLoc(OrdAssertEq(dbg_src_loc)));
+    }
+
+    pub fn diags(&self) -> &[Diag] {
+        // FIXME(eddyb) seriously consider moving to `BTreeMap` (see above).
+        // HACK(eddyb) this assumes `Attr::Diagnostics` is the last of `Attr`!
+        match self.attrs.last() {
+            Some(Attr::Diagnostics(OrdAssertEq(diags))) => diags,
+            _ => &[],
+        }
+    }
+
+    pub fn mutate_diags(&mut self, f: impl FnOnce(&mut Vec<Diag>)) {
         // FIXME(eddyb) seriously consider moving to `BTreeMap` (see above).
         // HACK(eddyb) this assumes `Attr::Diagnostics` is the last of `Attr`!
         let mut attr = if let Some(Attr::Diagnostics(_)) = self.attrs.last() {
@@ -307,30 +335,54 @@ impl AttrSetDef {
             Attr::Diagnostics(OrdAssertEq(vec![]))
         };
         match &mut attr {
-            Attr::Diagnostics(OrdAssertEq(diags)) => diags.push(diag),
+            Attr::Diagnostics(OrdAssertEq(diags)) => f(diags),
             _ => unreachable!(),
         }
         self.attrs.insert(attr);
     }
 
-    // FIXME(eddyb) should this be hidden in favor of `AttrSet::append_diag`?
-    pub fn append_diag(&self, diag: Diag) -> Self {
-        let mut new_attrs = Self { attrs: self.attrs.clone() };
-        new_attrs.push_diag(diag);
-        new_attrs
+    // HACK(eddyb) these only exist to avoid changing code working with `AttrSetDef`s.
+    pub fn push_diags(&mut self, new_diags: impl IntoIterator<Item = Diag>) {
+        self.mutate_diags(|diags| diags.extend(new_diags));
+    }
+    pub fn push_diag(&mut self, diag: Diag) {
+        self.push_diags([diag]);
     }
 }
 
 // FIXME(eddyb) should these methods be elsewhere?
 impl AttrSet {
-    // FIXME(eddyb) should this be hidden in favor of `push_diag`?
-    // FIXME(eddyb) should these methods always take multiple values?
-    pub fn append_diag(self, cx: &Context, diag: Diag) -> Self {
-        cx.intern(cx[self].append_diag(diag))
+    // FIXME(eddyb) could these two methods have a better name?
+    pub fn reintern_with(self, cx: &Context, f: impl FnOnce(&mut AttrSetDef)) -> Self {
+        let mut new_attrs = AttrSetDef { attrs: cx[self].attrs.clone() };
+        f(&mut new_attrs);
+        cx.intern(new_attrs)
+    }
+    pub fn mutate(&mut self, cx: &Context, f: impl FnOnce(&mut AttrSetDef)) {
+        *self = self.reintern_with(cx, f);
+    }
+
+    pub fn dbg_src_loc(self, cx: &Context) -> Option<DbgSrcLoc> {
+        if self == AttrSet::default() {
+            return None;
+        }
+        cx[self].dbg_src_loc()
+    }
+
+    pub fn set_dbg_src_loc(&mut self, cx: &Context, dbg_src_loc: DbgSrcLoc) {
+        self.mutate(cx, |attrs| attrs.set_dbg_src_loc(dbg_src_loc));
+    }
+
+    pub fn diags(self, cx: &Context) -> &[Diag] {
+        cx[self].diags()
+    }
+
+    pub fn push_diags(&mut self, cx: &Context, diags: impl IntoIterator<Item = Diag>) {
+        self.mutate(cx, |attrs| attrs.push_diags(diags));
     }
 
     pub fn push_diag(&mut self, cx: &Context, diag: Diag) {
-        *self = self.append_diag(cx, diag);
+        self.push_diags(cx, [diag]);
     }
 }
 
@@ -342,17 +394,15 @@ impl AttrSet {
 // FIXME(eddyb) consider interning individual attrs, not just `AttrSet`s.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, derive_more::From)]
 pub enum Attr {
+    // HACK(eddyb) this must be the first variant of `Attr` for the correctness
+    // of `AttrSetDef::{dbg_src_loc,set_dbg_src_loc}`.
+    DbgSrcLoc(OrdAssertEq<DbgSrcLoc>),
+
     /// `QPtr`-specific attributes (see [`qptr::QPtrAttr`]).
     #[from]
     QPtr(qptr::QPtrAttr),
 
     SpvAnnotation(spv::Inst),
-
-    SpvDebugLine {
-        file_path: OrdAssertEq<InternedStr>,
-        line: u32,
-        col: u32,
-    },
 
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
@@ -363,9 +413,27 @@ pub enum Attr {
     /// Can be used anywhere to record [`Diag`]nostics produced during a pass,
     /// while allowing the pass to continue (and its output to be pretty-printed).
     //
-    // HACK(eddyb) this is the last variant to control printing order, but also
-    // to make `push_diag`/`append_diag` above work correctly!
+    // HACK(eddyb) this must be the last variant of `Attr` for the correctness
+    // of`AttrSetDef::{diags,mutate_diags}` (this also helps with printing order).
     Diagnostics(OrdAssertEq<Vec<Diag>>),
+}
+
+/// Simple `file:line:column`-style debuginfo, similar to SPIR-V `OpLine`,
+/// but also supporting `(line, column)` ranges, and inlined locations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct DbgSrcLoc {
+    pub file_path: InternedStr,
+
+    // FIXME(eddyb) `Range` might make sense here but these are inclusive,
+    // and `range::RangeInclusive` (the non-`Iterator` version of `a..=b`)
+    // isn't stable (nor the type of `a..=b` expressions), yet.
+    pub start_line_col: (u32, u32),
+    pub end_line_col: (u32, u32),
+
+    /// To describe locations originally in the callee of a call that was inlined,
+    /// the name of the callee and attributes describing the callsite are used,
+    /// where callsite attributes are expected to contain an [`Attr::DbgSrcLoc`].
+    pub inlined_callee_name_and_call_site: Option<(InternedStr, AttrSet)>,
 }
 
 /// Diagnostics produced by SPIR-T passes, and recorded in [`Attr::Diagnostics`].

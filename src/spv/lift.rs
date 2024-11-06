@@ -5,10 +5,10 @@ use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey, Exportee, Func,
-    FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeKind, NodeOutputDecl, Region, RegionInputDecl,
-    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey,
+    Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody,
+    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq,
+    Region, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -207,8 +207,8 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
-            Attr::SpvDebugLine { file_path, .. } => {
-                self.debug_strings.insert(&self.cx[file_path.0]);
+            Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc { file_path, .. })) => {
+                self.debug_strings.insert(&self.cx[file_path]);
             }
         }
         attr.inner_visit_with(self);
@@ -1508,9 +1508,9 @@ impl Module {
 
             for attr in cx[attrs].attrs.iter() {
                 match attr {
-                    Attr::Diagnostics(_)
+                    Attr::DbgSrcLoc(_)
+                    | Attr::Diagnostics(_)
                     | Attr::QPtr(_)
-                    | Attr::SpvDebugLine { .. }
                     | Attr::SpvBitflagsOperand(_) => {}
                     Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
                         let target_id = result_id.expect(
@@ -1718,15 +1718,12 @@ impl Module {
             // in order to end up with the expected line debuginfo.
             // FIXME(eddyb) make this less of a search and more of a
             // lookup by splitting attrs into key and value parts.
-            let new_debug_line = cx[attrs].attrs.iter().find_map(|attr| match *attr {
-                Attr::SpvDebugLine { file_path, line, col } => {
-                    Some((ids.debug_strings[&cx[file_path.0]], line, col))
-                }
-                _ => None,
+            let new_debug_line = attrs.dbg_src_loc(cx).map(|dbg_src_loc| {
+                (ids.debug_strings[&cx[dbg_src_loc.file_path]], dbg_src_loc.start_line_col)
             });
             if current_debug_line != new_debug_line {
                 let (opcode, imms, ids) = match new_debug_line {
-                    Some((file_path_id, line, col)) => (
+                    Some((file_path_id, (line, col))) => (
                         wk.OpLine,
                         [
                             spv::Imm::Short(wk.LiteralInteger, line),

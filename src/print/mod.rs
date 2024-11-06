@@ -25,7 +25,7 @@ use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUs
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
-    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, Diag, DiagLevel,
+    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel,
     DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
     FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
     ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
@@ -2111,6 +2111,99 @@ impl Print for Attr {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let non_comment_attr = match self {
+            // FIXME(eddyb) move from repeating the same backtrace-like comments
+            // (potentially many times in a row) to a more "stateful" approach,
+            // which only mentions every inlined callsite once per sequence of
+            // e.g. `DataInst`s that are all nested in it.
+            &Attr::DbgSrcLoc(OrdAssertEq(dbg_src_loc)) => {
+                let mut comments = SmallVec::<[_; 8]>::new();
+                let mut next_dbg_src_loc = Some(dbg_src_loc);
+                while let Some(dbg_src_loc) = next_dbg_src_loc {
+                    let DbgSrcLoc {
+                        file_path,
+                        start_line_col: (start_line, mut start_col),
+                        end_line_col: (end_line, mut end_col),
+                        inlined_callee_name_and_call_site,
+                    } = dbg_src_loc;
+
+                    // HACK(eddyb) Rust-GPU's column numbers seem
+                    // off-by-one wrt what e.g. VSCode expects
+                    // for `:line:col` syntax, but it's hard to
+                    // tell from the spec and `glslang` doesn't
+                    // even emit column numbers at all!
+                    start_col += 1;
+                    end_col += 1;
+
+                    let mut s = String::new();
+                    if comments.is_empty() {
+                        s += "// at ";
+                    } else {
+                        s += "// … at ";
+                    }
+
+                    // HACK(eddyb) only skip string-quoting and escaping for
+                    // well-behaved file paths.
+                    let file_path = &printer.cx[file_path];
+                    if file_path.chars().all(|c| c.is_ascii_graphic() && c != ':') {
+                        s += file_path;
+                    } else {
+                        write!(s, "{file_path:?}").unwrap();
+                    }
+
+                    // HACK(eddyb) the syntaxes used are taken from VSCode, i.e.:
+                    // https://github.com/microsoft/vscode/blob/6b924c5/src/vs/workbench/contrib/terminalContrib/links/browser/terminalLinkParsing.ts#L75-L91
+                    // (using the most boring syntax possible for every situation).
+                    let is_quoted = s.ends_with('"');
+                    let is_range = (start_line, start_col) != (end_line, end_col);
+                    write!(
+                        s,
+                        "{}{start_line}{}{start_col}",
+                        if is_quoted { ',' } else { ':' },
+                        if is_quoted && is_range { '.' } else { ':' }
+                    )
+                    .unwrap();
+                    if is_range {
+                        s += "-";
+                        if start_line != end_line {
+                            write!(s, "{end_line}.").unwrap();
+                        }
+                        write!(s, "{end_col}").unwrap();
+                    }
+
+                    // Chain inlined locations by putting the most important
+                    // details (`file:line:col`) at the start of each comment,
+                    // and the less important ones (callee name) at the end.
+                    next_dbg_src_loc =
+                        inlined_callee_name_and_call_site.map(|(callee_name, call_site_attrs)| {
+                            s += ", in `";
+
+                            // HACK(eddyb) not trusting non-trivial strings to behave.
+                            let callee_name = &printer.cx[callee_name];
+                            if callee_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                s += callee_name;
+                            } else {
+                                s.extend(callee_name.escape_debug().flat_map(|c| {
+                                    (c == '`').then_some('\\').into_iter().chain([c])
+                                }));
+                            }
+
+                            s += "`, inlined …";
+
+                            call_site_attrs.dbg_src_loc(printer.cx).unwrap_or_else(|| DbgSrcLoc {
+                                file_path: printer.cx.intern("<unknown callee location>"),
+                                start_line_col: (0, 0),
+                                end_line_col: (0, 0),
+                                inlined_callee_name_and_call_site: None,
+                            })
+                        });
+
+                    if !comments.is_empty() {
+                        comments.push(pretty::Node::ForceLineSeparation);
+                    }
+                    comments.push(printer.comment_style().apply(s));
+                }
+                return pretty::Fragment::new(comments);
+            }
             Attr::Diagnostics(diags) => {
                 return pretty::Fragment::new(
                     diags
@@ -2249,24 +2342,6 @@ impl Print for Attr {
                 } else {
                     printer.pretty_spv_inst(printer.attr_style(), *opcode, imms, [None])
                 }
-            }
-            &Attr::SpvDebugLine { file_path, line, col } => {
-                // HACK(eddyb) Rust-GPU's column numbers seem
-                // off-by-one wrt what e.g. VSCode expects
-                // for `:line:col` syntax, but it's hard to
-                // tell from the spec and `glslang` doesn't
-                // even emit column numbers at all!
-                let col = col + 1;
-
-                // HACK(eddyb) only use skip string quoting
-                // and escaping for well-behaved file paths.
-                let file_path = &printer.cx[file_path.0];
-                let comment = if file_path.chars().all(|c| c.is_ascii_graphic() && c != ':') {
-                    format!("// at {file_path}:{line}:{col}")
-                } else {
-                    format!("// at {file_path:?}:{line}:{col}")
-                };
-                return printer.comment_style().apply(comment).into();
             }
             &Attr::SpvBitflagsOperand(imm) => printer.pretty_spv_operand_from_imms([imm]),
         };

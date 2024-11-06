@@ -4,11 +4,11 @@ use crate::func_at::FuncAtMut;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityListIter, ExportKey, Exportee,
-    Func, FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import,
-    Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
-    cfg, spv,
+    DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey,
+    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody,
+    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl,
+    OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind,
+    TypeOrConst, Value, cfg, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -328,10 +328,32 @@ impl InnerTransform for AttrSetDef {
 impl InnerTransform for Attr {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         match self {
-            Attr::Diagnostics(_)
-            | Attr::SpvAnnotation(_)
-            | Attr::SpvDebugLine { .. }
-            | Attr::SpvBitflagsOperand(_) => Transformed::Unchanged,
+            Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {
+                Transformed::Unchanged
+            }
+
+            &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
+                file_path,
+                start_line_col,
+                end_line_col,
+                inlined_callee_name_and_call_site,
+            })) => {
+                // FIXME(eddyb) this should be replaced with an impl of `InnerTransform`
+                // for `Option<T>` or some other helper, to avoid "manual transpose".
+                transform!({
+                    inlined_callee_name_and_call_site -> inlined_callee_name_and_call_site
+                        .map(|(callee_name, call_site_attrs)| {
+                            transformer.transform_attr_set_use(call_site_attrs)
+                                .map(|call_site_attrs| (callee_name, call_site_attrs))
+                        })
+                        .map_or(Transformed::Unchanged, |t| t.map(Some))
+                } => Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
+                    file_path,
+                    start_line_col,
+                    end_line_col,
+                    inlined_callee_name_and_call_site,
+                })))
+            }
 
             Attr::QPtr(attr) => transform!({
                 attr -> match attr {
