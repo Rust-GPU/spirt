@@ -2602,7 +2602,7 @@ impl Print for ConstDef {
                             Some(format!("{float:?}")).filter(|s| {
                                 s.parse::<FLOAT>()
                                     .map(float_to_bits)
-                                    .map_or(false, |roundtrip_bits| roundtrip_bits == bits)
+                                    .is_ok_and(|roundtrip_bits| roundtrip_bits == bits)
                             })
                         }
 

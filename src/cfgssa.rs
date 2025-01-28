@@ -458,6 +458,8 @@ mod data {
 
     // HACK(eddyb) most of the need for this arises from avoidance of
     // `unsafe` code (i.e. `MaybeUninit<V>` could suffice in most cases).
+    // FIXME(eddyb) figure out if keeping this around is useful at all.
+    #[allow(unused)]
     pub enum WrapNonDefaultValueInOption {}
     impl<V> ValueStorage<V> for WrapNonDefaultValueInOption {
         type Slot = Option<V>;

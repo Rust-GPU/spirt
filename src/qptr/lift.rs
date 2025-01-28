@@ -541,7 +541,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let field_idx = match &buf_data_layout.components {
                     Components::Fields { offsets, layouts }
                         if offsets.last() == Some(&fixed_base_size)
-                            && layouts.last().map_or(false, |last_field| {
+                            && layouts.last().is_some_and(|last_field| {
                                 last_field.mem_layout.fixed_base.size == 0
                                     && last_field.mem_layout.dyn_unit_stride
                                         == Some(dyn_unit_stride)

@@ -726,7 +726,7 @@ impl Module {
                         &print::Plan::for_root(
                             &cx,
                             &Diag::err([
-                                format!("in %{}, ", func_id).into(),
+                                format!("in %{func_id}, ").into(),
                                 "return type differs between `OpFunction` (".into(),
                                 func_ret_type.into(),
                                 ") and `OpTypeFunction` (".into(),
@@ -1200,7 +1200,7 @@ impl Module {
                 let func_def_body = func_def_body.as_deref_mut().unwrap();
 
                 let is_last_in_block = lookahead_raw_inst(1)
-                    .map_or(true, |next_raw_inst| next_raw_inst.without_ids.opcode == wk.OpLabel);
+                    .is_none_or(|next_raw_inst| next_raw_inst.without_ids.opcode == wk.OpLabel);
 
                 if opcode == wk.OpLabel {
                     if is_last_in_block {
@@ -1424,9 +1424,7 @@ impl Module {
                         .push(RegionInputDecl { attrs, ty: result_type.unwrap() });
                 } else if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
                     let is_second_to_last_in_block = lookahead_raw_inst(2)
-                        .map_or(true, |next_raw_inst| {
-                            next_raw_inst.without_ids.opcode == wk.OpLabel
-                        });
+                        .is_none_or(|next_raw_inst| next_raw_inst.without_ids.opcode == wk.OpLabel);
 
                     if !is_second_to_last_in_block {
                         return Err(invalid(
@@ -1612,7 +1610,7 @@ impl Module {
                             &print::Plan::for_root(
                                 &cx,
                                 &Diag::err([
-                                    format!("in %{}, ", func_id).into(),
+                                    format!("in %{func_id}, ").into(),
                                     format!("param #{i}'s type differs between `OpTypeFunction` (")
                                         .into(),
                                     func_decl_param.ty.into(),

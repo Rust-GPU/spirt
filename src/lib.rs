@@ -51,7 +51,7 @@
 // HACK(eddyb) using `(struct.Context.html)` to link `Context`, not `context::Context`.
 //! * [`Context`](struct.Context.html): handles interning ([`Type`]s, [`Const`]s, etc.) and allocating entity handles
 //! * [`Module`]: owns [`Func`]s and [`GlobalVar`]s (rooted by [`exports`](Module::exports))
-//! * [`FuncDefBody`]: owns [`Region`]s and [DataInst]s (rooted by [`body`](FuncDefBody::body))
+//! * [`FuncDefBody`]: owns [`Region`]s and [`DataInst`]s (rooted by [`body`](FuncDefBody::body))
 //!
 //! ##### Utilities and passes
 //! * [`print`](mod@print): pretty-printer with (styled and hyperlinked) HTML output
@@ -99,7 +99,6 @@
     clippy::map_err_ignore,
     clippy::map_flatten,
     clippy::map_unwrap_or,
-    clippy::match_on_vec_items,
     clippy::match_same_arms,
     clippy::match_wild_err_arm,
     clippy::match_wildcard_for_single_variants,
