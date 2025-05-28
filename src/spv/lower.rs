@@ -25,6 +25,11 @@ enum IdDef {
 
     Func(Func),
 
+    // HACK(eddyb) despite `FuncBody` deferring ID resolution to allow forward
+    // references *between* functions, function pointer *constants* need a `Func`
+    // long before any `OpFunction`s, so they're pre-defined as dummy imports.
+    FuncForwardRef(Func),
+
     SpvExtInstImport(InternedStr),
     SpvDebugString(InternedStr),
 }
@@ -37,7 +42,7 @@ impl IdDef {
             IdDef::Type(_) => "a type".into(),
             IdDef::Const(_) => "a constant".into(),
 
-            IdDef::Func(_) => "a function".into(),
+            IdDef::Func(_) | IdDef::FuncForwardRef(_) => "a function".into(),
 
             IdDef::SpvExtInstImport(name) => {
                 format!("`OpExtInstImport {:?}`", &cx[name])
@@ -113,6 +118,37 @@ impl Module {
 
         // HACK(eddyb) used to quickly check whether an `OpVariable` is global.
         let storage_class_function_imm = spv::Imm::Short(wk.StorageClass, wk.Function);
+
+        // HACK(eddyb) used as the `FuncDecl` for an `IdDef::FuncForwardRef`.
+        let dummy_decl_for_func_forward_ref = FuncDecl {
+            attrs: {
+                let mut attrs = AttrSet::default();
+                attrs.push_diag(
+                    &cx,
+                    Diag::err(["function ID used as forward reference but never defined".into()]),
+                );
+                attrs
+            },
+            // FIXME(eddyb) this gets simpler w/ disaggregation.
+            ret_type: cx.intern(TypeKind::SpvInst {
+                spv_inst: wk.OpTypeVoid.into(),
+                type_and_const_inputs: [].into_iter().collect(),
+            }),
+            params: [].into_iter().collect(),
+            def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
+        };
+        // HACK(eddyb) no `PartialEq` on `FuncDecl`.
+        let assert_is_dummy_decl_for_func_forward_ref = |decl: &FuncDecl| {
+            let [expected, found] = [&dummy_decl_for_func_forward_ref, decl].map(
+                |FuncDecl { attrs, ret_type, params, def }| {
+                    let DeclDef::Imported(import) = def else {
+                        unreachable!();
+                    };
+                    (attrs, ret_type, params, import)
+                },
+            );
+            assert!(expected == found);
+        };
 
         let mut module = {
             let [magic, version, generator_magic, id_bound, reserved_inst_schema] = parser.header;
@@ -584,6 +620,38 @@ impl Module {
                 id_defs.insert(id, IdDef::Type(ty));
 
                 Seq::TypeConstOrGlobalVar
+            } else if opcode == wk.OpConstantFunctionPointerINTEL {
+                use std::collections::hash_map::Entry;
+
+                let id = inst.result_id.unwrap();
+
+                let func_id = inst.ids[0];
+                let func = match id_defs.entry(func_id) {
+                    Entry::Occupied(entry) => match entry.get() {
+                        &IdDef::FuncForwardRef(func) => Ok(func),
+                        id_def => Err(id_def.descr(&cx)),
+                    },
+                    Entry::Vacant(entry) => {
+                        let func =
+                            module.funcs.define(&cx, dummy_decl_for_func_forward_ref.clone());
+                        entry.insert(IdDef::FuncForwardRef(func));
+                        Ok(func)
+                    }
+                }
+                .map_err(|descr| {
+                    invalid(&format!(
+                        "unsupported use of {descr} as the `OpConstantFunctionPointerINTEL` operand"
+                    ))
+                })?;
+
+                let ct = cx.intern(ConstDef {
+                    attrs: mem::take(&mut attrs),
+                    ty: result_type.unwrap(),
+                    kind: ConstKind::PtrToFunc(func),
+                });
+                id_defs.insert(id, IdDef::Const(ct));
+
+                Seq::TypeConstOrGlobalVar
             } else if inst_category == spec::InstructionCategory::Const || opcode == wk.OpUndef {
                 let id = inst.result_id.unwrap();
                 let const_inputs = inst
@@ -755,19 +823,40 @@ impl Module {
                         })
                     }
                 };
+                let decl = FuncDecl {
+                    attrs: mem::take(&mut attrs),
+                    ret_type: func_ret_type,
+                    params: func_type_param_types
+                        .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
+                        .collect(),
+                    def,
+                };
 
-                let func = module.funcs.define(
-                    &cx,
-                    FuncDecl {
-                        attrs: mem::take(&mut attrs),
-                        ret_type: func_ret_type,
-                        params: func_type_param_types
-                            .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
-                            .collect(),
-                        def,
-                    },
-                );
-                id_defs.insert(func_id, IdDef::Func(func));
+                let func = {
+                    use std::collections::hash_map::Entry;
+
+                    match id_defs.entry(func_id) {
+                        Entry::Occupied(mut entry) => match entry.get() {
+                            &IdDef::FuncForwardRef(func) => {
+                                let decl_slot = &mut module.funcs[func];
+                                assert_is_dummy_decl_for_func_forward_ref(decl_slot);
+                                *decl_slot = decl;
+
+                                entry.insert(IdDef::Func(func));
+                                Ok(func)
+                            }
+                            id_def => Err(id_def.descr(&cx)),
+                        },
+                        Entry::Vacant(entry) => {
+                            let func = module.funcs.define(&cx, decl);
+                            entry.insert(IdDef::Func(func));
+                            Ok(func)
+                        }
+                    }
+                    .map_err(|descr| {
+                        invalid(&format!("invalid redefinition of {descr} as a new function"))
+                    })?
+                };
 
                 current_func_body = Some(FuncBody { func_id, func, insts: vec![] });
 
@@ -1171,7 +1260,7 @@ impl Module {
                             "unsupported use of {} outside `OpExtInst`",
                             id_def.descr(&cx),
                         ))),
-                        None => local_id_defs
+                        None | Some(IdDef::FuncForwardRef(_)) => local_id_defs
                             .get(&id)
                             .copied()
                             .ok_or_else(|| invalid(&format!("undefined ID %{id}",))),

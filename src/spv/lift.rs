@@ -145,7 +145,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         }
         let ct_def = &self.cx[ct];
         match ct_def.kind {
-            ConstKind::PtrToGlobalVar(_) | ConstKind::SpvInst { .. } => {
+            ConstKind::PtrToGlobalVar(_) | ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
                 self.visit_const_def(ct_def);
                 self.globals.insert(global);
             }
@@ -1051,7 +1051,9 @@ impl LazyInst<'_, '_> {
                                 };
                                 (gv_decl.attrs, import)
                             }
-                            ConstKind::SpvInst { .. } => (ct_def.attrs, None),
+                            ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
+                                (ct_def.attrs, None)
+                            }
 
                             // Not inserted into `globals` while visiting.
                             ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
@@ -1171,6 +1173,13 @@ impl LazyInst<'_, '_> {
                                 ids: initializer.into_iter().collect(),
                             }
                         }
+
+                        &ConstKind::PtrToFunc(func) => spv::InstWithIds {
+                            without_ids: wk.OpConstantFunctionPointerINTEL.into(),
+                            result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
+                            result_id,
+                            ids: [ids.funcs[&func].func_id].into_iter().collect(),
+                        },
 
                         ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                             let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;

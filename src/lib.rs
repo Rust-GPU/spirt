@@ -594,7 +594,13 @@ pub struct ConstDef {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ConstKind {
+    // FIXME(eddyb) maybe merge these? however, their connection is somewhat
+    // tenuous (being one of the LLVM-isms SPIR-V inherited, among other things),
+    // there's still the need to rename "global variable" post-`Var`-refactor,
+    // and last but not least, `PtrToFunc` needs `SPV_INTEL_function_pointers`,
+    // an OpenCL-only extension Intel came up with for their own SPIR-V tooling.
     PtrToGlobalVar(GlobalVar),
+    PtrToFunc(Func),
 
     // HACK(eddyb) this is a fallback case that should become increasingly rare
     // (especially wrt recursive consts), `Rc` means it can't bloat `ConstDef`.
@@ -683,7 +689,7 @@ pub struct FuncDecl {
     pub def: DeclDef<FuncDefBody>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct FuncParam {
     pub attrs: AttrSet,
 
