@@ -18,10 +18,8 @@ jobs:
           submodules: true
       - uses: actions-rs/toolchain@v1
         with:
-          # FIXME(eddyb) `style_edition = "2024"` in `rustfmt.toml` is what keeps
-          # this on `nightly`, should switch to `stable` when that stabilizes.
-          toolchain: nightly
-          # HACK(eddyb) use `nightly` by default without breaking the ability to
+          toolchain: stable
+          # HACK(eddyb) use `stable` by default without breaking the ability to
           # temporarily bypass it through `rust-toolchain.toml`.
           default: true
           override: false

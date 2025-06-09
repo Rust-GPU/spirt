@@ -1824,9 +1824,10 @@ impl Print for spv::Dialect {
                             printer.pretty_spv_print_tokens_for_operand({
                                 let mut tokens = spv::print::operand_from_imms(cap_imms(cap));
                                 tokens.tokens.drain(..tokens.tokens.len() - 1);
-                                assert!(matches!(tokens.tokens[..], [
-                                    spv::print::Token::EnumerandName(_)
-                                ]));
+                                assert!(matches!(
+                                    tokens.tokens[..],
+                                    [spv::print::Token::EnumerandName(_)]
+                                ));
                                 tokens
                             })
                         });
@@ -1955,8 +1956,12 @@ impl Print for spv::ModuleDebugInfo {
                                                             printer.pretty_string_literal(
                                                                 &printer.cx[file],
                                                             ),
-                                                            pretty::join_space(":", [printer
-                                                                .pretty_string_literal(contents)]),
+                                                            pretty::join_space(
+                                                                ":",
+                                                                [printer.pretty_string_literal(
+                                                                    contents,
+                                                                )],
+                                                            ),
                                                         ])
                                                     })
                                                     .map(|entry| {
@@ -3050,10 +3055,13 @@ impl Print for FuncAt<'_, Node> {
                 let (inputs_header, body_suffix) = if !inputs.is_empty() {
                     let input_decls_and_uses =
                         inputs.iter().enumerate().map(|(input_idx, input)| {
-                            (input, Value::RegionInput {
-                                region: *body,
-                                input_idx: input_idx.try_into().unwrap(),
-                            })
+                            (
+                                input,
+                                Value::RegionInput {
+                                    region: *body,
+                                    input_idx: input_idx.try_into().unwrap(),
+                                },
+                            )
                         });
                     (
                         pretty::join_comma_sep(
