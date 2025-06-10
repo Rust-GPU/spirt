@@ -68,6 +68,14 @@ impl<'a> Iterator for FuncAt<'a, EntityListIter<Node>> {
     }
 }
 
+impl DoubleEndedIterator for FuncAt<'_, EntityListIter<Node>> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let (prev, rest) = self.position.split_last(self.nodes)?;
+        self.position = rest;
+        Some(self.at(prev))
+    }
+}
+
 impl<'a> FuncAt<'a, Node> {
     pub fn def(self) -> &'a NodeDef {
         &self.nodes[self.position]
