@@ -938,24 +938,29 @@ impl<'a> Printer<'a> {
                         def.deduped_attrs_across_versions.insert(attrs);
                     }
                 };
-                let visit_region = |func_at_region: FuncAt<'_, Region>| {
-                    let region = func_at_region.position;
+                // HACK(eddyb) this is as bad as it is due to the combination of:
+                // - borrowing constraints on `define` (mutable access to maps)
+                // - needing to minimize the changes to allow rebasing further
+                //   refactors (after which it may be easier to clean up anyway)
+                let visit_region_or_node = |func_at_r_or_n: FuncAt<'_, Either<Region, Node>>| {
+                    let region_or_node = func_at_r_or_n.position;
+                    if let Either::Left(region) = region_or_node {
+                        define(Use::AlignmentAnchorForRegion(region), None);
+                        // FIXME(eddyb) should labels have names?
+                        define(Use::RegionLabel(region), None);
 
-                    define(Use::AlignmentAnchorForRegion(region), None);
-                    // FIXME(eddyb) should labels have names?
-                    define(Use::RegionLabel(region), None);
+                        let RegionDef { inputs, children: _, outputs: _ } =
+                            func_def_body.at(region).def();
 
-                    let RegionDef { inputs, children, outputs: _ } = func_def_body.at(region).def();
-
-                    for (i, input_decl) in inputs.iter().enumerate() {
-                        define(
-                            Use::RegionInput { region, input_idx: i.try_into().unwrap() },
-                            Some(input_decl.attrs),
-                        );
-                    }
-
-                    for func_at_node in func_def_body.at(*children) {
-                        let node = func_at_node.position;
+                        for (i, input_decl) in inputs.iter().enumerate() {
+                            define(
+                                Use::RegionInput { region, input_idx: i.try_into().unwrap() },
+                                Some(input_decl.attrs),
+                            );
+                        }
+                    } else {
+                        let node = region_or_node.right().unwrap();
+                        let func_at_node = func_at_r_or_n.at(node);
 
                         define(Use::AlignmentAnchorForNode(node), None);
 
@@ -987,8 +992,8 @@ impl<'a> Printer<'a> {
                 };
 
                 // FIXME(eddyb) maybe this should be provided by `visit`.
-                struct VisitAllRegions<F>(F);
-                impl<'a, F: FnMut(FuncAt<'a, Region>)> Visitor<'a> for VisitAllRegions<F> {
+                struct VisitAllRegionsAndNodes<F>(F);
+                impl<'a, F: FnMut(FuncAt<'a, Either<Region, Node>>)> Visitor<'a> for VisitAllRegionsAndNodes<F> {
                     // FIXME(eddyb) this is excessive, maybe different kinds of
                     // visitors should exist for module-level and func-level?
                     fn visit_attr_set_use(&mut self, _: AttrSet) {}
@@ -998,11 +1003,15 @@ impl<'a> Printer<'a> {
                     fn visit_func_use(&mut self, _: Func) {}
 
                     fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
-                        self.0(func_at_region);
+                        self.0(func_at_region.at(Either::Left(func_at_region.position)));
                         func_at_region.inner_visit_with(self);
                     }
+                    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
+                        self.0(func_at_node.at(Either::Right(func_at_node.position)));
+                        func_at_node.inner_visit_with(self);
+                    }
                 }
-                func_def_body.inner_visit_with(&mut VisitAllRegions(visit_region));
+                func_def_body.inner_visit_with(&mut VisitAllRegionsAndNodes(visit_region_or_node));
             }
 
             let mut region_label_counter = 0;
