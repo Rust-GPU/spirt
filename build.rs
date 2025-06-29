@@ -7,7 +7,7 @@ fn main() {
         std::env::current_dir().unwrap().join("khronos-spec/SPIRV-Headers/include/spirv/unified1");
     println!("cargo:rerun-if-changed={}", khr_spv_include_dir.display());
 
-    if !std::fs::metadata(&khr_spv_include_dir).map_or(false, |m| m.is_dir()) {
+    if !std::fs::metadata(&khr_spv_include_dir).is_ok_and(|m| m.is_dir()) {
         eprintln!(" error: {} is not a directory", khr_spv_include_dir.display());
         eprintln!("  help: git submodules are required to build from a git checkout");
         eprintln!("  help: run `git submodule update --init`");

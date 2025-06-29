@@ -211,9 +211,9 @@ impl ModuleEmitter {
         let expected_final_pos = self.words.len() + total_word_count;
 
         let opcode = u32::from(inst.opcode.as_u16())
-            | u32::from(u16::try_from(total_word_count).ok().ok_or_else(|| {
+            | (u32::from(u16::try_from(total_word_count).ok().ok_or_else(|| {
                 invalid("word count of SPIR-V instruction doesn't fit in 16 bits")
-            })?) << 16;
+            })?) << 16);
         self.words.extend(
             iter::once(opcode)
                 .chain(inst.result_type_id.map(|id| id.get()))

@@ -351,7 +351,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             if let QPtrOp::DynOffset { stride, index_bounds } = &op {
                 let const_offset = const_idx_as_i32(dyn_idx.unwrap())
                     .filter(|const_idx| {
-                        index_bounds.as_ref().map_or(true, |bounds| bounds.contains(const_idx))
+                        index_bounds.as_ref().is_none_or(|bounds| bounds.contains(const_idx))
                     })
                     .and_then(|const_idx| i32::try_from(stride.get()).ok()?.checked_mul(const_idx));
                 if let Some(const_offset) = const_offset {

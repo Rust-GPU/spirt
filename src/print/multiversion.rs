@@ -196,7 +196,7 @@ impl Versions<pretty::FragmentPostLayout> {
                             .iter()
                             .zip(anchor_aligner.merged_columns())
                             .flat_map(|(&(_, repeat_count), column)| {
-                                iter::repeat(column).take(repeat_count)
+                                iter::repeat_n(column, repeat_count)
                             })
                             .peekable();
 
@@ -246,7 +246,7 @@ impl Versions<pretty::FragmentPostLayout> {
                                             }
                                             line
                                         }
-                                        other.map_or(false, |other| {
+                                        other.is_some_and(|other| {
                                             strip_indents(line) != strip_indents(other)
                                         })
                                     };
@@ -518,10 +518,7 @@ impl<'a> AnchorAligner<'a> {
             // Figure out which side has to wait, to align an upcoming anchor.
             let (old_at_anchor, new_at_anchor) =
                 next_anchor.map_or((false, false), |(anchor_old, anchor_new)| {
-                    (
-                        old_line_idx.map_or(false, |old| old == anchor_old),
-                        new_line_idx.map_or(false, |new| new == anchor_new),
-                    )
+                    (old_line_idx == Some(anchor_old), new_line_idx == Some(anchor_new))
                 });
             let old_line = if old_at_anchor && !new_at_anchor {
                 // Pausing "old", waiting for "new".

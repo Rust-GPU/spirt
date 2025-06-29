@@ -84,17 +84,20 @@ impl ControlFlowGraph {
         func_def_body: &FuncDefBody,
     ) -> impl DoubleEndedIterator<Item = Region> {
         let mut post_order = SmallVec::<[_; 8]>::new();
-        self.traverse_whole_func(func_def_body, &mut TraversalState {
-            incoming_edge_counts: EntityOrientedDenseMap::new(),
+        self.traverse_whole_func(
+            func_def_body,
+            &mut TraversalState {
+                incoming_edge_counts: EntityOrientedDenseMap::new(),
 
-            pre_order_visit: |_| {},
-            post_order_visit: |region| post_order.push(region),
+                pre_order_visit: |_| {},
+                post_order_visit: |region| post_order.push(region),
 
-            // NOTE(eddyb) this doesn't impact semantics, but combined with
-            // the final reversal, it should keep targets in the original
-            // order in the cases when they didn't get deduplicated.
-            reverse_targets: true,
-        });
+                // NOTE(eddyb) this doesn't impact semantics, but combined with
+                // the final reversal, it should keep targets in the original
+                // order in the cases when they didn't get deduplicated.
+                reverse_targets: true,
+            },
+        );
         post_order.into_iter().rev()
     }
 }
@@ -906,10 +909,13 @@ impl DeferredEdgeBundleSet {
                     Err(new_deferred) => {
                         assert!(new_deferred.edge_bundle.target == target);
                         assert!(matches!(new_deferred.condition, LazyCond::True));
-                        (None, DeferredEdgeBundleSet::Always {
-                            target,
-                            edge_bundle: new_deferred.edge_bundle.with_target(()),
-                        })
+                        (
+                            None,
+                            DeferredEdgeBundleSet::Always {
+                                target,
+                                edge_bundle: new_deferred.edge_bundle.with_target(()),
+                            },
+                        )
                     }
                 }
             }
@@ -918,14 +924,17 @@ impl DeferredEdgeBundleSet {
                 for (i, (&target, deferred)) in target_to_deferred.iter_mut().enumerate() {
                     // HACK(eddyb) "take" `deferred` so it can be passed to
                     // `matches` (and put back if that returned `Err`).
-                    let taken_deferred = mem::replace(deferred, DeferredEdgeBundle {
-                        condition: LazyCond::False,
-                        edge_bundle: IncomingEdgeBundle {
-                            target: Default::default(),
-                            accumulated_count: Default::default(),
-                            target_inputs: Default::default(),
+                    let taken_deferred = mem::replace(
+                        deferred,
+                        DeferredEdgeBundle {
+                            condition: LazyCond::False,
+                            edge_bundle: IncomingEdgeBundle {
+                                target: Default::default(),
+                                accumulated_count: Default::default(),
+                                target_inputs: Default::default(),
+                            },
                         },
-                    });
+                    );
 
                     match matches(taken_deferred.with_target(target)) {
                         Ok(x) => {
@@ -1111,13 +1120,16 @@ impl<'a> Structurizer<'a> {
                 // in the general case (but special-cased because this is very
                 // close to being structurizable, just needs a bit of plumbing).
                 let mut control_inst_on_exit_from = EntityOrientedDenseMap::new();
-                control_inst_on_exit_from.insert(self.func_def_body.body, ControlInst {
-                    attrs: AttrSet::default(),
-                    kind: ControlInstKind::Unreachable,
-                    inputs: [].into_iter().collect(),
-                    targets: [].into_iter().collect(),
-                    target_inputs: FxIndexMap::default(),
-                });
+                control_inst_on_exit_from.insert(
+                    self.func_def_body.body,
+                    ControlInst {
+                        attrs: AttrSet::default(),
+                        kind: ControlInstKind::Unreachable,
+                        inputs: [].into_iter().collect(),
+                        targets: [].into_iter().collect(),
+                        target_inputs: FxIndexMap::default(),
+                    },
+                );
                 self.func_def_body.unstructured_cfg = Some(ControlFlowGraph {
                     control_inst_on_exit_from,
                     loop_merge_to_loop_header: Default::default(),
@@ -1133,13 +1145,15 @@ impl<'a> Structurizer<'a> {
 
             _ => {
                 // Repair all the regions that remain unclaimed, including the body.
-                let structurize_region_state = mem::take(&mut self.structurize_region_state)
-                    .into_iter()
-                    .chain([(self.func_def_body.body, StructurizeRegionState::Ready {
-                        accumulated_backedge_count: IncomingEdgeCount::default(),
+                let structurize_region_state =
+                    mem::take(&mut self.structurize_region_state).into_iter().chain([(
+                        self.func_def_body.body,
+                        StructurizeRegionState::Ready {
+                            accumulated_backedge_count: IncomingEdgeCount::default(),
 
-                        region_deferred_edges: func_body_deferred_edges,
-                    })]);
+                            region_deferred_edges: func_body_deferred_edges,
+                        },
+                    )]);
                 for (target, state) in structurize_region_state {
                     if let StructurizeRegionState::Ready { region_deferred_edges, .. } = state {
                         self.rebuild_cfg_from_unclaimed_region_deferred_edges(
@@ -1537,11 +1551,13 @@ impl<'a> Structurizer<'a> {
             .map(|backedge| backedge.accumulated_count)
             .unwrap_or_default();
 
-        let old_state =
-            self.structurize_region_state.insert(region, StructurizeRegionState::Ready {
+        let old_state = self.structurize_region_state.insert(
+            region,
+            StructurizeRegionState::Ready {
                 accumulated_backedge_count,
                 region_deferred_edges: deferred_edges,
-            });
+            },
+        );
         if !matches!(old_state, Some(StructurizeRegionState::InProgress)) {
             unreachable!(
                 "cfg::Structurizer::structurize_region: \

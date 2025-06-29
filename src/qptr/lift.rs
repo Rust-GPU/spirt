@@ -511,12 +511,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     _ => return Err(LiftError(Diag::bug(["non-Buffer pointee".into()]))),
                 };
 
-                self.deferred_ptr_noops.insert(data_inst, DeferredPtrNoop {
-                    output_pointer: buf_ptr,
-                    output_pointer_addr_space: addr_space,
-                    output_pointee_layout: buf_data_layout,
-                    parent_block,
-                });
+                self.deferred_ptr_noops.insert(
+                    data_inst,
+                    DeferredPtrNoop {
+                        output_pointer: buf_ptr,
+                        output_pointer_addr_space: addr_space,
+                        output_pointee_layout: buf_data_layout,
+                        parent_block,
+                    },
+                );
 
                 DataInstDef {
                     kind: QPtrOp::BufferData.into(),
@@ -538,14 +541,14 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let field_idx = match &buf_data_layout.components {
                     Components::Fields { offsets, layouts }
                         if offsets.last() == Some(&fixed_base_size)
-                            && layouts.last().map_or(false, |last_field| {
+                            && layouts.last().is_some_and(|last_field| {
                                 last_field.mem_layout.fixed_base.size == 0
                                     && last_field.mem_layout.dyn_unit_stride
                                         == Some(dyn_unit_stride)
-                                    && matches!(last_field.components, Components::Elements {
-                                        fixed_len: None,
-                                        ..
-                                    })
+                                    && matches!(
+                                        last_field.components,
+                                        Components::Elements { fixed_len: None, .. }
+                                    )
                             }) =>
                     {
                         u32::try_from(offsets.len() - 1).unwrap()
@@ -640,12 +643,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 if access_chain_inputs.len() == 1 {
-                    self.deferred_ptr_noops.insert(data_inst, DeferredPtrNoop {
-                        output_pointer: base_ptr,
-                        output_pointer_addr_space: addr_space,
-                        output_pointee_layout: TypeLayout::Concrete(layout),
-                        parent_block,
-                    });
+                    self.deferred_ptr_noops.insert(
+                        data_inst,
+                        DeferredPtrNoop {
+                            output_pointer: base_ptr,
+                            output_pointer_addr_space: addr_space,
+                            output_pointee_layout: TypeLayout::Concrete(layout),
+                            parent_block,
+                        },
+                    );
 
                     // FIXME(eddyb) avoid the repeated call to `type_of_val`,
                     // maybe don't even replace the `QPtrOp::Offset` instruction?

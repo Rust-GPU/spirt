@@ -18,10 +18,8 @@ jobs:
           submodules: true
       - uses: actions-rs/toolchain@v1
         with:
-          # FIXME(eddyb) `style_edition = "2024"` in `rustfmt.toml` is what keeps
-          # this on `nightly`, should switch to `stable` when that stabilizes.
-          toolchain: nightly
-          # HACK(eddyb) use `nightly` by default without breaking the ability to
+          toolchain: stable
+          # HACK(eddyb) use `stable` by default without breaking the ability to
           # temporarily bypass it through `rust-toolchain.toml`.
           default: true
           override: false
@@ -63,7 +61,7 @@ jobs:
           override: true
       # NOTE(eddyb) this is the simplest way found so far to get `glslang`.
       - name: Prepare Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.3.250.0
           vulkan-components: Glslang SPIRV-Tools

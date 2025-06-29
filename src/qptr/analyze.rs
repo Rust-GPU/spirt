@@ -323,7 +323,7 @@ impl UsageMerger<'_> {
                 // complex it may be (notably, this is needed for nested arrays).
                 if b.max_size
                     .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
-                    .map_or(false, |b_in_a_max_size| b_in_a_max_size <= a_stride.get())
+                    .is_some_and(|b_in_a_max_size| b_in_a_max_size <= a_stride.get())
                 {
                     // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
                     ({
@@ -402,7 +402,7 @@ impl UsageMerger<'_> {
                     ))
                     .rev()
                     .take_while(|(a_sub_offset, a_sub_usage)| {
-                        a_sub_usage.max_size.map_or(true, |a_sub_max_size| {
+                        a_sub_usage.max_size.is_none_or(|a_sub_max_size| {
                             a_sub_offset.checked_add(a_sub_max_size).unwrap() > b_offset_in_a
                         })
                     });
@@ -585,7 +585,7 @@ impl MemTypeLayout {
                 entries.iter().all(|(&sub_offset, sub_usage)| {
                     // FIXME(eddyb) maybe this overflow should be propagated up,
                     // as a sign that `usage` is malformed?
-                    usage_offset.checked_add(sub_offset).map_or(false, |combined_offset| {
+                    usage_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
                         // NOTE(eddyb) the reason this is only applicable to
                         // offset `0` is that *in all other cases*, every
                         // individual `OffsetBase` requires its own type, to
@@ -924,7 +924,7 @@ impl<'a> InferUsage<'a> {
                                 ));
                             }
                         };
-                        if data_inst_def.output_type.map_or(false, is_qptr) {
+                        if data_inst_def.output_type.is_some_and(is_qptr) {
                             if let Some(usage) = output_usage {
                                 usage_or_err_attrs_to_attach
                                     .push((Value::DataInstOutput(data_inst), usage));
