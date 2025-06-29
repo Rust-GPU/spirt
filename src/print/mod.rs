@@ -1130,9 +1130,64 @@ impl Printer<'_> {
 }
 
 impl Printer<'_> {
-    /// Pretty-print a string literal with escaping and styling.
+    /// Pretty-print a numeric (integer) literal, in either base 10 or 16.
+    ///
+    /// Heuristics (e.g. statistics of the digits/nibbles) are used to pick
+    /// e.g. `0xff00` over `65280`, and `1000` over `0x3e8`.
     //
-    // FIXME(eddyb) add methods like this for all styled text (e.g. numeric literals).
+    // FIXME(eddyb) handle signedness, maybe tune heuristics?
+    // FIXME(eddyb) add methods like this for other kinds of numeric literals.
+    fn pretty_numeric_literal_as_dec_or_hex(&self, n: u128) -> pretty::Fragment {
+        let style = self.numeric_literal_style();
+
+        // FIXME(eddyb) it should be possible to avoid allocations or floats,
+        // but this initial implementation focuses on simplicity above all else.
+
+        let dec = format!("{n}");
+
+        // HACK(eddyb) all 2-digit decimal numbers always have 1-2 unique nibbles,
+        // making it effectively impossible to tell apart with a heuristic, and
+        // on top of that, even numbers that are "simpler" in hexadecimal, may
+        // still be more recognizable as decimal (e.g. `64` over `0x40`).
+        if dec.len() <= 2 {
+            return style.apply(dec).into();
+        }
+
+        let hex = format!("0x{n:x}");
+
+        fn score<const BASE: usize>(s: &str) -> f64 {
+            let probability_per_digit = 1.0 / (s.len() as f64);
+            let mut digit_probabilities = [0.0; BASE];
+
+            let mut total_probability = 0.0;
+
+            for d in s.chars() {
+                digit_probabilities[d.to_digit(BASE as u32).unwrap() as usize] +=
+                    probability_per_digit;
+                total_probability += probability_per_digit;
+            }
+
+            // HACK(eddyb) this will end up being `1.0 / N * N / BASE`, which
+            // in theory should always result in `1.0 / BASE` (i.e. a constant),
+            // except for float rounding, but maybe this shouldn't care?
+            let avg_probability = total_probability / (BASE as f64);
+
+            // HACK(eddyb) compute MSE (mean squared error), hoping that will
+            // be inversely correlated with how "random" the digit string looks.
+            digit_probabilities.iter().map(|&p| (p - avg_probability).powi(2)).sum::<f64>()
+                / (BASE as f64)
+        }
+
+        let hex_over_dec = score::<16>(&hex[2..]) - score::<10>(&dec);
+
+        // HACK(eddyb) arbitrary "epsilon" based on observed values.
+        let hex_over_dec =
+            if hex_over_dec.abs() < 1e-3 { hex.len() <= dec.len() } else { hex_over_dec > 0.0 };
+
+        style.apply(if hex_over_dec { hex } else { dec }).into()
+    }
+
+    /// Pretty-print a string literal with escaping and styling.
     fn pretty_string_literal(&self, s: &str) -> pretty::Fragment {
         // HACK(eddyb) this is somewhat inefficient, but we need to allocate a
         // `String` for every piece anyway, so might as well make it convenient.
@@ -2570,13 +2625,29 @@ impl Print for ConstDef {
                             let (printed_value, ty) = if signed {
                                 let sext_raw_bits =
                                     (raw_bits as u128 as i128) << (128 - width) >> (128 - width);
-                                (format!("{sext_raw_bits}"), format!("s{width}"))
+                                // FIXME(eddyb) consider supporting negative hex.
+                                (
+                                    if sext_raw_bits >= 0 {
+                                        printer.pretty_numeric_literal_as_dec_or_hex(
+                                            sext_raw_bits as u128,
+                                        )
+                                    } else {
+                                        printer
+                                            .numeric_literal_style()
+                                            .apply(format!("{sext_raw_bits}"))
+                                            .into()
+                                    },
+                                    format!("s{width}"),
+                                )
                             } else {
-                                (format!("{raw_bits}"), format!("u{width}"))
+                                (
+                                    printer.pretty_numeric_literal_as_dec_or_hex(raw_bits.into()),
+                                    format!("u{width}"),
+                                )
                             };
                             Some(pretty::Fragment::new([
-                                printer.numeric_literal_style().apply(printed_value),
-                                literal_ty_suffix(ty),
+                                printed_value,
+                                literal_ty_suffix(ty).into(),
                             ]))
                         } else {
                             None
