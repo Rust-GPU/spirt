@@ -1382,9 +1382,14 @@ impl<'a> Printer<'a> {
                         // HACK(eddyb) also claim all yet-unclaimed parent scopes.
                         let stack = &mut reusable_dbg_scope_stack;
                         stack.clear();
-                        stack.extend(
-                            scope.parents(cx).take_while(|parent| !claimed.contains(parent)),
-                        );
+                        stack.extend(scope.parents(cx).take_while(|parent| {
+                            claimed.get_index_of(parent).is_none_or(|parent_claim_idx| {
+                                // HACK(eddyb) scopes later in `newly_claimed_range`
+                                // get treated as unclaimed, in order to claim them
+                                // even earlier (just before they're first needed).
+                                parent_claim_idx > claim_idx
+                            })
+                        }));
                         for parent in stack.drain(..).rev() {
                             placements.insert(parent);
                         }
