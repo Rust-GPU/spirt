@@ -25,21 +25,23 @@ use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUs
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
-    DataInstDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel, DiagMsgPart, EntityListIter,
-    ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
-    GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef,
-    NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind, Type,
-    TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    DataInstDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel, DiagMsgPart,
+    EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
+    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
+    Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq,
+    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
+    cfg, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::fmt::{self, Write as _};
 use std::hash::Hash;
-use std::mem;
+use std::{iter, mem};
 
 mod multiversion;
 mod pretty;
@@ -186,18 +188,75 @@ impl CxInterned {
     }
 }
 
+// FIXME(eddyb) should `DbgSrcLoc` have a "parent scope" field like this?
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum DbgScope {
+    // HACK(eddyb) `DbgSrcLoc`'s `inlined_callee_name_and_call_site`'s field.
+    InlinedCalleeBody { callee_name: InternedStr, call_site: AttrSet },
+}
+
+impl DbgScope {
+    fn try_from_attrs(cx: &Context, attrs: AttrSet) -> Option<Self> {
+        DbgScope::try_from_dbg_src_loc(attrs.dbg_src_loc(cx)?)
+    }
+
+    fn try_from_dbg_src_loc(dbg_src_loc: DbgSrcLoc) -> Option<Self> {
+        let DbgSrcLoc {
+            file_path: _,
+            start_line_col: _,
+            end_line_col: _,
+            inlined_callee_name_and_call_site,
+        } = dbg_src_loc;
+
+        let (callee_name, call_site) = inlined_callee_name_and_call_site?;
+
+        Some(DbgScope::InlinedCalleeBody { callee_name, call_site })
+    }
+
+    fn parent(&self, cx: &Context) -> Option<Self> {
+        match *self {
+            DbgScope::InlinedCalleeBody { callee_name: _, call_site } => {
+                DbgScope::try_from_attrs(cx, call_site)
+            }
+        }
+    }
+
+    fn parents<'a>(&self, cx: &'a Context) -> impl Iterator<Item = Self> + 'a {
+        let mut scope = Some(*self);
+        iter::from_fn(move || {
+            scope = scope?.parent(cx);
+            scope
+        })
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum Use {
     PlanItem(PlanItem),
 
     CxInterned(CxInterned),
 
+    DbgScope {
+        scope: DbgScope,
+
+        // HACK(eddyb) only needed because `DbgScope` itself can appear in many
+        // functions with identical values (e.g. due to monomorphization), and
+        // it lacks the kind of "globally unique" identity of `Region`/`Node`.
+        parent_func: Func,
+    },
+
     RegionLabel(Region),
 
     // FIXME(eddyb) these are `Value`'s variants except `Const`, maybe `Use`
     // should just use `Value` and assert it's never `Const`?
-    RegionInput { region: Region, input_idx: u32 },
-    NodeOutput { node: Node, output_idx: u32 },
+    RegionInput {
+        region: Region,
+        input_idx: u32,
+    },
+    NodeOutput {
+        node: Node,
+        output_idx: u32,
+    },
     DataInstOutput(DataInst),
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
@@ -228,6 +287,8 @@ impl Use {
         match self {
             Self::PlanItem(item) => item.keyword_and_name_prefix().unwrap(),
             Self::CxInterned(interned) => interned.keyword_and_name_prefix(),
+
+            Self::DbgScope { .. } => ("", "d"),
             Self::RegionLabel(_) => ("label", "L"),
 
             Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput(_) => {
@@ -626,6 +687,201 @@ impl Plan<'_> {
     }
 }
 
+/// Inside-out reverse traversal, placing debug scopes' definitions,
+/// such that each debug scope's definition is always found:
+/// - in the innermost `Region` which contains all uses of it
+/// - just before the first `Node` which contains any uses of it
+//
+// FIXME(eddyb) try to turn this into debug scopes structurally "wrapping" the
+// ranges of nodes "inside" it, but that's an a harder "aesthetic optimization",
+// and it would still need an approach like this, as a general fallback, anyway.
+// FIXME(eddyb) consider interning the `DbgScope`s, even if locally.
+struct DbgScopeDefPlacer<'a> {
+    cx: &'a Context,
+}
+
+#[derive(Copy, Clone)]
+struct DbgScopeDefPlace {
+    parent_region: Region,
+
+    intra_region: DbgScopeDefPlaceInRegion,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct DbgScopeDefPlaceInRegion {
+    // HACK(eddyb) `Option` only needed due to potentially empty regions.
+    before_node: Option<Node>,
+}
+
+impl DbgScopeDefPlace {
+    fn top_of(func_at_region: FuncAt<'_, Region>) -> Self {
+        DbgScopeDefPlace {
+            parent_region: func_at_region.position,
+            intra_region: DbgScopeDefPlaceInRegion {
+                before_node: func_at_region
+                    .at_children()
+                    .into_iter()
+                    .next()
+                    .map(|func_at_node| func_at_node.position),
+            },
+        }
+    }
+}
+
+struct DbgScopeDefMap {
+    // HACK(eddyb) a place that "dominates" (is earlier than, and
+    // not nested any further than) all of the ones used in `scopes`.
+    top: DbgScopeDefPlace,
+
+    // HACK(eddyb) to simplify both collection and usage, the insertion order
+    // (that `FxIndexMap` preserves) is reversed from printing order.
+    rev_scopes: FxIndexMap<DbgScope, DbgScopeDefPlace>,
+}
+
+// FIXME(eddyb) do these methods need better names?
+impl DbgScopeDefMap {
+    fn merge_ordered(
+        top: DbgScopeDefPlace,
+        scope_maps: impl DoubleEndedIterator<Item = Self>,
+    ) -> Self {
+        let rev_scopes = scope_maps
+            .rev()
+            .reduce(|old_tail, new_head| {
+                if old_tail.rev_scopes.is_empty() {
+                    return new_head;
+                }
+
+                let mut merged =
+                    DbgScopeDefMap { top: new_head.top, rev_scopes: old_tail.rev_scopes };
+                for (new_scope, new_place) in new_head.rev_scopes {
+                    merged
+                        .rev_scopes
+                        .entry(new_scope)
+                        .and_modify(|merged_place| {
+                            *merged_place = merged.top;
+                        })
+                        .or_insert(new_place);
+                }
+                merged
+            })
+            .map(|merged| merged.rev_scopes)
+            .unwrap_or_default();
+        DbgScopeDefMap { top, rev_scopes }
+    }
+
+    fn merge_unordered(
+        common_top: DbgScopeDefPlace,
+        scope_maps: impl DoubleEndedIterator<Item = Self>,
+    ) -> Self {
+        DbgScopeDefMap::merge_ordered(
+            common_top,
+            scope_maps.map(|mut scope_map| {
+                scope_map.top = common_top;
+                scope_map
+            }),
+        )
+    }
+
+    fn prepend_attrs(&mut self, cx: &Context, attrs: AttrSet) {
+        if let Some(scope) = DbgScope::try_from_attrs(cx, attrs) {
+            for scope in [scope].into_iter().chain(scope.parents(cx)) {
+                use indexmap::map::Entry;
+
+                match self.rev_scopes.entry(scope) {
+                    Entry::Occupied(entry) => {
+                        *entry.into_mut() = self.top;
+                        break;
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(self.top);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl DbgScopeDefPlacer<'_> {
+    fn scopes_used_in_whole_func(&mut self, func_def_body: &FuncDefBody) -> DbgScopeDefMap {
+        match &func_def_body.unstructured_cfg {
+            None => self.scopes_used_in_region(func_def_body.at_body()),
+            Some(cfg) => DbgScopeDefMap::merge_unordered(
+                DbgScopeDefPlace::top_of(func_def_body.at_body()),
+                cfg.rev_post_order(func_def_body).map(|region| {
+                    let mut scopes = self.scopes_used_in_region(func_def_body.at(region));
+                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
+                        scopes.prepend_attrs(self.cx, control_inst.attrs);
+                    }
+                    scopes
+                }),
+            ),
+        }
+    }
+
+    // FIXME(eddyb) use some in-place tricks (a la `SnapshotVec`) to make
+    // this cheaper than allocating and returning `DbgScopeDefMap`s.
+    fn scopes_used_in_region(&mut self, func_at_region: FuncAt<'_, Region>) -> DbgScopeDefMap {
+        // HACK(eddyb) helper used to avoid hardcoding `Node` details (see below).
+        struct ShallowVisitAttrsAndRegions<VA, VR> {
+            visit_attrs: VA,
+            visit_region: VR,
+        }
+        impl<'a, VA: FnMut(AttrSet), VR: FnMut(Region)> Visitor<'a>
+            for ShallowVisitAttrsAndRegions<VA, VR>
+        {
+            // FIXME(eddyb) this is excessive, maybe different kinds of
+            // visitors should exist for module-level and func-level?
+            fn visit_type_use(&mut self, _: Type) {}
+            fn visit_const_use(&mut self, _: Const) {}
+            fn visit_global_var_use(&mut self, _: GlobalVar) {}
+            fn visit_func_use(&mut self, _: Func) {}
+
+            fn visit_attr_set_use(&mut self, attrs: AttrSet) {
+                (self.visit_attrs)(attrs);
+            }
+            fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
+                (self.visit_region)(func_at_region.position);
+            }
+        }
+
+        DbgScopeDefMap::merge_ordered(
+            DbgScopeDefPlace::top_of(func_at_region),
+            func_at_region.at_children().into_iter().map(|func_at_node| {
+                // HACK(eddyb) working around pre-unification non-uniform `Node`
+                // details by collecting the relevant fields with a `Visitor`.
+                let mut child_regions = SmallVec::<[_; 4]>::new();
+                ShallowVisitAttrsAndRegions {
+                    visit_attrs: |_| {},
+                    visit_region: |region| child_regions.push(region),
+                }
+                .visit_node_def(func_at_node);
+
+                let mut map = DbgScopeDefMap::merge_unordered(
+                    DbgScopeDefPlace {
+                        parent_region: func_at_region.position,
+                        intra_region: DbgScopeDefPlaceInRegion {
+                            before_node: Some(func_at_node.position),
+                        },
+                    },
+                    child_regions.into_iter().map(|child_region| {
+                        self.scopes_used_in_region(func_at_node.at(child_region))
+                    }),
+                );
+
+                ShallowVisitAttrsAndRegions {
+                    visit_attrs: |attrs| {
+                        map.prepend_attrs(self.cx, attrs);
+                    },
+                    visit_region: |_| {},
+                }
+                .visit_node_def(func_at_node);
+
+                map
+            }),
+        )
+    }
+}
+
 pub struct Printer<'a> {
     cx: &'a Context,
     use_styles: FxIndexMap<Use, UseStyle>,
@@ -634,6 +890,24 @@ pub struct Printer<'a> {
     /// containing those entries which are actively used for `UseStyle::Named`
     /// values in `use_styles`, and therefore need to be hidden from attributes.
     attrs_with_spv_name_in_use: FxHashMap<AttrSet, &'a spv::Inst>,
+
+    /// Map from each `Region` to the `DbgScope`s placed in it in any version,
+    /// indexed by `DbgScopeDefPlaceInRegion` (e.g. "just before some `Node`").
+    ///
+    /// **Note**: due to different versions potentially placing one `DbgScope`
+    /// before two (or more) different `Node`s, which might not even have any
+    /// theoretical global ordering (i.e. due to removed/reordered `Node`s),
+    /// each `Region` must explicitly ensure each `DbgScope` is printed once.
+    //
+    // FIXME(eddyb) is `Use::DbgScope` even needed at all, with this?
+    per_region_dbg_scope_def_placements: EntityOrientedDenseMap<
+        Region,
+        FxHashMap<DbgScopeDefPlaceInRegion, SmallIndexSet<DbgScope, 2>>,
+    >,
+
+    // HACK(eddyb) only used for `DbgScope` printing, but could/should be used
+    // for more situations (and maybe include the version index, as well).
+    current_plan_item: Cell<Option<PlanItem>>,
 }
 
 /// How an [`Use`] of a definition should be printed.
@@ -660,54 +934,95 @@ enum UseStyle {
     Inline,
 }
 
+// HACK(eddyb) move this elsewhere.
+enum SmallIndexSet<T, const N: usize> {
+    Linear(ArrayVec<T, N>),
+    Hashed(Box<FxIndexSet<T>>),
+}
+
+type SmallSetIter<'a, T> = Either<std::slice::Iter<'a, T>, indexmap::set::Iter<'a, T>>;
+
+impl<T, const N: usize> Default for SmallIndexSet<T, N> {
+    fn default() -> Self {
+        Self::Linear(ArrayVec::new())
+    }
+}
+
+impl<T: Eq + Hash, const N: usize> SmallIndexSet<T, N> {
+    fn insert(&mut self, x: T) -> bool {
+        match self {
+            Self::Linear(xs) => {
+                // HACK(eddyb) this optimizes for values repeating, i.e.
+                // `xs.last() == Some(&x)` being the most common case.
+                if xs.iter().rev().any(|old| *old == x) {
+                    return false;
+                }
+                if let Err(err) = xs.try_push(x) {
+                    *self = Self::Hashed(Box::new(xs.drain(..).chain([err.element()]).collect()));
+                }
+                true
+            }
+            Self::Hashed(xs) => xs.insert(x),
+        }
+    }
+
+    fn iter(&self) -> SmallSetIter<'_, T> {
+        match self {
+            Self::Linear(xs) => Either::Left(xs.iter()),
+            Self::Hashed(xs) => Either::Right(xs.iter()),
+        }
+    }
+}
+
+impl<'a, T: Eq + Hash, const N: usize> IntoIterator for &'a SmallIndexSet<T, N> {
+    type IntoIter = SmallSetIter<'a, T>;
+    type Item = &'a T;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+// FIXME(eddyb) maybe this should be provided by `visit`.
+struct VisitAllRegionsAndNodes<VRN> {
+    visit_region_or_node: VRN,
+    parent_region: Option<Region>,
+}
+impl<'a, VRN: FnMut(FuncAt<'a, Either<Region, (Node, Region)>>)> Visitor<'a>
+    for VisitAllRegionsAndNodes<VRN>
+{
+    // FIXME(eddyb) this is excessive, maybe different kinds of
+    // visitors should exist for module-level and func-level?
+    fn visit_attr_set_use(&mut self, _: AttrSet) {}
+    fn visit_type_use(&mut self, _: Type) {}
+    fn visit_const_use(&mut self, _: Const) {}
+    fn visit_global_var_use(&mut self, _: GlobalVar) {}
+    fn visit_func_use(&mut self, _: Func) {}
+
+    fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
+        (self.visit_region_or_node)(func_at_region.at(Either::Left(func_at_region.position)));
+
+        let outer_region = self.parent_region.replace(func_at_region.position);
+        func_at_region.inner_visit_with(self);
+        self.parent_region = outer_region;
+    }
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
+        (self.visit_region_or_node)(
+            func_at_node.at(Either::Right((func_at_node.position, self.parent_region.unwrap()))),
+        );
+        func_at_node.inner_visit_with(self);
+    }
+}
+
 impl<'a> Printer<'a> {
     fn new(plan: &Plan<'a>) -> Self {
         let cx = plan.cx;
         let wk = &spv::spec::Spec::get().well_known;
 
-        // HACK(eddyb) move this elsewhere.
-        enum SmallSet<T, const N: usize> {
-            Linear(ArrayVec<T, N>),
-            Hashed(Box<FxIndexSet<T>>),
-        }
-
-        type SmallSetIter<'a, T> = Either<std::slice::Iter<'a, T>, indexmap::set::Iter<'a, T>>;
-
-        impl<T, const N: usize> Default for SmallSet<T, N> {
-            fn default() -> Self {
-                Self::Linear(ArrayVec::new())
-            }
-        }
-
-        impl<T: Eq + Hash, const N: usize> SmallSet<T, N> {
-            fn insert(&mut self, x: T) {
-                match self {
-                    Self::Linear(xs) => {
-                        // HACK(eddyb) this optimizes for values repeating, i.e.
-                        // `xs.last() == Some(&x)` being the most common case.
-                        if !xs.iter().rev().any(|old| *old == x) {
-                            if let Err(err) = xs.try_push(x) {
-                                *self = Self::Hashed(Box::new(
-                                    xs.drain(..).chain([err.element()]).collect(),
-                                ));
-                            }
-                        }
-                    }
-                    Self::Hashed(xs) => {
-                        xs.insert(x);
-                    }
-                }
-            }
-
-            fn iter(&self) -> SmallSetIter<'_, T> {
-                match self {
-                    Self::Linear(xs) => Either::Left(xs.iter()),
-                    Self::Hashed(xs) => Either::Right(xs.iter()),
-                }
-            }
-        }
-
         let mut attrs_with_spv_name_in_use = FxHashMap::default();
+        let mut per_region_dbg_scope_def_placements: EntityOrientedDenseMap<
+            Region,
+            FxHashMap<DbgScopeDefPlaceInRegion, SmallIndexSet<DbgScope, 2>>,
+        > = EntityOrientedDenseMap::new();
 
         // NOTE(eddyb) `SmallSet` is an important optimization, as most attributes
         // *do not* change across versions, so we avoid a lot of repeated work.
@@ -763,7 +1078,7 @@ impl<'a> Printer<'a> {
                     return (use_kind, UseStyle::Anon { parent_func: None, idx: 0 });
                 }
 
-                let mut deduped_attrs_across_versions = SmallSet::<_, 8>::default();
+                let mut deduped_attrs_across_versions = SmallIndexSet::<_, 8>::default();
                 match use_kind {
                     Use::CxInterned(interned) => {
                         deduped_attrs_across_versions.insert(match interned {
@@ -781,7 +1096,8 @@ impl<'a> Printer<'a> {
                             deduped_attrs_across_versions.insert(attrs);
                         }
                     }
-                    Use::RegionLabel(_)
+                    Use::DbgScope { .. }
+                    | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
                     | Use::DataInstOutput(_)
@@ -855,7 +1171,8 @@ impl<'a> Printer<'a> {
                     }
                     Use::PlanItem(_) => false,
 
-                    Use::RegionLabel(_)
+                    Use::DbgScope { .. }
+                    | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
                     | Use::DataInstOutput(_)
@@ -865,7 +1182,7 @@ impl<'a> Printer<'a> {
                         unreachable!()
                     }
                 };
-                let style = if inline {
+                let use_style = if inline {
                     UseStyle::Inline
                 } else {
                     let ac = &mut anon_counters;
@@ -880,6 +1197,7 @@ impl<'a> Printer<'a> {
                             | PlanItem::ModuleDialect
                             | PlanItem::ModuleDebugInfo,
                         )
+                        | Use::DbgScope { .. }
                         | Use::RegionLabel(_)
                         | Use::RegionInput { .. }
                         | Use::NodeOutput { .. }
@@ -894,7 +1212,7 @@ impl<'a> Printer<'a> {
                     *counter += 1;
                     UseStyle::Anon { parent_func: None, idx }
                 };
-                (use_kind, style)
+                (use_kind, use_style)
             })
             .collect();
 
@@ -916,7 +1234,7 @@ impl<'a> Printer<'a> {
             // and we have to first buffer all the intra-function definitions.
             #[derive(Default)]
             struct IntraFuncDefAcrossVersions {
-                deduped_attrs_across_versions: SmallSet<AttrSet, 4>,
+                deduped_attrs_across_versions: SmallIndexSet<AttrSet, 4>,
             }
             let mut intra_func_defs_across_versions: FxIndexMap<Use, IntraFuncDefAcrossVersions> =
                 FxIndexMap::default();
@@ -931,7 +1249,210 @@ impl<'a> Printer<'a> {
                 }
             });
 
+            // HACK(eddyb) this approach could get expensive in some cases, and
+            // while it doesn't make a great effort to unify across versions,
+            // it still needs several passes and data structures to achieve
+            // the goal of printing each `DbgScope` definition exactly once
+            // (per version), while not knowing which version is being printed.
+            let dbg_scopes_across_versions: Vec<_> = func_def_bodies_across_versions
+                .clone()
+                .map(|func_def_body| {
+                    DbgScopeDefPlacer { cx }.scopes_used_in_whole_func(func_def_body)
+                })
+                .collect();
+            let mut all_possible_dbg_scope_placements: EntityOrientedDenseMap<
+                Region,
+                FxIndexMap<DbgScopeDefPlaceInRegion, SmallIndexSet<DbgScope, 4>>,
+            > = EntityOrientedDenseMap::new();
+            for dbg_scopes in &dbg_scopes_across_versions {
+                for (&scope, &place) in dbg_scopes.rev_scopes.iter().rev() {
+                    let DbgScopeDefPlace { parent_region, intra_region } = place;
+                    all_possible_dbg_scope_placements
+                        .entry(parent_region)
+                        .get_or_insert_default()
+                        .entry(intra_region)
+                        .or_default()
+                        .insert(scope);
+                }
+            }
+
+            // HACK(eddyb) outside the loop for buffer reuse reasons.
+            let mut reusable_claimed_dbg_scopes_in_this_version = FxIndexSet::default();
+            let mut reusable_dbg_scope_stack = vec![];
+
+            for (func_def_body, dbg_scopes_in_this_version) in
+                func_def_bodies_across_versions.clone().zip_eq(dbg_scopes_across_versions)
+            {
+                // HACK(eddyb) to avoid ending up with some versions having more
+                // than one `Region` printing the same `DbgScope`, we filter the
+                // "upper bound" (`all_possible_dbg_scope_placements`) entries,
+                // by only keeping, within each version, the first placement of
+                // each `DbgScope` - this effectively hoists the `DbgScope`s to
+                // some common `Region`, if necessary to "synchronize" versions.
+                //
+                // FIXME(eddyb) this isn't even enough across all possible cases,
+                // because a `Region` can get removed in a later version, and so
+                // for now, the version with multiple applicable `Region`s will
+                // get duplicated printing (to avoid further complicating this).
+                reusable_claimed_dbg_scopes_in_this_version.clear();
+                let mut claim_dbg_scopes_at = |place: DbgScopeDefPlace| {
+                    let DbgScopeDefPlace { parent_region, intra_region } = place;
+                    let Some(region_placements) =
+                        all_possible_dbg_scope_placements.get(parent_region)
+                    else {
+                        return;
+                    };
+
+                    // HACK(eddyb) because `all_possible_dbg_scope_placements`
+                    // is cross-version, further filtering is needed to ignore
+                    // `DbgScope`s completely missing from certain versions.
+                    let used_in_this_version = |scope: &DbgScope| {
+                        dbg_scopes_in_this_version.rev_scopes.contains_key(scope)
+                    };
+
+                    // HACK(eddyb) take advantage of `IndexSet` ordering,
+                    // in order to also use `claimed` as a "staging area".
+                    let claimed = &mut reusable_claimed_dbg_scopes_in_this_version;
+                    let newly_claimed_start = claimed.len();
+
+                    // HACK(eddyb) here this isn't just used for empty regions,
+                    // but indicates the start of `parent_region`, where anything
+                    // placed in `parent_region` *across any version*, should be
+                    // hoisted to (unless claimed by any child of `parent_region`).
+                    if intra_region.before_node.is_none() {
+                        // HACK(eddyb) the child nodes haven't been claimed yet,
+                        // so to know which `DbgScope`s they *will have* claimed
+                        // in the future, we simulate that entire process, with
+                        // `claimed` potentially gaining a range of new entries,
+                        // that will effectively filter a *second* such range,
+                        // before removing the first range (of future claims).
+                        claimed.extend(
+                            func_def_body
+                                .at(parent_region)
+                                .at_children()
+                                .into_iter()
+                                .map(|func_at_node| Some(func_at_node.position))
+                                .filter_map(|before_node| {
+                                    region_placements.get(&DbgScopeDefPlaceInRegion { before_node })
+                                })
+                                .flatten()
+                                .copied()
+                                .filter(used_in_this_version),
+                        );
+                        let simulated_future_claims_range = newly_claimed_start..claimed.len();
+
+                        // NOTE(eddyb) implicit filtering: only new `DbgScope`s
+                        // get inserted into `claimed`, growing `claimed.len()`.
+                        claimed.extend(
+                            region_placements
+                                .values()
+                                .flatten()
+                                .copied()
+                                .filter(used_in_this_version),
+                        );
+
+                        claimed.splice(simulated_future_claims_range, []);
+                    } else {
+                        // NOTE(eddyb) implicit filtering: only new `DbgScope`s
+                        // get inserted into `claimed`, growing `claimed.len()`.
+                        claimed.extend(
+                            region_placements
+                                .get(&intra_region)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .filter(used_in_this_version),
+                        );
+                    }
+
+                    let newly_claimed_range = newly_claimed_start..claimed.len();
+
+                    if newly_claimed_range.is_empty() {
+                        return;
+                    }
+
+                    let placements = per_region_dbg_scope_def_placements
+                        .entry(parent_region)
+                        .get_or_insert_default()
+                        .entry(intra_region)
+                        .or_default();
+                    for claim_idx in newly_claimed_range {
+                        let scope = claimed[claim_idx];
+
+                        // HACK(eddyb) also claim all yet-unclaimed parent scopes.
+                        let stack = &mut reusable_dbg_scope_stack;
+                        stack.clear();
+                        stack.extend(
+                            scope.parents(cx).take_while(|parent| !claimed.contains(parent)),
+                        );
+                        for parent in stack.drain(..).rev() {
+                            placements.insert(parent);
+                        }
+
+                        placements.insert(scope);
+                    }
+                };
+
+                // HACK(eddyb) a full separate visit is done here, due to the
+                // cross-version nature of `per_region_dbg_scope_def_placements`,
+                // meaning later versions can hoist `DbgScope`s to earlier in a
+                // `Region`, and therefore change the print order of `DbgScope`s,
+                // so numbering can only be done *after* the order is settled.
+                // FIXME(eddyb) maybe run `DbgScopeDefPlacer` twice, instead,
+                // or find some other way to hoist `DbgScope`s to placements
+                // that work well across all versions.
+                let visit_region_or_node = |farn: FuncAt<'_, Either<Region, (Node, Region)>>| {
+                    let region_or_node = farn.position;
+                    if let Either::Left(region) = region_or_node {
+                        // HACK(eddyb) this will claim all `DbgScope`s which both:
+                        // - happen to be placed anywhere inside `region` in any version
+                        // - won't be later claimed by a `region` child `Node`
+                        // (see also comments above/inside `claim_dbg_scopes_at`)
+                        claim_dbg_scopes_at(DbgScopeDefPlace {
+                            parent_region: region,
+                            intra_region: DbgScopeDefPlaceInRegion { before_node: None },
+                        });
+                    } else {
+                        let (node, parent_region) = region_or_node.right().unwrap();
+
+                        claim_dbg_scopes_at(DbgScopeDefPlace {
+                            parent_region,
+                            intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
+                        });
+                    }
+                };
+
+                func_def_body.inner_visit_with(&mut VisitAllRegionsAndNodes {
+                    visit_region_or_node,
+                    parent_region: None,
+                });
+            }
+            drop(reusable_claimed_dbg_scopes_in_this_version);
+            drop(reusable_dbg_scope_stack);
+
+            let mut dbg_scope_counter = 0;
+
             for func_def_body in func_def_bodies_across_versions {
+                let mut define_dbg_scopes_at = |place: DbgScopeDefPlace| {
+                    let DbgScopeDefPlace { parent_region, intra_region } = place;
+                    let Some(dbg_scopes) = per_region_dbg_scope_def_placements
+                        .get(parent_region)
+                        .and_then(|placements| placements.get(&intra_region))
+                    else {
+                        return;
+                    };
+
+                    let counter = &mut dbg_scope_counter;
+                    for &scope in dbg_scopes {
+                        use_styles
+                            .entry(Use::DbgScope { scope, parent_func: func })
+                            .or_insert_with(|| {
+                                let idx = *counter;
+                                *counter += 1;
+                                UseStyle::Anon { parent_func: Some(func), idx }
+                            });
+                    }
+                };
                 let mut define = |use_kind, attrs| {
                     let def = intra_func_defs_across_versions.entry(use_kind).or_default();
                     if let Some(attrs) = attrs {
@@ -942,9 +1463,14 @@ impl<'a> Printer<'a> {
                 // - borrowing constraints on `define` (mutable access to maps)
                 // - needing to minimize the changes to allow rebasing further
                 //   refactors (after which it may be easier to clean up anyway)
-                let visit_region_or_node = |func_at_r_or_n: FuncAt<'_, Either<Region, Node>>| {
-                    let region_or_node = func_at_r_or_n.position;
+                let visit_region_or_node = |farn: FuncAt<'_, Either<Region, (Node, Region)>>| {
+                    let region_or_node = farn.position;
                     if let Either::Left(region) = region_or_node {
+                        define_dbg_scopes_at(DbgScopeDefPlace {
+                            parent_region: region,
+                            intra_region: DbgScopeDefPlaceInRegion { before_node: None },
+                        });
+
                         define(Use::AlignmentAnchorForRegion(region), None);
                         // FIXME(eddyb) should labels have names?
                         define(Use::RegionLabel(region), None);
@@ -959,8 +1485,13 @@ impl<'a> Printer<'a> {
                             );
                         }
                     } else {
-                        let node = region_or_node.right().unwrap();
-                        let func_at_node = func_at_r_or_n.at(node);
+                        let (node, parent_region) = region_or_node.right().unwrap();
+                        let func_at_node = farn.at(node);
+
+                        define_dbg_scopes_at(DbgScopeDefPlace {
+                            parent_region,
+                            intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
+                        });
 
                         define(Use::AlignmentAnchorForNode(node), None);
 
@@ -991,27 +1522,10 @@ impl<'a> Printer<'a> {
                     }
                 };
 
-                // FIXME(eddyb) maybe this should be provided by `visit`.
-                struct VisitAllRegionsAndNodes<F>(F);
-                impl<'a, F: FnMut(FuncAt<'a, Either<Region, Node>>)> Visitor<'a> for VisitAllRegionsAndNodes<F> {
-                    // FIXME(eddyb) this is excessive, maybe different kinds of
-                    // visitors should exist for module-level and func-level?
-                    fn visit_attr_set_use(&mut self, _: AttrSet) {}
-                    fn visit_type_use(&mut self, _: Type) {}
-                    fn visit_const_use(&mut self, _: Const) {}
-                    fn visit_global_var_use(&mut self, _: GlobalVar) {}
-                    fn visit_func_use(&mut self, _: Func) {}
-
-                    fn visit_region_def(&mut self, func_at_region: FuncAt<'a, Region>) {
-                        self.0(func_at_region.at(Either::Left(func_at_region.position)));
-                        func_at_region.inner_visit_with(self);
-                    }
-                    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
-                        self.0(func_at_node.at(Either::Right(func_at_node.position)));
-                        func_at_node.inner_visit_with(self);
-                    }
-                }
-                func_def_body.inner_visit_with(&mut VisitAllRegionsAndNodes(visit_region_or_node));
+                func_def_body.inner_visit_with(&mut VisitAllRegionsAndNodes {
+                    visit_region_or_node,
+                    parent_region: None,
+                });
             }
 
             let mut region_label_counter = 0;
@@ -1058,7 +1572,13 @@ impl<'a> Printer<'a> {
             }
         }
 
-        Self { cx, use_styles, attrs_with_spv_name_in_use }
+        Self {
+            cx,
+            use_styles,
+            attrs_with_spv_name_in_use,
+            per_region_dbg_scope_def_placements,
+            current_plan_item: Cell::new(None),
+        }
     }
 
     pub fn cx(&self) -> &'a Context {
@@ -1492,8 +2012,9 @@ pub trait Print {
 impl Use {
     /// Common implementation for [`Use::print`] and [`Use::print_as_def`].
     fn print_as_ref_or_def(&self, printer: &Printer<'_>, is_def: bool) -> pretty::Fragment {
-        let style = printer.use_styles.get(self).unwrap_or(&UseStyle::Inline);
-        match style {
+        // FIXME(eddyb) name rename `UseStyle` so it doesn't clash with `pretty::Styles`
+        let use_style = printer.use_styles.get(self).unwrap_or(&UseStyle::Inline);
+        match use_style {
             &UseStyle::Anon { parent_func, idx: _ } | &UseStyle::Named { parent_func, name: _ } => {
                 // FIXME(eddyb) should this be used as part of `UseStyle`'s definition?
                 #[derive(Debug, PartialEq, Eq)]
@@ -1542,14 +2063,14 @@ impl Use {
                     }
                 }
 
-                let suffix_of = |style| match style {
+                let suffix_of = |use_style| match use_style {
                     &UseStyle::Anon { idx, .. } => Suffix::Num(idx),
                     UseStyle::Named { name, .. } => Suffix::Name(name),
                     UseStyle::Inline => unreachable!(),
                 };
 
                 let (keyword, name_prefix) = self.keyword_and_name_prefix();
-                let suffix = suffix_of(style);
+                let suffix = suffix_of(use_style);
 
                 // FIXME(eddyb) could the `anchor: Rc<str>` be cached?
                 let mk_anchor = |anchor: String, text: Vec<_>| pretty::Node::Anchor {
@@ -1582,27 +2103,41 @@ impl Use {
                 {
                     vec![]
                 } else {
-                    // HACK(eddyb) make the suffix larger for e.g. `T` than `v`.
-                    let suffix_size = if name_prefix.ends_with(|c: char| c.is_ascii_uppercase()) {
-                        -1
-                    } else {
-                        -2
+                    // HACK(eddyb) `DbgScope`s only appear in "debuginfo comments",
+                    // and that's easier to handle here, than post-process later.
+                    // FIXME(eddyb) consider `thickness: Some(0)` or something
+                    // intermediate, instead of the `4` that anchors default to.
+                    let base_style = match self {
+                        Self::DbgScope { .. } => Some(printer.comment_style()),
+                        _ => None,
+                    };
+
+                    let suffix_style = {
+                        // HACK(eddyb) make the suffix larger for e.g. `T` than `v`.
+                        let suffix_size = if name_prefix.ends_with(|c: char| c.is_ascii_uppercase())
+                        {
+                            -1
+                        } else {
+                            -2
+                        };
+
+                        let base_or_default = base_style.unwrap_or_default();
+                        pretty::Styles {
+                            size: Some(base_or_default.size.unwrap_or_default() + suffix_size),
+                            ..base_or_default
+                        }
                     };
                     let suffix = match suffix {
                         Suffix::Num(idx) => (
-                            Some(pretty::Styles {
-                                size: Some(suffix_size),
-                                subscript: true,
-                                ..Default::default()
-                            }),
+                            Some(pretty::Styles { subscript: true, ..suffix_style }),
                             format!("{idx}").into(),
                         ),
                         Suffix::Name(name) => (
                             Some(pretty::Styles {
                                 thickness: Some(0),
-                                size: Some(suffix_size - 1),
+                                size: Some(suffix_style.size.unwrap_or_default() - 1),
                                 color: Some(pretty::palettes::simple::LIGHT_GRAY),
-                                ..Default::default()
+                                ..suffix_style
                             }),
                             format!("`{name}`").into(),
                         ),
@@ -1610,8 +2145,8 @@ impl Use {
                     Some(keyword)
                         .filter(|kw| is_def && !kw.is_empty())
                         .into_iter()
-                        .flat_map(|kw| [(None, kw.into()), (None, " ".into())])
-                        .chain([(None, name_prefix.into()), suffix])
+                        .flat_map(|kw| [(base_style, kw.into()), (base_style, " ".into())])
+                        .chain([(base_style, name_prefix.into()), suffix])
                         .collect()
                 };
                 mk_anchor(anchor, name).into()
@@ -1627,7 +2162,8 @@ impl Use {
                         item.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
-                Self::RegionLabel(_)
+                Self::DbgScope { .. }
+                | Self::RegionLabel(_)
                 | Self::RegionInput { .. }
                 | Self::NodeOutput { .. }
                 | Self::DataInstOutput(_) => "_".into(),
@@ -1733,7 +2269,11 @@ impl Plan<'_> {
                             .item_defs
                             .get(&item)
                             .map(|def| {
-                                def.print(printer).insert_name_before_def(
+                                let prev_plan_item = printer.current_plan_item.replace(Some(item));
+                                let printed_def = def.print(printer);
+                                printer.current_plan_item.set(prev_plan_item);
+
+                                printed_def.insert_name_before_def(
                                     Use::PlanItem(item).print_as_def(printer),
                                 )
                             })
@@ -2169,103 +2709,166 @@ impl Print for AttrSet {
     }
 }
 
+// FIXME(eddyb) maybe this could implement `Print` but it'd still be awkward.
+impl DbgScope {
+    fn maybe_print_name_as_ref(&self, printer: &Printer<'_>) -> Option<pretty::Fragment> {
+        self.maybe_print_name_as_ref_or_def(printer, false)
+    }
+
+    fn maybe_print_name_as_ref_or_def(
+        &self,
+        printer: &Printer<'_>,
+        is_def: bool,
+    ) -> Option<pretty::Fragment> {
+        let parent_func =
+            printer.current_plan_item.get().and_then(|plan_item| match plan_item {
+                PlanItem::Func(func) => Some(func),
+                _ => None,
+            })?;
+
+        let dbg_scope_use = Use::DbgScope { scope: *self, parent_func };
+        printer
+            .use_styles
+            .contains_key(&dbg_scope_use)
+            .then(|| dbg_scope_use.print_as_ref_or_def(printer, is_def))
+    }
+
+    fn maybe_print_def(&self, printer: &Printer<'_>) -> Option<pretty::Fragment> {
+        let name = self.maybe_print_name_as_ref_or_def(printer, true)?;
+
+        let mut def = self.print_with_prefix(printer, " = ");
+
+        // HACK(eddyb) avoid breaking `insert_name_before_def` anchor hoisting.
+        def.attrs.nodes.push(printer.comment_style().apply("// "));
+
+        Some(def.insert_name_before_def(name))
+    }
+
+    // HACK(eddyb) `AttrsAndDef` used to separate the `// at ...` comment, which
+    // is treated like `Attr::DbgSrcLoc`, from the "body" of the `DbgScope` def.
+    fn print_with_prefix(&self, printer: &Printer<'_>, prefix: &'static str) -> AttrsAndDef {
+        let mut s = String::new();
+        s += prefix;
+
+        let DbgScope::InlinedCalleeBody { callee_name, call_site } = *self;
+
+        s += "inlined `";
+
+        // HACK(eddyb) not trusting non-trivial strings to behave.
+        let callee_name = &printer.cx[callee_name];
+        if callee_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            s += callee_name;
+        } else {
+            s.extend(
+                callee_name
+                    .escape_debug()
+                    .flat_map(|c| (c == '`').then_some('\\').into_iter().chain([c])),
+            );
+        }
+
+        s += "` call";
+
+        AttrsAndDef {
+            attrs: call_site.print(printer),
+            def_without_name: printer.comment_style().apply(s).into(),
+        }
+    }
+}
+
 impl Print for Attr {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let non_comment_attr = match self {
-            // FIXME(eddyb) move from repeating the same backtrace-like comments
-            // (potentially many times in a row) to a more "stateful" approach,
-            // which only mentions every inlined callsite once per sequence of
-            // e.g. `DataInst`s that are all nested in it.
             &Attr::DbgSrcLoc(OrdAssertEq(dbg_src_loc)) => {
-                let mut comments = SmallVec::<[_; 8]>::new();
-                let mut next_dbg_src_loc = Some(dbg_src_loc);
-                while let Some(dbg_src_loc) = next_dbg_src_loc {
-                    let DbgSrcLoc {
-                        file_path,
-                        start_line_col: (start_line, mut start_col),
-                        end_line_col: (end_line, mut end_col),
-                        inlined_callee_name_and_call_site,
-                    } = dbg_src_loc;
+                let mut comment = SmallVec::<[_; 4]>::new();
 
-                    // HACK(eddyb) Rust-GPU's column numbers seem
-                    // off-by-one wrt what e.g. VSCode expects
-                    // for `:line:col` syntax, but it's hard to
-                    // tell from the spec and `glslang` doesn't
-                    // even emit column numbers at all!
-                    start_col += 1;
-                    end_col += 1;
+                let DbgSrcLoc {
+                    file_path,
+                    start_line_col: (start_line, mut start_col),
+                    end_line_col: (end_line, mut end_col),
+                    inlined_callee_name_and_call_site: _,
+                } = dbg_src_loc;
 
-                    let mut s = String::new();
-                    if comments.is_empty() {
-                        s += "// at ";
-                    } else {
-                        s += "// … at ";
-                    }
+                let dbg_scope = DbgScope::try_from_dbg_src_loc(dbg_src_loc);
+                let dbg_scope_name =
+                    dbg_scope.and_then(|scope| scope.maybe_print_name_as_ref(printer));
+                let has_dbg_scope_name = dbg_scope_name.is_some();
 
-                    // HACK(eddyb) only skip string-quoting and escaping for
-                    // well-behaved file paths.
-                    let file_path = &printer.cx[file_path];
-                    if file_path.chars().all(|c| c.is_ascii_graphic() && c != ':') {
-                        s += file_path;
-                    } else {
-                        write!(s, "{file_path:?}").unwrap();
-                    }
+                // HACK(eddyb) Rust-GPU's column numbers seem
+                // off-by-one wrt what e.g. VSCode expects
+                // for `:line:col` syntax, but it's hard to
+                // tell from the spec and `glslang` doesn't
+                // even emit column numbers at all!
+                start_col += 1;
+                end_col += 1;
 
-                    // HACK(eddyb) the syntaxes used are taken from VSCode, i.e.:
-                    // https://github.com/microsoft/vscode/blob/6b924c5/src/vs/workbench/contrib/terminalContrib/links/browser/terminalLinkParsing.ts#L75-L91
-                    // (using the most boring syntax possible for every situation).
-                    let is_quoted = s.ends_with('"');
-                    let is_range = (start_line, start_col) != (end_line, end_col);
-                    write!(
-                        s,
-                        "{}{start_line}{}{start_col}",
-                        if is_quoted { ',' } else { ':' },
-                        if is_quoted && is_range { '.' } else { ':' }
-                    )
-                    .unwrap();
-                    if is_range {
-                        s += "-";
-                        if start_line != end_line {
-                            write!(s, "{end_line}.").unwrap();
-                        }
-                        write!(s, "{end_col}").unwrap();
-                    }
+                let mut s = String::new();
+                s += "// ";
 
-                    // Chain inlined locations by putting the most important
-                    // details (`file:line:col`) at the start of each comment,
-                    // and the less important ones (callee name) at the end.
-                    next_dbg_src_loc =
-                        inlined_callee_name_and_call_site.map(|(callee_name, call_site_attrs)| {
-                            s += ", in `";
+                if let Some(dbg_scope_name) = dbg_scope_name {
+                    // FIXME(eddyb) this might not be the best way to refer
+                    // to the `DbgScope`, but it should work for now.
+                    s += "in ";
+                    comment.extend([
+                        printer.comment_style().apply(mem::take(&mut s)).into(),
+                        dbg_scope_name,
+                    ]);
 
-                            // HACK(eddyb) not trusting non-trivial strings to behave.
-                            let callee_name = &printer.cx[callee_name];
-                            if callee_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                                s += callee_name;
-                            } else {
-                                s.extend(callee_name.escape_debug().flat_map(|c| {
-                                    (c == '`').then_some('\\').into_iter().chain([c])
-                                }));
-                            }
-
-                            s += "`, inlined …";
-
-                            call_site_attrs.dbg_src_loc(printer.cx).unwrap_or_else(|| DbgSrcLoc {
-                                file_path: printer.cx.intern("<unknown callee location>"),
-                                start_line_col: (0, 0),
-                                end_line_col: (0, 0),
-                                inlined_callee_name_and_call_site: None,
-                            })
-                        });
-
-                    if !comments.is_empty() {
-                        comments.push(pretty::Node::ForceLineSeparation);
-                    }
-                    comments.push(printer.comment_style().apply(s));
+                    s += " ";
                 }
-                return pretty::Fragment::new(comments);
+
+                s += "at ";
+
+                // HACK(eddyb) only skip string-quoting and escaping for
+                // well-behaved file paths.
+                let file_path = &printer.cx[file_path];
+                if file_path.chars().all(|c| c.is_ascii_graphic() && c != ':') {
+                    s += file_path;
+                } else {
+                    write!(s, "{file_path:?}").unwrap();
+                }
+
+                // HACK(eddyb) the syntaxes used are taken from VSCode, i.e.:
+                // https://github.com/microsoft/vscode/blob/6b924c5/src/vs/workbench/contrib/terminalContrib/links/browser/terminalLinkParsing.ts#L75-L91
+                // (using the most boring syntax possible for every situation).
+                let is_quoted = s.ends_with('"');
+                let is_range = (start_line, start_col) != (end_line, end_col);
+                write!(
+                    s,
+                    "{}{start_line}{}{start_col}",
+                    if is_quoted { ',' } else { ':' },
+                    if is_quoted && is_range { '.' } else { ':' }
+                )
+                .unwrap();
+                if is_range {
+                    s += "-";
+                    if start_line != end_line {
+                        write!(s, "{end_line}.").unwrap();
+                    }
+                    write!(s, "{end_col}").unwrap();
+                }
+                comment.push(printer.comment_style().apply(s).into());
+
+                let comment = pretty::Fragment::new(comment);
+
+                if let Some(dbg_scope) = dbg_scope {
+                    // HACK(eddyb) only print the `DbgScope` inline if
+                    // it lacked a `Use::DbgScope` to refer to, earlier.
+                    if !has_dbg_scope_name {
+                        // HACK(eddyb) chain `DbgScope`s by putting more important
+                        // details (`file:line:col`) at the start of each comment,
+                        // and less important ones (e.g. an inlined callee's name),
+                        // at the end (even if the `DbgScope` is the only part
+                        // which is affected by the comment just above this one).
+                        return dbg_scope
+                            .print_with_prefix(printer, " in ")
+                            .insert_name_before_def(comment);
+                    }
+                }
+
+                return comment;
             }
+
             Attr::Diagnostics(diags) => {
                 return pretty::Fragment::new(
                     diags
@@ -3034,6 +3637,53 @@ impl Print for FuncAt<'_, Region> {
 
         // NOTE(eddyb) `inputs` are always printed by the parent.
 
+        // HACK(eddyb) have to track which `DbgScope`s have been printed already,
+        // due to potential duplication due to different versions' placements.
+        let mut seen_dbg_scope_defs = SmallIndexSet::<_, 4>::default();
+        let dbg_scope_def_placements =
+            printer.per_region_dbg_scope_def_placements.get(self.position);
+        let mut dbg_scope_defs_at = |intra_region: DbgScopeDefPlaceInRegion| {
+            let mut relevant_dbg_scope_defs = dbg_scope_def_placements
+                .and_then(|placements| placements.get(&intra_region))
+                .into_iter()
+                .flat_map(|dbg_scopes| dbg_scopes.iter().copied())
+                .filter(|&dbg_scope| seen_dbg_scope_defs.insert(dbg_scope))
+                .filter_map(|dbg_scope| dbg_scope.maybe_print_def(printer));
+
+            // HACK(eddyb) allow the caller to tell apart the empty case.
+            let relevant_dbg_scope_defs =
+                [relevant_dbg_scope_defs.next()?].into_iter().chain(relevant_dbg_scope_defs);
+
+            Some(pretty::Fragment::new(
+                relevant_dbg_scope_defs
+                    .flat_map(|comment| [comment, pretty::Node::ForceLineSeparation.into()]),
+            ))
+        };
+
+        let header = dbg_scope_defs_at(DbgScopeDefPlaceInRegion { before_node: None })
+            .map(|dbg_scope_defs| {
+                pretty::Fragment::new([
+                    dbg_scope_defs,
+                    // HACK(eddyb) separate hoisted `DbgScope`s with an empty line.
+                    // FIXME(eddyb) have an explicit `pretty::Node`
+                    // for "vertical gap" instead.
+                    "\n\n".into(),
+                ])
+            })
+            .unwrap_or_default();
+
+        let body = (self.at(*children).into_iter())
+            .map(|func_at_node| {
+                pretty::Fragment::new([
+                    dbg_scope_defs_at(DbgScopeDefPlaceInRegion {
+                        before_node: Some(func_at_node.position),
+                    })
+                    .unwrap_or_default(),
+                    func_at_node.print(printer),
+                ])
+            })
+            .intersperse(pretty::Node::ForceLineSeparation.into());
+
         let outputs_footer = if !outputs.is_empty() {
             let mut outputs = outputs.iter().map(|v| v.print(printer));
             let outputs = if outputs.len() == 1 {
@@ -3046,20 +3696,12 @@ impl Print for FuncAt<'_, Region> {
             pretty::Fragment::default()
         };
 
-        pretty::Fragment::new([
-            Use::AlignmentAnchorForRegion(self.position).print_as_def(printer),
-            self.at(*children).into_iter().print(printer),
-            outputs_footer,
-        ])
-    }
-}
-
-impl Print for FuncAt<'_, EntityListIter<Node>> {
-    type Output = pretty::Fragment;
-    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         pretty::Fragment::new(
-            self.map(|func_at_node| func_at_node.print(printer))
-                .intersperse(pretty::Node::ForceLineSeparation.into()),
+            [Use::AlignmentAnchorForRegion(self.position).print_as_def(printer)]
+                .into_iter()
+                .chain([header])
+                .chain(body)
+                .chain([outputs_footer]),
         )
     }
 }
