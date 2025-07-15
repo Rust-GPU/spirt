@@ -608,7 +608,7 @@ impl MemTypeLayout {
                 let usage_fixed_len = usage
                     .max_size
                     .map(|size| {
-                        if size % usage_stride.get() != 0 {
+                        if !size.is_multiple_of(usage_stride.get()) {
                             // FIXME(eddyb) maybe this should be propagated up,
                             // as a sign that `usage` is malformed?
                             return Err(());

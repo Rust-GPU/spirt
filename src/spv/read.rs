@@ -266,7 +266,7 @@ impl ModuleParser {
     pub fn read_from_spv_bytes(spv_bytes: Vec<u8>) -> io::Result<Self> {
         let spv_spec = spec::Spec::get();
 
-        if spv_bytes.len() % 4 != 0 {
+        if !spv_bytes.len().is_multiple_of(4) {
             return Err(invalid("not a multiple of 4 bytes"));
         }
         // May need to mutate the bytes (to normalize endianness) later below.

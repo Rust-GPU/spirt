@@ -245,7 +245,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 let fixed_len = usage
                     .max_size
                     .map(|size| {
-                        if size % stride.get() != 0 {
+                        if !size.is_multiple_of(stride.get()) {
                             return Err(LiftError(Diag::bug([format!(
                                 "DynOffsetBase: size ({size}) not a multiple of stride ({stride})"
                             )
