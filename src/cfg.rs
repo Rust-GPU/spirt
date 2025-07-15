@@ -82,7 +82,7 @@ impl ControlFlowGraph {
     pub fn rev_post_order(
         &self,
         func_def_body: &FuncDefBody,
-    ) -> impl DoubleEndedIterator<Item = Region> {
+    ) -> impl DoubleEndedIterator<Item = Region> + use<> {
         let mut post_order = SmallVec::<[_; 8]>::new();
         self.traverse_whole_func(
             func_def_body,

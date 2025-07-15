@@ -1952,7 +1952,7 @@ impl AttrsAndDef {
         let mut maybe_def_end_anchor = pretty::Fragment::default();
         let mut name = name.into();
         if let [
-            pretty::Node::Anchor { is_def: ref mut original_anchor_is_def @ true, anchor, text: _ },
+            pretty::Node::Anchor { is_def: original_anchor_is_def @ true, anchor, text: _ },
             ..,
         ] = &mut name.nodes[..]
         {
