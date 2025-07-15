@@ -213,11 +213,11 @@ impl InstParser<'_> {
             self.inst.result_id = def.has_result_id.then(&mut id).transpose()?;
         }
 
-        if let Some(type_id) = self.inst.result_type_id {
-            if !self.known_ids.contains_key(&type_id) {
-                // FIXME(eddyb) also check that the ID is a valid type.
-                return Err(Error::UnknownResultTypeId(type_id));
-            }
+        if let Some(type_id) = self.inst.result_type_id
+            && !self.known_ids.contains_key(&type_id)
+        {
+            // FIXME(eddyb) also check that the ID is a valid type.
+            return Err(Error::UnknownResultTypeId(type_id));
         }
 
         for (mode, kind) in def.all_operands() {

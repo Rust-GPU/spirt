@@ -625,16 +625,16 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 );
             }
         }
-        if let Some(output_type) = data_inst_def.output_type {
-            if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type) {
-                old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
-                    QPtrAttr::FromSpvPtrOutput {
-                        addr_space: OrdAssertEq(addr_space),
-                        pointee: OrdAssertEq(pointee),
-                    }
-                    .into(),
-                );
-            }
+        if let Some(output_type) = data_inst_def.output_type
+            && let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type)
+        {
+            old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
+                QPtrAttr::FromSpvPtrOutput {
+                    addr_space: OrdAssertEq(addr_space),
+                    pointee: OrdAssertEq(pointee),
+                }
+                .into(),
+            );
         }
 
         if let Some(LowerError(e)) = extra_error {

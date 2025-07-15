@@ -95,10 +95,10 @@ impl Visitor<'_> for LiveExportCollector<'_> {
         match *import {
             Import::LinkName(name) => {
                 let export_key = ExportKey::LinkName(name);
-                if let Some(&exportee) = self.module.exports.get(&export_key) {
-                    if self.live_exports.insert(export_key) {
-                        exportee.inner_visit_with(self);
-                    }
+                if let Some(&exportee) = self.module.exports.get(&export_key)
+                    && self.live_exports.insert(export_key)
+                {
+                    exportee.inner_visit_with(self);
                 }
             }
         }
@@ -198,12 +198,11 @@ impl Visitor<'_> for ImportResolutionCollector<'_> {
             // FIXME(eddyb) if the export is missing (or the wrong kind), it will
             // simply not get remapped - perhaps some kind of diagnostic is in
             // order? (maybe an entire pass infrastructure that can report errors)
-            if let DeclDef::Imported(Import::LinkName(name)) = gv_decl.def {
-                if let Some(&Exportee::GlobalVar(def_gv)) =
+            if let DeclDef::Imported(Import::LinkName(name)) = gv_decl.def
+                && let Some(&Exportee::GlobalVar(def_gv)) =
                     self.module.exports.get(&ExportKey::LinkName(name))
-                {
-                    self.resolved_global_vars.insert(gv, def_gv);
-                }
+            {
+                self.resolved_global_vars.insert(gv, def_gv);
             }
         }
     }
@@ -215,12 +214,11 @@ impl Visitor<'_> for ImportResolutionCollector<'_> {
             // FIXME(eddyb) if the export is missing (or the wrong kind), it will
             // simply not get remapped - perhaps some kind of diagnostic is in
             // order? (maybe an entire pass infrastructure that can report errors)
-            if let DeclDef::Imported(Import::LinkName(name)) = func_decl.def {
-                if let Some(&Exportee::Func(def_func)) =
+            if let DeclDef::Imported(Import::LinkName(name)) = func_decl.def
+                && let Some(&Exportee::Func(def_func)) =
                     self.module.exports.get(&ExportKey::LinkName(name))
-                {
-                    self.resolved_funcs.insert(func, def_func);
-                }
+            {
+                self.resolved_funcs.insert(func, def_func);
             }
         }
     }
