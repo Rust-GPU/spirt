@@ -245,7 +245,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 let fixed_len = usage
                     .max_size
                     .map(|size| {
-                        if size % stride.get() != 0 {
+                        if !size.is_multiple_of(stride.get()) {
                             return Err(LiftError(Diag::bug([format!(
                                 "DynOffsetBase: size ({size}) not a multiple of stride ({stride})"
                             )
@@ -430,13 +430,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) maybe all this data should be packaged up together in a
         // type with fields like those of `DeferredPtrNoop` (or even more).
         let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::DataInstOutput(v_data_inst) = v {
-                if let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst) {
-                    return Ok((
-                        ptr_noop.output_pointer_addr_space,
-                        ptr_noop.output_pointee_layout.clone(),
-                    ));
-                }
+            if let Value::DataInstOutput(v_data_inst) = v
+                && let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst)
+            {
+                return Ok((
+                    ptr_noop.output_pointer_addr_space,
+                    ptr_noop.output_pointee_layout.clone(),
+                ));
             }
 
             let (addr_space, pointee_type) =
@@ -685,17 +685,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 loop {
                     if let Components::Elements { stride: layout_stride, elem, fixed_len } =
                         &layout.components
+                        && layout_stride == stride
+                        && Ok(index_bounds.clone())
+                            == fixed_len
+                                .map(|len| i32::try_from(len.get()).map(|len| 0..len))
+                                .transpose()
                     {
-                        if layout_stride == stride
-                            && Ok(index_bounds.clone())
-                                == fixed_len
-                                    .map(|len| i32::try_from(len.get()).map(|len| 0..len))
-                                    .transpose()
-                        {
-                            access_chain_inputs.push(data_inst_def.inputs[1]);
-                            layout = elem.clone();
-                            break;
-                        }
+                        access_chain_inputs.push(data_inst_def.inputs[1]);
+                        layout = elem.clone();
+                        break;
                     }
 
                     // FIXME(eddyb) deduplicate with `maybe_adjust_pointer_for_access`.
@@ -1094,12 +1092,12 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                     if let DataInstKind::QPtr(_) = data_inst_def.kind {
                         lifted =
                             Err(LiftError(Diag::bug(["unimplemented qptr instruction".into()])));
-                    } else if let Some(ty) = data_inst_def.output_type {
-                        if matches!(self.lifter.cx[ty].kind, TypeKind::QPtr) {
-                            lifted = Err(LiftError(Diag::bug([
-                                "unimplemented qptr-producing instruction".into(),
-                            ])));
-                        }
+                    } else if let Some(ty) = data_inst_def.output_type
+                        && matches!(self.lifter.cx[ty].kind, TypeKind::QPtr)
+                    {
+                        lifted = Err(LiftError(Diag::bug([
+                            "unimplemented qptr-producing instruction".into(),
+                        ])));
                     }
                 }
                 match lifted {

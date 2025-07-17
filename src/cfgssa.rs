@@ -564,7 +564,7 @@ mod data {
             self.contains(k).then(|| self.entry(k).remove().unwrap())
         }
 
-        pub fn keys(&self) -> impl Iterator<Item = K> {
+        pub fn keys(&self) -> impl Iterator<Item = K> + use<K, V, VS> {
             let mut i = 0;
             let mut remaining = self.occupied;
             iter::from_fn(move || {

@@ -533,10 +533,10 @@ impl MemTypeLayout {
         // "Fast accept" based on type alone (expected as recursion base case).
         if let QPtrMemUsageKind::StrictlyTyped(usage_type)
         | QPtrMemUsageKind::DirectAccess(usage_type) = usage.kind
+            && usage_offset == 0
+            && self.original_type == usage_type
         {
-            if usage_offset == 0 && self.original_type == usage_type {
-                return true;
-            }
+            return true;
         }
 
         {
@@ -608,7 +608,7 @@ impl MemTypeLayout {
                 let usage_fixed_len = usage
                     .max_size
                     .map(|size| {
-                        if size % usage_stride.get() != 0 {
+                        if !size.is_multiple_of(usage_stride.get()) {
                             // FIXME(eddyb) maybe this should be propagated up,
                             // as a sign that `usage` is malformed?
                             return Err(());
@@ -924,11 +924,11 @@ impl<'a> InferUsage<'a> {
                                 ));
                             }
                         };
-                        if data_inst_def.output_type.is_some_and(is_qptr) {
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
-                            }
+                        if data_inst_def.output_type.is_some_and(is_qptr)
+                            && let Some(usage) = output_usage
+                        {
+                            usage_or_err_attrs_to_attach
+                                .push((Value::DataInstOutput(data_inst), usage));
                         }
                     }
 

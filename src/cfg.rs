@@ -82,7 +82,7 @@ impl ControlFlowGraph {
     pub fn rev_post_order(
         &self,
         func_def_body: &FuncDefBody,
-    ) -> impl DoubleEndedIterator<Item = Region> {
+    ) -> impl DoubleEndedIterator<Item = Region> + use<> {
         let mut post_order = SmallVec::<[_; 8]>::new();
         self.traverse_whole_func(
             func_def_body,
@@ -1871,14 +1871,14 @@ impl<'a> Structurizer<'a> {
         // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
         for case in cases {
-            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
-                if !structured_body_inputs.is_empty() {
-                    self.region_input_rewrites.insert(
-                        structured_body,
-                        RegionInputRewrites::ReplaceWith(structured_body_inputs),
-                    );
-                    self.func_def_body.at_mut(structured_body).def().inputs.clear();
-                }
+            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case
+                && !structured_body_inputs.is_empty()
+            {
+                self.region_input_rewrites.insert(
+                    structured_body,
+                    RegionInputRewrites::ReplaceWith(structured_body_inputs),
+                );
+                self.func_def_body.at_mut(structured_body).def().inputs.clear();
             }
         }
 

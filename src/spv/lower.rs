@@ -799,12 +799,12 @@ impl Module {
 
                 Seq::Function
             };
-            if let Some(prev_seq) = seq {
-                if prev_seq > next_seq {
-                    return Err(invalid(&format!(
-                        "out of order: {next_seq:?} instructions must precede {prev_seq:?} instructions"
-                    )));
-                }
+            if let Some(prev_seq) = seq
+                && prev_seq > next_seq
+            {
+                return Err(invalid(&format!(
+                    "out of order: {next_seq:?} instructions must precede {prev_seq:?} instructions"
+                )));
             }
             seq = Some(next_seq);
 
@@ -978,26 +978,26 @@ impl Module {
                         local_id_defs.insert(id, local_id_def);
                     }
 
-                    if let Some(def_map) = &mut cfgssa_def_map {
-                        if let DeclDef::Present(func_def_body) = &func_decl.def {
-                            let current_block = match block_details.last() {
-                                Some((&current_block, _)) => current_block,
-                                // HACK(eddyb) ensure e.g. `OpFunctionParameter`
-                                // are treated like `OpPhi`s of the entry block.
-                                None => func_def_body.body,
-                            };
+                    if let Some(def_map) = &mut cfgssa_def_map
+                        && let DeclDef::Present(func_def_body) = &func_decl.def
+                    {
+                        let current_block = match block_details.last() {
+                            Some((&current_block, _)) => current_block,
+                            // HACK(eddyb) ensure e.g. `OpFunctionParameter`
+                            // are treated like `OpPhi`s of the entry block.
+                            None => func_def_body.body,
+                        };
 
-                            if opcode == wk.OpLabel {
-                                // HACK(eddyb) the entry block was already added.
-                                if current_block != func_def_body.body {
-                                    def_map.add_block(current_block);
-                                }
-                                continue;
+                        if opcode == wk.OpLabel {
+                            // HACK(eddyb) the entry block was already added.
+                            if current_block != func_def_body.body {
+                                def_map.add_block(current_block);
                             }
+                            continue;
+                        }
 
-                            if let Some(id) = result_id {
-                                def_map.add_def(current_block, id, result_type.unwrap());
-                            }
+                        if let Some(id) = result_id {
+                            def_map.add_def(current_block, id, result_type.unwrap());
                         }
                     }
                 }
@@ -1643,14 +1643,12 @@ impl Module {
             }
 
             // Sanity-check the entry block.
-            if let Some(func_def_body) = func_def_body {
-                if block_details[&func_def_body.body].phi_count > 0 {
-                    // FIXME(remove) embed IDs in errors by moving them to the
-                    // `let invalid = |...| ...;` closure that wraps insts.
-                    return Err(invalid(&format!(
-                        "in %{func_id}, the entry block contains `OpPhi`s"
-                    )));
-                }
+            if let Some(func_def_body) = func_def_body
+                && block_details[&func_def_body.body].phi_count > 0
+            {
+                // FIXME(remove) embed IDs in errors by moving them to the
+                // `let invalid = |...| ...;` closure that wraps insts.
+                return Err(invalid(&format!("in %{func_id}, the entry block contains `OpPhi`s")));
             }
         }
 

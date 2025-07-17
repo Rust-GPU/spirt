@@ -630,13 +630,13 @@ impl<'a> Visitor<'a> for Plan<'a> {
     }
 
     fn visit_func_decl(&mut self, func_decl: &'a FuncDecl) {
-        if let DeclDef::Present(func_def_body) = &func_decl.def {
-            if let Some(cfg) = &func_def_body.unstructured_cfg {
-                for region in cfg.rev_post_order(func_def_body) {
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        for &target in &control_inst.targets {
-                            *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
-                        }
+        if let DeclDef::Present(func_def_body) = &func_decl.def
+            && let Some(cfg) = &func_def_body.unstructured_cfg
+        {
+            for region in cfg.rev_post_order(func_def_body) {
+                if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
+                    for &target in &control_inst.targets {
+                        *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
                     }
                 }
             }
@@ -1952,7 +1952,7 @@ impl AttrsAndDef {
         let mut maybe_def_end_anchor = pretty::Fragment::default();
         let mut name = name.into();
         if let [
-            pretty::Node::Anchor { is_def: ref mut original_anchor_is_def @ true, anchor, text: _ },
+            pretty::Node::Anchor { is_def: original_anchor_is_def @ true, anchor, text: _ },
             ..,
         ] = &mut name.nodes[..]
         {
@@ -4089,12 +4089,12 @@ impl Print for FuncAt<'_, DataInst> {
                             }
                             ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                                 let (spv_inst, _const_inputs) = &**spv_inst_and_const_inputs;
-                                if spv_inst.opcode == wk.OpConstant {
-                                    if let [spv::Imm::Short(_, x)] = spv_inst.imms[..] {
-                                        // HACK(eddyb) only allow unambiguously positive values.
-                                        if i32::try_from(x).and_then(u32::try_from) == Ok(x) {
-                                            return Some(PseudoImm::U32(x));
-                                        }
+                                if spv_inst.opcode == wk.OpConstant
+                                    && let [spv::Imm::Short(_, x)] = spv_inst.imms[..]
+                                {
+                                    // HACK(eddyb) only allow unambiguously positive values.
+                                    if i32::try_from(x).and_then(u32::try_from) == Ok(x) {
+                                        return Some(PseudoImm::U32(x));
                                     }
                                 }
                             }

@@ -213,11 +213,11 @@ impl InstParser<'_> {
             self.inst.result_id = def.has_result_id.then(&mut id).transpose()?;
         }
 
-        if let Some(type_id) = self.inst.result_type_id {
-            if !self.known_ids.contains_key(&type_id) {
-                // FIXME(eddyb) also check that the ID is a valid type.
-                return Err(Error::UnknownResultTypeId(type_id));
-            }
+        if let Some(type_id) = self.inst.result_type_id
+            && !self.known_ids.contains_key(&type_id)
+        {
+            // FIXME(eddyb) also check that the ID is a valid type.
+            return Err(Error::UnknownResultTypeId(type_id));
         }
 
         for (mode, kind) in def.all_operands() {
@@ -266,7 +266,7 @@ impl ModuleParser {
     pub fn read_from_spv_bytes(spv_bytes: Vec<u8>) -> io::Result<Self> {
         let spv_spec = spec::Spec::get();
 
-        if spv_bytes.len() % 4 != 0 {
+        if !spv_bytes.len().is_multiple_of(4) {
             return Err(invalid("not a multiple of 4 bytes"));
         }
         // May need to mutate the bytes (to normalize endianness) later below.
