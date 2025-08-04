@@ -1,10 +1,8 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lifting (e.g. to SPIR-V).
 
-// HACK(eddyb) sharing layout code with other modules.
-use super::layout::*;
-
 use crate::func_at::FuncAtMut;
-use crate::qptr::{QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes};
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
@@ -17,6 +15,10 @@ use std::cell::Cell;
 use std::mem;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+
+// HACK(eddyb) sharing layout code with other modules.
+// FIXME(eddyb) can this just be a non-glob import?
+use crate::mem::layout::*;
 
 struct LiftError(Diag);
 
@@ -44,7 +46,7 @@ impl<'a> LiftToSpvPtrs<'a> {
     pub fn lift_global_var(&self, global_var_decl: &mut GlobalVarDecl) {
         match self.spv_ptr_type_and_addr_space_for_global_var(global_var_decl) {
             Ok((spv_ptr_type, addr_space)) => {
-                global_var_decl.attrs = self.strip_qptr_usage_attr(global_var_decl.attrs);
+                global_var_decl.attrs = self.strip_mem_accesses_attr(global_var_decl.attrs);
                 global_var_decl.type_of_ptr_to = spv_ptr_type;
                 global_var_decl.addr_space = addr_space;
                 global_var_decl.shape = None;
@@ -67,29 +69,29 @@ impl<'a> LiftToSpvPtrs<'a> {
                 deferred_ptr_noops: Default::default(),
                 data_inst_use_counts: Default::default(),
 
-                func_has_qptr_analysis_bug_diags: false,
+                func_has_mem_analysis_bug_diags: false,
             }
             .in_place_transform_func_decl(&mut module.funcs[func]);
         }
     }
 
-    fn find_qptr_usage_attr(&self, attrs: AttrSet) -> Result<&QPtrUsage, LiftError> {
+    fn find_mem_accesses_attr(&self, attrs: AttrSet) -> Result<&MemAccesses, LiftError> {
         self.cx[attrs]
             .attrs
             .iter()
             .find_map(|attr| match attr {
-                Attr::QPtr(QPtrAttr::Usage(usage)) => Some(&usage.0),
+                Attr::Mem(MemAttr::Accesses(accesses)) => Some(&accesses.0),
                 _ => None,
             })
-            .ok_or_else(|| LiftError(Diag::bug(["missing `qptr.usage` attribute".into()])))
+            .ok_or_else(|| LiftError(Diag::bug(["missing `mem.accesses` attribute".into()])))
     }
 
-    fn strip_qptr_usage_attr(&self, attrs: AttrSet) -> AttrSet {
+    fn strip_mem_accesses_attr(&self, attrs: AttrSet) -> AttrSet {
         self.cx.intern(AttrSetDef {
             attrs: self.cx[attrs]
                 .attrs
                 .iter()
-                .filter(|attr| !matches!(attr, Attr::QPtr(QPtrAttr::Usage(_))))
+                .filter(|attr| !matches!(attr, Attr::Mem(MemAttr::Accesses(_))))
                 .cloned()
                 .collect(),
         })
@@ -101,7 +103,7 @@ impl<'a> LiftToSpvPtrs<'a> {
     ) -> Result<(Type, AddrSpace), LiftError> {
         let wk = self.wk;
 
-        let qptr_usage = self.find_qptr_usage_attr(global_var_decl.attrs)?;
+        let mem_accesses = self.find_mem_accesses_attr(global_var_decl.attrs)?;
 
         let shape =
             global_var_decl.shape.ok_or_else(|| LiftError(Diag::bug(["missing shape".into()])))?;
@@ -109,17 +111,18 @@ impl<'a> LiftToSpvPtrs<'a> {
             (AddrSpace::Handles, shapes::GlobalVarShape::Handles { handle, fixed_count }) => {
                 let (storage_class, handle_type) = match handle {
                     shapes::Handle::Opaque(ty) => {
-                        if self.pointee_type_for_usage(qptr_usage)? != ty {
+                        if self.pointee_type_for_accesses(mem_accesses)? != ty {
                             return Err(LiftError(Diag::bug([
-                                "mismatched opaque handle types in `qptr.usage` vs `shape`".into(),
+                                "mismatched opaque handle types in `mem.accesses` vs `shape`"
+                                    .into(),
                             ])));
                         }
                         (wk.UniformConstant, ty)
                     }
-                    // FIXME(eddyb) validate usage against `buf` and/or expand
+                    // FIXME(eddyb) validate accesses against `buf` and/or expand
                     // the type to make sure it has the right size.
                     shapes::Handle::Buffer(AddrSpace::SpvStorageClass(storage_class), _buf) => {
-                        (storage_class, self.pointee_type_for_usage(qptr_usage)?)
+                        (storage_class, self.pointee_type_for_accesses(mem_accesses)?)
                     }
                     shapes::Handle::Buffer(AddrSpace::Handles, _) => {
                         return Err(LiftError(Diag::bug([
@@ -136,12 +139,12 @@ impl<'a> LiftToSpvPtrs<'a> {
                     },
                 )
             }
-            // FIXME(eddyb) validate usage against `layout` and/or expand
+            // FIXME(eddyb) validate accesses against `layout` and/or expand
             // the type to make sure it has the right size.
             (
                 AddrSpace::SpvStorageClass(storage_class),
                 shapes::GlobalVarShape::UntypedData(_layout),
-            ) => (storage_class, self.pointee_type_for_usage(qptr_usage)?),
+            ) => (storage_class, self.pointee_type_for_accesses(mem_accesses)?),
             (
                 AddrSpace::SpvStorageClass(storage_class),
                 shapes::GlobalVarShape::TypedInterface(ty),
@@ -197,57 +200,55 @@ impl<'a> LiftToSpvPtrs<'a> {
         })
     }
 
-    fn pointee_type_for_usage(&self, usage: &QPtrUsage) -> Result<Type, LiftError> {
+    fn pointee_type_for_accesses(&self, accesses: &MemAccesses) -> Result<Type, LiftError> {
         let wk = self.wk;
 
-        match usage {
-            &QPtrUsage::Handles(shapes::Handle::Opaque(ty)) => Ok(ty),
-            QPtrUsage::Handles(shapes::Handle::Buffer(_, data_usage)) => {
+        match accesses {
+            &MemAccesses::Handles(shapes::Handle::Opaque(ty)) => Ok(ty),
+            MemAccesses::Handles(shapes::Handle::Buffer(_, data_happ)) => {
                 let attr_spv_decorate_block = Attr::SpvAnnotation(spv::Inst {
                     opcode: wk.OpDecorate,
                     imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
                 });
-                match &data_usage.kind {
-                    QPtrMemUsageKind::Unused => {
-                        self.spv_op_type_struct([], [attr_spv_decorate_block])
-                    }
-                    QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
-                        fields.iter().map(|(&field_offset, field_usage)| {
-                            Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
+                match &data_happ.kind {
+                    DataHappKind::Dead => self.spv_op_type_struct([], [attr_spv_decorate_block]),
+                    DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
+                        fields.iter().map(|(&field_offset, field_happ)| {
+                            Ok((field_offset, self.pointee_type_for_data_happ(field_happ)?))
                         }),
                         [attr_spv_decorate_block],
                     ),
-                    QPtrMemUsageKind::StrictlyTyped(_)
-                    | QPtrMemUsageKind::DirectAccess(_)
-                    | QPtrMemUsageKind::DynOffsetBase { .. } => self.spv_op_type_struct(
-                        [Ok((0, self.pointee_type_for_mem_usage(data_usage)?))],
+                    DataHappKind::StrictlyTyped(_)
+                    | DataHappKind::Direct(_)
+                    | DataHappKind::Repeated { .. } => self.spv_op_type_struct(
+                        [Ok((0, self.pointee_type_for_data_happ(data_happ)?))],
                         [attr_spv_decorate_block],
                     ),
                 }
             }
-            QPtrUsage::Memory(usage) => self.pointee_type_for_mem_usage(usage),
+            MemAccesses::Data(happ) => self.pointee_type_for_data_happ(happ),
         }
     }
 
-    fn pointee_type_for_mem_usage(&self, usage: &QPtrMemUsage) -> Result<Type, LiftError> {
-        match &usage.kind {
-            QPtrMemUsageKind::Unused => self.spv_op_type_struct([], []),
-            &QPtrMemUsageKind::StrictlyTyped(ty) | &QPtrMemUsageKind::DirectAccess(ty) => Ok(ty),
-            QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
-                fields.iter().map(|(&field_offset, field_usage)| {
-                    Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
+    fn pointee_type_for_data_happ(&self, happ: &DataHapp) -> Result<Type, LiftError> {
+        match &happ.kind {
+            DataHappKind::Dead => self.spv_op_type_struct([], []),
+            &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => Ok(ty),
+            DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
+                fields.iter().map(|(&field_offset, field_happ)| {
+                    Ok((field_offset, self.pointee_type_for_data_happ(field_happ)?))
                 }),
                 [],
             ),
-            QPtrMemUsageKind::DynOffsetBase { element, stride } => {
-                let element_type = self.pointee_type_for_mem_usage(element)?;
+            DataHappKind::Repeated { element, stride } => {
+                let element_type = self.pointee_type_for_data_happ(element)?;
 
-                let fixed_len = usage
+                let fixed_len = happ
                     .max_size
                     .map(|size| {
                         if !size.is_multiple_of(stride.get()) {
                             return Err(LiftError(Diag::bug([format!(
-                                "DynOffsetBase: size ({size}) not a multiple of stride ({stride})"
+                                "Repeated: size ({size}) not a multiple of stride ({stride})"
                             )
                             .into()])));
                         }
@@ -397,8 +398,8 @@ struct LiftToSpvPtrInstsInFunc<'a> {
     // FIXME(eddyb) consider removing this and just do a full second traversal.
     data_inst_use_counts: EntityOrientedDenseMap<DataInst, NonZeroU32>,
 
-    // HACK(eddyb) this is used to avoid noise when `qptr::analyze` failed.
-    func_has_qptr_analysis_bug_diags: bool,
+    // HACK(eddyb) this is used to avoid noise when `mem::analyze` failed.
+    func_has_mem_analysis_bug_diags: bool,
 }
 
 struct DeferredPtrNoop {
@@ -458,13 +459,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
 
-            DataInstKind::QPtr(QPtrOp::FuncLocalVar(_mem_layout)) => {
-                let qptr_usage = self.lifter.find_qptr_usage_attr(data_inst_def.attrs)?;
+            DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
+                let mem_accesses = self.lifter.find_mem_accesses_attr(data_inst_def.attrs)?;
 
                 // FIXME(eddyb) validate against `mem_layout`!
-                let pointee_type = self.lifter.pointee_type_for_usage(qptr_usage)?;
+                let pointee_type = self.lifter.pointee_type_for_accesses(mem_accesses)?;
                 DataInstDef {
-                    attrs: self.lifter.strip_qptr_usage_attr(data_inst_def.attrs),
+                    attrs: self.lifter.strip_mem_accesses_attr(data_inst_def.attrs),
                     kind: DataInstKind::SpvInst(spv::Inst {
                         opcode: wk.OpVariable,
                         imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
@@ -751,10 +752,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     output_type: Some(self.lifter.spv_ptr_type(addr_space, layout.original_type)),
                 }
             }
-            DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
+            DataInstKind::Mem(op @ (MemOp::Load | MemOp::Store)) => {
+                // HACK(eddyb) `_` will match multiple variants soon.
+                #[allow(clippy::match_wildcard_for_single_variants)]
                 let (spv_opcode, access_type) = match op {
-                    QPtrOp::Load => (wk.OpLoad, data_inst_def.output_type.unwrap()),
-                    QPtrOp::Store => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
+                    MemOp::Load => (wk.OpLoad, data_inst_def.output_type.unwrap()),
+                    MemOp::Store => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
                     _ => unreachable!(),
                 };
 
@@ -1116,16 +1119,15 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                     Err(LiftError(e)) => {
                         let data_inst_def = func_at_inst.def();
 
-                        // HACK(eddyb) do not add redundant errors to `qptr::analyze` bugs.
-                        self.func_has_qptr_analysis_bug_diags = self
-                            .func_has_qptr_analysis_bug_diags
+                        // HACK(eddyb) do not add redundant errors to `mem::analyze` bugs.
+                        self.func_has_mem_analysis_bug_diags = self.func_has_mem_analysis_bug_diags
                             || self.lifter.cx[data_inst_def.attrs].attrs.iter().any(|attr| {
                                 match attr {
                                     Attr::Diagnostics(diags) => {
                                         diags.0.iter().any(|diag| match diag.level {
                                             DiagLevel::Bug(loc) => {
-                                                loc.file().ends_with("qptr/analyze.rs")
-                                                    || loc.file().ends_with("qptr\\analyze.rs")
+                                                loc.file().ends_with("mem/analyze.rs")
+                                                    || loc.file().ends_with("mem\\analyze.rs")
                                             }
                                             _ => false,
                                         })
@@ -1134,7 +1136,7 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                                 }
                             });
 
-                        if !self.func_has_qptr_analysis_bug_diags {
+                        if !self.func_has_mem_analysis_bug_diags {
                             data_inst_def.attrs.push_diag(&self.lifter.cx, e);
                         }
                     }

@@ -1,10 +1,8 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lowering (e.g. from SPIR-V).
 
-// HACK(eddyb) layout code used to be in this module.
-use super::layout::*;
-
 use crate::func_at::FuncAtMut;
-use crate::qptr::{QPtrAttr, QPtrOp, shapes};
+use crate::mem::{MemOp, shapes};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
@@ -15,6 +13,9 @@ use smallvec::SmallVec;
 use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+
+// HACK(eddyb) sharing layout code with other modules.
+use crate::mem::layout::*;
 
 struct LowerError(Diag);
 
@@ -412,7 +413,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             match self.lowerer.layout_of(var_data_type)? {
                 TypeLayout::Concrete(concrete) if concrete.mem_layout.dyn_unit_stride.is_none() => {
                     (
-                        QPtrOp::FuncLocalVar(concrete.mem_layout.fixed_base).into(),
+                        MemOp::FuncLocalVar(concrete.mem_layout.fixed_base).into(),
                         data_inst_def.inputs.clone(),
                     )
                 }
@@ -424,14 +425,14 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
             assert_eq!(data_inst_def.inputs.len(), 1);
-            (QPtrOp::Load.into(), data_inst_def.inputs.clone())
+            (MemOp::Load.into(), data_inst_def.inputs.clone())
         } else if spv_inst.opcode == wk.OpStore {
             // FIXME(eddyb) support memory operands somehow.
             if !spv_inst.imms.is_empty() {
                 return Ok(Transformed::Unchanged);
             }
             assert_eq!(data_inst_def.inputs.len(), 2);
-            (QPtrOp::Store.into(), data_inst_def.inputs.clone())
+            (MemOp::Store.into(), data_inst_def.inputs.clone())
         } else if spv_inst.opcode == wk.OpArrayLength {
             let field_idx = match spv_inst.imms[..] {
                 [spv::Imm::Short(_, field_idx)] => field_idx,
@@ -606,7 +607,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         match data_inst_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
-            DataInstKind::FuncCall(_) | DataInstKind::QPtr(_) => return,
+            DataInstKind::FuncCall(_) | DataInstKind::Mem(_) | DataInstKind::QPtr(_) => return,
 
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
         }
