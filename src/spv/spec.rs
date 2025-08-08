@@ -683,10 +683,7 @@ impl Spec {
                             .unwrap();
                     }
 
-                    Enumerant {
-                        req_params,
-                        rest_params,
-                    }
+                    Enumerant { req_params, rest_params }
                 };
 
                 let def = match o.category {
@@ -732,7 +729,8 @@ impl Spec {
                                     // Only allow aliases that do not meaningfully differ.
                                     assert!(
                                         prev_enumerant == new_enumerant,
-                                        "{} bits {} and {} share a bit index but differ in definition",
+                                        "{} bits {} and {} share a bit index \
+                                         but differ in definition",
                                         o.kind,
                                         prev_name,
                                         new_name,
@@ -757,10 +755,7 @@ impl Spec {
                             storage: bits,
                         };
 
-                        OperandKindDef::BitEnum {
-                            empty_name: empty_name.unwrap_or("None"),
-                            bits,
-                        }
+                        OperandKindDef::BitEnum { empty_name: empty_name.unwrap_or("None"), bits }
                     }
                     raw::OperandKindCategory::ValueEnum => {
                         assert!(o.bases.is_none());
@@ -768,10 +763,7 @@ impl Spec {
                         let enumerants = o.enumerants.as_ref().unwrap();
                         let variants = indexed::KhrSegmentedVec::from_in_order_iter(
                             enumerants.iter().map(|e| {
-                                (
-                                    e.value.try_into().unwrap(),
-                                    (e.enumerant, enumerant_from_raw(e)),
-                                )
+                                (e.value.try_into().unwrap(), (e.enumerant, enumerant_from_raw(e)))
                             }),
                             // `merge_duplicates` closure:
                             |(prev_name, prev_enumerant), (new_name, new_enumerant)| {
@@ -784,10 +776,7 @@ impl Spec {
                                     new_name,
                                 );
 
-                                (
-                                    preferred_name_between_dups(prev_name, new_name),
-                                    new_enumerant,
-                                )
+                                (preferred_name_between_dups(prev_name, new_name), new_enumerant)
                             },
                         );
 

@@ -475,7 +475,8 @@ impl<'a> LayoutCache<'a> {
                             }
                             Ordering::Greater => {
                                 return Err(LayoutError(Diag::bug([
-                                    "structs with explicit offsets must provide them for all fields"
+                                    "structs with explicit offsets \
+                                     must provide them for all fields"
                                         .into(),
                                 ])));
                             }

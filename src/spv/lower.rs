@@ -1675,20 +1675,14 @@ impl Module {
                     Ok((ExportKey::LinkName(name), exportee))
                 }
 
-                Export::EntryPoint {
-                    func_id,
-                    imms,
-                    interface_ids,
-                } => {
+                Export::EntryPoint { func_id, imms, interface_ids } => {
                     let func = match id_defs.get(&func_id) {
                         Some(&IdDef::Func(func)) => Ok(func),
                         Some(id_def) => Err(id_def.descr(&cx)),
                         None => Err(format!("unknown ID %{func_id}")),
                     }
                     .map_err(|descr| {
-                        invalid(&format!(
-                            "unsupported use of {descr} as the `OpEntryPoint` target"
-                        ))
+                        invalid(&format!("unsupported use of {descr} as the `OpEntryPoint` target"))
                     })?;
                     let interface_global_vars = interface_ids
                         .into_iter()
@@ -1703,16 +1697,14 @@ impl Module {
                         .map(|result| {
                             result.map_err(|descr| {
                                 invalid(&format!(
-                                    "unsupported use of {descr} as an `OpEntryPoint` interface variable"
+                                    "unsupported use of {descr} as an \
+                                     `OpEntryPoint` interface variable"
                                 ))
                             })
                         })
                         .collect::<Result<_, _>>()?;
                     Ok((
-                        ExportKey::SpvEntryPoint {
-                            imms,
-                            interface_global_vars,
-                        },
+                        ExportKey::SpvEntryPoint { imms, interface_global_vars },
                         Exportee::Func(func),
                     ))
                 }
