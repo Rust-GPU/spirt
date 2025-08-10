@@ -603,9 +603,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                 // FIXME(eddyb) this could include the chosen indices,
                                 // and maybe the current type and/or layout.
                                 return Err(LiftError(Diag::bug([format!(
-                                    "offset {offset} not found in type layout, after {} access chain indices",
+                                    "offset {offset} not found in type layout, \
+                                     after {} access chain indices",
                                     access_chain_inputs.len() - 1
-                                ).into()])));
+                                )
+                                .into()])));
                             }
                             (Some(idx), Some(_)) => {
                                 // FIXME(eddyb) !!! this can also be illegal overlap

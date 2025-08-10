@@ -379,8 +379,11 @@ impl UsageMerger<'_> {
                             MergeResult {
                                 merged: a.kind.clone(),
                                 error: Some(AnalysisError(Diag::bug([
-                                    format!("merge_mem: unimplemented non-intra-element merging into stride={a_stride} (")
-                                        .into(),
+                                    format!(
+                                        "merge_mem: unimplemented \
+                                         non-intra-element merging into stride={a_stride} ("
+                                    )
+                                    .into(),
                                     QPtrUsage::Memory(a).into(),
                                     " vs ".into(),
                                     QPtrUsage::Memory(b).into(),
@@ -1019,12 +1022,16 @@ impl<'a> InferUsage<'a> {
                                         QPtrUsage::Handles(_) => {
                                             return Err(AnalysisError(Diag::bug([format!(
                                                 "Offset({offset}): cannot offset Handles"
-                                            ).into()])));
+                                            )
+                                            .into()])));
                                         }
                                         QPtrUsage::Memory(usage) => usage,
                                     };
                                     let offset = u32::try_from(offset).ok().ok_or_else(|| {
-                                        AnalysisError(Diag::bug([format!("Offset({offset}): negative offset").into()]))
+                                        AnalysisError(Diag::bug([format!(
+                                            "Offset({offset}): negative offset"
+                                        )
+                                        .into()]))
                                     })?;
 
                                     // FIXME(eddyb) these should be normalized
@@ -1037,9 +1044,16 @@ impl<'a> InferUsage<'a> {
                                     Ok(QPtrUsage::Memory(QPtrMemUsage {
                                         max_size: usage
                                             .max_size
-                                            .map(|max_size| offset.checked_add(max_size).ok_or_else(|| {
-                                                AnalysisError(Diag::bug([format!("Offset({offset}): size overflow ({offset}+{max_size})").into()]))
-                                            })).transpose()?,
+                                            .map(|max_size| {
+                                                offset.checked_add(max_size).ok_or_else(|| {
+                                                    AnalysisError(Diag::bug([format!(
+                                                        "Offset({offset}): size overflow \
+                                                         ({offset}+{max_size})"
+                                                    )
+                                                    .into()]))
+                                                })
+                                            })
+                                            .transpose()?,
                                         // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                         // to represent the one-element case, seems
                                         // quite wasteful when it's likely consumed.
@@ -1059,19 +1073,25 @@ impl<'a> InferUsage<'a> {
                                 .and_then(|usage| {
                                     let usage = match usage {
                                         QPtrUsage::Handles(_) => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: cannot offset Handles".into()])));
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: cannot offset Handles".into(),
+                                            ])));
                                         }
                                         QPtrUsage::Memory(usage) => usage,
                                     };
                                     match usage.max_size {
                                         None => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: unsized element".into()])));
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: unsized element".into(),
+                                            ])));
                                         }
                                         // FIXME(eddyb) support this by "folding"
                                         // the usage onto itself (i.e. applying
                                         // `%= stride` on all offsets inside).
                                         Some(max_size) if max_size > stride.get() => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: element max_size exceeds stride".into()])));
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: element max_size exceeds stride".into(),
+                                            ])));
                                         }
                                         Some(_) => {}
                                     }
@@ -1082,19 +1102,22 @@ impl<'a> InferUsage<'a> {
                                             .as_ref()
                                             .map(|index_bounds| {
                                                 if index_bounds.start < 0 || index_bounds.end < 0 {
-                                                    return Err(AnalysisError(
-                                                        Diag::bug([
-                                                            "DynOffset: potentially negative offset"
-                                                                .into(),
-                                                        ])
-                                                    ));
+                                                    return Err(AnalysisError(Diag::bug([
+                                                        "DynOffset: potentially negative offset"
+                                                            .into(),
+                                                    ])));
                                                 }
-                                                let index_bounds_end = u32::try_from(index_bounds.end).unwrap();
-                                                index_bounds_end.checked_mul(stride.get()).ok_or_else(|| {
-                                                     AnalysisError(Diag::bug([
-                                                        format!("DynOffset: size overflow ({index_bounds_end}*{stride})").into(),
-                                                    ]))
-                                                })
+                                                let index_bounds_end =
+                                                    u32::try_from(index_bounds.end).unwrap();
+                                                index_bounds_end
+                                                    .checked_mul(stride.get())
+                                                    .ok_or_else(|| {
+                                                        AnalysisError(Diag::bug([format!(
+                                                            "DynOffset: size overflow \
+                                                             ({index_bounds_end}*{stride})"
+                                                        )
+                                                        .into()]))
+                                                    })
                                             })
                                             .transpose()?,
                                         kind: QPtrMemUsageKind::DynOffsetBase {
@@ -1165,50 +1188,65 @@ impl<'a> InferUsage<'a> {
                                         self.layout_cache
                                             .layout_of(ty)
                                             .map_err(|LayoutError(e)| AnalysisError(e))
-                                            .and_then(|layout| match layout {
-                                                TypeLayout::Handle(handle) => {
-                                                    let handle = match handle {
-                                                        shapes::Handle::Opaque(ty) => {
-                                                            shapes::Handle::Opaque(ty)
-                                                        }
-                                                        // NOTE(eddyb) this error is important,
-                                                        // as the `Block` annotation on the
-                                                        // buffer type means the type is *not*
-                                                        // usable anywhere inside buffer data,
-                                                        // since it would conflict with our
-                                                        // own `Block`-annotated wrapper.
-                                                        shapes::Handle::Buffer(..) => {
-                                                            return Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole Buffer ambiguous (handle vs buffer data)".into()])
-                                                            ));
-                                                        }
-                                                    };
-                                                    Ok(QPtrUsage::Handles(handle))
-                                                }
-                                                // NOTE(eddyb) because we can't represent
-                                                // the original type, in the same way we
-                                                // use `QPtrMemUsageKind::StrictlyTyped`
-                                                // for non-handles, we can't guarantee
-                                                // a generated type that matches the
-                                                // desired `pointee` type.
-                                                TypeLayout::HandleArray(..) => {
-                                                    Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole handle array unrepresentable".into()])
-                                                    ))
-                                                }
-                                                TypeLayout::Concrete(concrete) => {
-                                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                                        max_size: if concrete
-                                                            .mem_layout
-                                                            .dyn_unit_stride
-                                                            .is_some()
-                                                        {
-                                                            None
-                                                        } else {
-                                                            Some(
-                                                                concrete.mem_layout.fixed_base.size,
-                                                            )
-                                                        },
-                                                        kind: QPtrMemUsageKind::StrictlyTyped(ty),
-                                                    }))
+                                            .and_then(|layout| {
+                                                match layout {
+                                                    TypeLayout::Handle(handle) => {
+                                                        let handle = match handle {
+                                                            shapes::Handle::Opaque(ty) => {
+                                                                shapes::Handle::Opaque(ty)
+                                                            }
+                                                            // NOTE(eddyb) this error is important,
+                                                            // as the `Block` annotation on the
+                                                            // buffer type means the type is *not*
+                                                            // usable anywhere inside buffer data,
+                                                            // since it would conflict with our
+                                                            // own `Block`-annotated wrapper.
+                                                            shapes::Handle::Buffer(..) => {
+                                                                return Err(AnalysisError(
+                                                                    Diag::bug(["ToSpvPtrInput: \
+                                                                        whole Buffer ambiguous \
+                                                                        (handle vs buffer data)"
+                                                                        .into()]),
+                                                                ));
+                                                            }
+                                                        };
+                                                        Ok(QPtrUsage::Handles(handle))
+                                                    }
+                                                    // NOTE(eddyb) because we can't represent
+                                                    // the original type, in the same way we
+                                                    // use `QPtrMemUsageKind::StrictlyTyped`
+                                                    // for non-handles, we can't guarantee
+                                                    // a generated type that matches the
+                                                    // desired `pointee` type.
+                                                    TypeLayout::HandleArray(..) => {
+                                                        Err(AnalysisError(Diag::bug([
+                                                            "ToSpvPtrInput: \
+                                                             whole handle array \
+                                                             unrepresentable"
+                                                                .into(),
+                                                        ])))
+                                                    }
+                                                    TypeLayout::Concrete(concrete) => {
+                                                        Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                                            max_size: if concrete
+                                                                .mem_layout
+                                                                .dyn_unit_stride
+                                                                .is_some()
+                                                            {
+                                                                None
+                                                            } else {
+                                                                Some(
+                                                                    concrete
+                                                                        .mem_layout
+                                                                        .fixed_base
+                                                                        .size,
+                                                                )
+                                                            },
+                                                            kind: QPtrMemUsageKind::StrictlyTyped(
+                                                                ty,
+                                                            ),
+                                                        }))
+                                                    }
                                                 }
                                             }),
                                     );
