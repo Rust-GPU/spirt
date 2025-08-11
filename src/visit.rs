@@ -1,7 +1,8 @@
 //! Immutable IR traversal.
 
 use crate::func_at::FuncAt;
-use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
@@ -245,13 +246,15 @@ impl InnerVisit for Attr {
                 }
             }
 
+            Attr::Mem(attr) => match attr {
+                MemAttr::Accesses(accesses) => accesses.0.inner_visit_with(visitor),
+            },
+
             Attr::QPtr(attr) => match attr {
                 QPtrAttr::ToSpvPtrInput { input_idx: _, pointee }
                 | QPtrAttr::FromSpvPtrOutput { addr_space: _, pointee } => {
                     visitor.visit_type_use(pointee.0);
                 }
-
-                QPtrAttr::Usage(usage) => usage.0.inner_visit_with(visitor),
             },
         }
     }
@@ -267,46 +270,46 @@ impl InnerVisit for Vec<DiagMsgPart> {
                 &DiagMsgPart::Attrs(attrs) => visitor.visit_attr_set_use(attrs),
                 &DiagMsgPart::Type(ty) => visitor.visit_type_use(ty),
                 &DiagMsgPart::Const(ct) => visitor.visit_const_use(ct),
-                DiagMsgPart::QPtrUsage(usage) => usage.inner_visit_with(visitor),
+                DiagMsgPart::MemAccesses(accesses) => accesses.inner_visit_with(visitor),
             }
         }
     }
 }
 
-impl InnerVisit for QPtrUsage {
+impl InnerVisit for MemAccesses {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            &QPtrUsage::Handles(qptr::shapes::Handle::Opaque(ty)) => {
+            &MemAccesses::Handles(crate::mem::shapes::Handle::Opaque(ty)) => {
                 visitor.visit_type_use(ty);
             }
-            QPtrUsage::Handles(qptr::shapes::Handle::Buffer(_, data_usage)) => {
-                data_usage.inner_visit_with(visitor);
+            MemAccesses::Handles(crate::mem::shapes::Handle::Buffer(_, data_happ)) => {
+                data_happ.inner_visit_with(visitor);
             }
-            QPtrUsage::Memory(usage) => usage.inner_visit_with(visitor),
+            MemAccesses::Data(happ) => happ.inner_visit_with(visitor),
         }
     }
 }
 
-impl InnerVisit for QPtrMemUsage {
+impl InnerVisit for DataHapp {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         let Self { max_size: _, kind } = self;
         kind.inner_visit_with(visitor);
     }
 }
 
-impl InnerVisit for QPtrMemUsageKind {
+impl InnerVisit for DataHappKind {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            Self::Unused => {}
-            &Self::StrictlyTyped(ty) | &Self::DirectAccess(ty) => {
+            Self::Dead => {}
+            &Self::StrictlyTyped(ty) | &Self::Direct(ty) => {
                 visitor.visit_type_use(ty);
             }
-            Self::OffsetBase(entries) => {
-                for sub_usage in entries.values() {
-                    sub_usage.inner_visit_with(visitor);
+            Self::Disjoint(entries) => {
+                for sub_happ in entries.values() {
+                    sub_happ.inner_visit_with(visitor);
                 }
             }
-            Self::DynOffsetBase { element, stride: _ } => {
+            Self::Repeated { element, stride: _ } => {
                 element.inner_visit_with(visitor);
             }
         }
@@ -369,9 +372,11 @@ impl InnerVisit for GlobalVarDecl {
         visitor.visit_type_use(*type_of_ptr_to);
         if let Some(shape) = shape {
             match shape {
-                qptr::shapes::GlobalVarShape::TypedInterface(ty) => visitor.visit_type_use(*ty),
-                qptr::shapes::GlobalVarShape::Handles { .. }
-                | qptr::shapes::GlobalVarShape::UntypedData(_) => {}
+                crate::mem::shapes::GlobalVarShape::TypedInterface(ty) => {
+                    visitor.visit_type_use(*ty);
+                }
+                crate::mem::shapes::GlobalVarShape::Handles { .. }
+                | crate::mem::shapes::GlobalVarShape::UntypedData(_) => {}
             }
         }
         match addr_space {
@@ -534,15 +539,15 @@ impl InnerVisit for DataInstKind {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
             &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
+            DataInstKind::Mem(op) => match *op {
+                MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store => {}
+            },
             DataInstKind::QPtr(op) => match *op {
-                QPtrOp::FuncLocalVar(_)
-                | QPtrOp::HandleArrayIndex
+                QPtrOp::HandleArrayIndex
                 | QPtrOp::BufferData
                 | QPtrOp::BufferDynLen { .. }
                 | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. }
-                | QPtrOp::Load
-                | QPtrOp::Store => {}
+                | QPtrOp::DynOffset { .. } => {}
             },
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
         }

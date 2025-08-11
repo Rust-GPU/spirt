@@ -198,6 +198,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_attr(&mut self, attr: &Attr) {
         match *attr {
             Attr::Diagnostics(_)
+            | Attr::Mem(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
@@ -211,6 +212,12 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
         #[allow(clippy::match_same_arms)]
         match data_inst_def.kind {
+            // FIXME(eddyb) this should be a proper `Result`-based error instead,
+            // and/or `spv::lift` should mutate the module for legalization.
+            DataInstKind::Mem(_) => {
+                unreachable!("`DataInstKind::Mem` should be legalized away before lifting");
+            }
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::QPtr(_) => {
@@ -1225,7 +1232,7 @@ impl LazyInst<'_, '_> {
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
                     // Disallowed while visiting.
-                    DataInstKind::QPtr(_) => unreachable!(),
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
 
                     &DataInstKind::FuncCall(callee) => {
                         (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
@@ -1504,6 +1511,7 @@ impl Module {
                 match attr {
                     Attr::DbgSrcLoc(_)
                     | Attr::Diagnostics(_)
+                    | Attr::Mem(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
                     Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {

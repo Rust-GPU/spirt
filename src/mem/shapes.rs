@@ -1,6 +1,7 @@
 //! Variable shapes (untyped memory layouts vs abstract resources).
 //
 // FIXME(eddyb) does this need its own module still?
+// TODO(eddyb) strongly consider moving these to `mem/mod.rs`.
 
 use crate::{AddrSpace, Type};
 use std::num::NonZeroU32;
@@ -22,6 +23,7 @@ pub enum GlobalVarShape {
     },
 
     // FIXME(eddyb) unify terminology around "concrete"/"memory"/"untyped (data)".
+    // TODO(eddyb) strongly consider renaming this to just `Data`.
     UntypedData(MemLayout),
 
     /// Non-memory pipeline interface, which must keep the exact original type,
@@ -73,7 +75,7 @@ pub enum Handle<BL = MaybeDynMemLayout> {
     // instead of being treated like a buffer?
     //
     // FIXME(eddyb) should this be a `Type` of its own, that can be loaded from
-    // a handle `QPtr`, and then has data pointer / length ops *on that*?
+    // a handle pointer, and then has data pointer / length ops *on that*?
     Buffer(AddrSpace, BL),
 }
 
@@ -83,11 +85,12 @@ pub enum Handle<BL = MaybeDynMemLayout> {
 /// and are both kept track of to detect ambiguity in implicit layouts, e.g.
 /// field offsets when the `Offset` decoration isn't being used.
 /// Note, however, that `legacy_align` can be raised to "extended" alignment,
-/// or completeley ignored, using [`LayoutConfig`](crate::qptr::LayoutConfig).
+/// or completeley ignored, using [`LayoutConfig`](crate::mem::LayoutConfig).
 ///
 /// Only `align` is *required*, that is `size % align == 0` must be always enforced.
 //
 // FIXME(eddyb) consider supporting specialization-constant-length arrays.
+// TODO(eddyb) strongly consider renaming this to `DataLayout`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemLayout {
     // FIXME(eddyb) use proper newtypes (and log2 for align!).
