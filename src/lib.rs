@@ -153,8 +153,7 @@
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
-pub mod cfg;
-pub mod cfgssa;
+pub mod cf;
 mod context;
 pub mod func_at;
 pub mod print;
@@ -717,7 +716,9 @@ pub struct FuncDefBody {
     /// When present, it starts at `body` (more specifically, its exit),
     /// effectively replacing the structured return `body` otherwise implies,
     /// with `body` (or rather, its `children`) always being fully structured.
-    pub unstructured_cfg: Option<cfg::ControlFlowGraph>,
+    //
+    // FIXME(eddyb) replace this with a new `NodeKind` variant.
+    pub unstructured_cfg: Option<cf::unstructured::ControlFlowGraph>,
 }
 
 /// Entity handle for a [`RegionDef`](crate::RegionDef)
@@ -881,7 +882,7 @@ pub enum NodeKind {
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
+    Select { kind: cf::SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
 
     /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
     ///
@@ -910,21 +911,12 @@ pub enum NodeKind {
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
     ExitInvocation {
-        kind: cfg::ExitInvocationKind,
+        kind: cf::ExitInvocationKind,
 
         // FIXME(eddyb) centralize `Value` inputs across `Node`s,
         // and only use stricter types for building/traversing the IR.
         inputs: SmallVec<[Value; 2]>,
     },
-}
-
-#[derive(Clone)]
-pub enum SelectionKind {
-    /// Two-case selection based on boolean condition, i.e. `if`-`else`, with
-    /// the two cases being "then" and "else" (in that order).
-    BoolCond,
-
-    SpvInst(spv::Inst),
 }
 
 /// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).

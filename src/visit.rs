@@ -1,5 +1,6 @@
 //! Immutable IR traversal.
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
@@ -8,8 +9,7 @@ use crate::{
     DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
     ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
-    spv,
+    RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -499,7 +499,7 @@ impl<'a> FuncAt<'a, Node> {
                 visitor.visit_region_def(self.at(*body));
                 visitor.visit_value_use(repeat_condition);
             }
-            NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
+            NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs } => {
                 for v in inputs {
                     visitor.visit_value_use(v);
                 }
@@ -554,17 +554,19 @@ impl InnerVisit for DataInstKind {
     }
 }
 
-impl InnerVisit for cfg::ControlInst {
+impl InnerVisit for cf::unstructured::ControlInst {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            cfg::ControlInstKind::Unreachable
-            | cfg::ControlInstKind::Return
-            | cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
-            | cfg::ControlInstKind::Branch
-            | cfg::ControlInstKind::SelectBranch(
+            cf::unstructured::ControlInstKind::Unreachable
+            | cf::unstructured::ControlInstKind::Return
+            | cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
+                _,
+            ))
+            | cf::unstructured::ControlInstKind::Branch
+            | cf::unstructured::ControlInstKind::SelectBranch(
                 SelectionKind::BoolCond | SelectionKind::SpvInst(_),
             ) => {}
         }

@@ -1,5 +1,6 @@
 //! Mutable IR traversal.
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAtMut;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
@@ -8,8 +9,7 @@ use crate::{
     DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
     ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
-    spv,
+    RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -654,7 +654,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                 transformer.transform_value_use(scrutinee).apply_to(scrutinee);
             }
             NodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
-            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
+            | NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs } => {
                 for v in inputs {
                     transformer.transform_value_use(v).apply_to(v);
                 }
@@ -674,8 +674,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             // Fully handled above, before recursing into any child regions.
             NodeKind::Block { insts: _ }
             | NodeKind::Select { kind: _, scrutinee: _, cases: _ }
-            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs: _ } => {
-            }
+            | NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs: _ } => {}
 
             NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
                 transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
@@ -736,17 +735,19 @@ impl InnerInPlaceTransform for DataInstKind {
     }
 }
 
-impl InnerInPlaceTransform for cfg::ControlInst {
+impl InnerInPlaceTransform for cf::unstructured::ControlInst {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         match kind {
-            cfg::ControlInstKind::Unreachable
-            | cfg::ControlInstKind::Return
-            | cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
-            | cfg::ControlInstKind::Branch
-            | cfg::ControlInstKind::SelectBranch(
+            cf::unstructured::ControlInstKind::Unreachable
+            | cf::unstructured::ControlInstKind::Return
+            | cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
+                _,
+            ))
+            | cf::unstructured::ControlInstKind::Branch
+            | cf::unstructured::ControlInstKind::SelectBranch(
                 SelectionKind::BoolCond | SelectionKind::SpvInst(_),
             ) => {}
         }
