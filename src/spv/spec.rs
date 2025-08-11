@@ -137,6 +137,7 @@ def_well_known! {
         OpConstantTrue,
         OpConstant,
         OpUndef,
+        OpConstantFunctionPointerINTEL,
 
         OpVariable,
 
@@ -183,6 +184,7 @@ def_well_known! {
         LiteralExtInstInteger,
         LiteralString,
         LiteralContextDependentNumber,
+        LiteralSpecConstantOpInteger,
     ],
     // FIXME(eddyb) find a way to namespace these to avoid conflicts.
     addressing_model: u32 = [
@@ -200,6 +202,8 @@ def_well_known! {
         HitAttributeKHR,
         RayPayloadKHR,
         CallableDataKHR,
+
+        CodeSectionINTEL,
     ],
     decoration: u32 = [
         LinkageAttributes,

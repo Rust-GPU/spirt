@@ -1,5 +1,5 @@
 use crate::visit::{InnerVisit, Visitor};
-use crate::{AttrSet, Const, Context, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type, cfg};
+use crate::{AttrSet, Const, Context, DeclDef, Func, FxIndexSet, GlobalVar, Module, Type, cf};
 
 /// Apply the [`cfg::Structurizer`] algorithm to all function definitions in `module`.
 pub fn structurize_func_cfgs(module: &mut Module) {
@@ -22,7 +22,7 @@ pub fn structurize_func_cfgs(module: &mut Module) {
 
     for &func in &collector.seen_funcs {
         if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
-            cfg::Structurizer::new(cx, func_def_body).structurize_func();
+            cf::structurize::Structurizer::new(cx, func_def_body).structurize_func();
         }
     }
 }

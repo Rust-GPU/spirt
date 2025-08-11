@@ -1,13 +1,14 @@
 //! SPIR-V to SPIR-T lowering.
 
+use crate::cf::{self, SelectionKind};
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, print,
+    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind,
+    TypeOrConst, Value, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -24,6 +25,11 @@ enum IdDef {
 
     Func(Func),
 
+    // HACK(eddyb) despite `FuncBody` deferring ID resolution to allow forward
+    // references *between* functions, function pointer *constants* need a `Func`
+    // long before any `OpFunction`s, so they're pre-defined as dummy imports.
+    FuncForwardRef(Func),
+
     SpvExtInstImport(InternedStr),
     SpvDebugString(InternedStr),
 }
@@ -36,7 +42,7 @@ impl IdDef {
             IdDef::Type(_) => "a type".into(),
             IdDef::Const(_) => "a constant".into(),
 
-            IdDef::Func(_) => "a function".into(),
+            IdDef::Func(_) | IdDef::FuncForwardRef(_) => "a function".into(),
 
             IdDef::SpvExtInstImport(name) => {
                 format!("`OpExtInstImport {:?}`", &cx[name])
@@ -112,6 +118,37 @@ impl Module {
 
         // HACK(eddyb) used to quickly check whether an `OpVariable` is global.
         let storage_class_function_imm = spv::Imm::Short(wk.StorageClass, wk.Function);
+
+        // HACK(eddyb) used as the `FuncDecl` for an `IdDef::FuncForwardRef`.
+        let dummy_decl_for_func_forward_ref = FuncDecl {
+            attrs: {
+                let mut attrs = AttrSet::default();
+                attrs.push_diag(
+                    &cx,
+                    Diag::err(["function ID used as forward reference but never defined".into()]),
+                );
+                attrs
+            },
+            // FIXME(eddyb) this gets simpler w/ disaggregation.
+            ret_type: cx.intern(TypeKind::SpvInst {
+                spv_inst: wk.OpTypeVoid.into(),
+                type_and_const_inputs: [].into_iter().collect(),
+            }),
+            params: [].into_iter().collect(),
+            def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
+        };
+        // HACK(eddyb) no `PartialEq` on `FuncDecl`.
+        let assert_is_dummy_decl_for_func_forward_ref = |decl: &FuncDecl| {
+            let [expected, found] = [&dummy_decl_for_func_forward_ref, decl].map(
+                |FuncDecl { attrs, ret_type, params, def }| {
+                    let DeclDef::Imported(import) = def else {
+                        unreachable!();
+                    };
+                    (attrs, ret_type, params, import)
+                },
+            );
+            assert!(expected == found);
+        };
 
         let mut module = {
             let [magic, version, generator_magic, id_bound, reserved_inst_schema] = parser.header;
@@ -583,6 +620,38 @@ impl Module {
                 id_defs.insert(id, IdDef::Type(ty));
 
                 Seq::TypeConstOrGlobalVar
+            } else if opcode == wk.OpConstantFunctionPointerINTEL {
+                use std::collections::hash_map::Entry;
+
+                let id = inst.result_id.unwrap();
+
+                let func_id = inst.ids[0];
+                let func = match id_defs.entry(func_id) {
+                    Entry::Occupied(entry) => match entry.get() {
+                        &IdDef::FuncForwardRef(func) => Ok(func),
+                        id_def => Err(id_def.descr(&cx)),
+                    },
+                    Entry::Vacant(entry) => {
+                        let func =
+                            module.funcs.define(&cx, dummy_decl_for_func_forward_ref.clone());
+                        entry.insert(IdDef::FuncForwardRef(func));
+                        Ok(func)
+                    }
+                }
+                .map_err(|descr| {
+                    invalid(&format!(
+                        "unsupported use of {descr} as the `OpConstantFunctionPointerINTEL` operand"
+                    ))
+                })?;
+
+                let ct = cx.intern(ConstDef {
+                    attrs: mem::take(&mut attrs),
+                    ty: result_type.unwrap(),
+                    kind: ConstKind::PtrToFunc(func),
+                });
+                id_defs.insert(id, IdDef::Const(ct));
+
+                Seq::TypeConstOrGlobalVar
             } else if inst_category == spec::InstructionCategory::Const || opcode == wk.OpUndef {
                 let id = inst.result_id.unwrap();
                 let const_inputs = inst
@@ -750,23 +819,44 @@ impl Module {
                             nodes: Default::default(),
                             data_insts: Default::default(),
                             body,
-                            unstructured_cfg: Some(cfg::ControlFlowGraph::default()),
+                            unstructured_cfg: Some(cf::unstructured::ControlFlowGraph::default()),
                         })
                     }
                 };
+                let decl = FuncDecl {
+                    attrs: mem::take(&mut attrs),
+                    ret_type: func_ret_type,
+                    params: func_type_param_types
+                        .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
+                        .collect(),
+                    def,
+                };
 
-                let func = module.funcs.define(
-                    &cx,
-                    FuncDecl {
-                        attrs: mem::take(&mut attrs),
-                        ret_type: func_ret_type,
-                        params: func_type_param_types
-                            .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
-                            .collect(),
-                        def,
-                    },
-                );
-                id_defs.insert(func_id, IdDef::Func(func));
+                let func = {
+                    use std::collections::hash_map::Entry;
+
+                    match id_defs.entry(func_id) {
+                        Entry::Occupied(mut entry) => match entry.get() {
+                            &IdDef::FuncForwardRef(func) => {
+                                let decl_slot = &mut module.funcs[func];
+                                assert_is_dummy_decl_for_func_forward_ref(decl_slot);
+                                *decl_slot = decl;
+
+                                entry.insert(IdDef::Func(func));
+                                Ok(func)
+                            }
+                            id_def => Err(id_def.descr(&cx)),
+                        },
+                        Entry::Vacant(entry) => {
+                            let func = module.funcs.define(&cx, decl);
+                            entry.insert(IdDef::Func(func));
+                            Ok(func)
+                        }
+                    }
+                    .map_err(|descr| {
+                        invalid(&format!("invalid redefinition of {descr} as a new function"))
+                    })?
+                };
 
                 current_func_body = Some(FuncBody { func_id, func, insts: vec![] });
 
@@ -867,7 +957,7 @@ impl Module {
                 const SPIRT_CFGSSA_UNDOMINATE: bool = true;
 
                 SPIRT_CFGSSA_UNDOMINATE.then(|| {
-                    let mut def_map = crate::cfgssa::DefMap::new();
+                    let mut def_map = cf::cfgssa::DefMap::new();
 
                     // HACK(eddyb) allow e.g. `OpFunctionParameter` to
                     // be treated like `OpPhi`s of the entry block.
@@ -1036,7 +1126,7 @@ impl Module {
             let mut cfgssa_use_accumulator = cfgssa_def_map
                 .as_ref()
                 .filter(|_| func_def_body.is_some())
-                .map(crate::cfgssa::UseAccumulator::new);
+                .map(cf::cfgssa::UseAccumulator::new);
             if let Some(use_acc) = &mut cfgssa_use_accumulator {
                 // HACK(eddyb) ensure e.g. `OpFunctionParameter`
                 // are treated like `OpPhi`s of the entry block.
@@ -1170,7 +1260,7 @@ impl Module {
                             "unsupported use of {} outside `OpExtInst`",
                             id_def.descr(&cx),
                         ))),
-                        None => local_id_defs
+                        None | Some(IdDef::FuncForwardRef(_)) => local_id_defs
                             .get(&id)
                             .copied()
                             .ok_or_else(|| invalid(&format!("undefined ID %{id}",))),
@@ -1380,22 +1470,22 @@ impl Module {
 
                     let kind = if opcode == wk.OpUnreachable {
                         assert!(targets.is_empty() && inputs.is_empty());
-                        cfg::ControlInstKind::Unreachable
+                        cf::unstructured::ControlInstKind::Unreachable
                     } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
                         assert!(targets.is_empty() && inputs.len() <= 1);
-                        cfg::ControlInstKind::Return
+                        cf::unstructured::ControlInstKind::Return
                     } else if targets.is_empty() {
-                        cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(
-                            raw_inst.without_ids.clone(),
-                        ))
+                        cf::unstructured::ControlInstKind::ExitInvocation(
+                            cf::ExitInvocationKind::SpvInst(raw_inst.without_ids.clone()),
+                        )
                     } else if opcode == wk.OpBranch {
                         assert_eq!((targets.len(), inputs.len()), (1, 0));
-                        cfg::ControlInstKind::Branch
+                        cf::unstructured::ControlInstKind::Branch
                     } else if opcode == wk.OpBranchConditional {
                         assert_eq!((targets.len(), inputs.len()), (2, 1));
-                        cfg::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
+                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
                     } else if opcode == wk.OpSwitch {
-                        cfg::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
+                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
                             raw_inst.without_ids.clone(),
                         ))
                     } else {
@@ -1409,7 +1499,13 @@ impl Module {
                         .control_inst_on_exit_from
                         .insert(
                             current_block.region,
-                            cfg::ControlInst { attrs, kind, inputs, targets, target_inputs },
+                            cf::unstructured::ControlInst {
+                                attrs,
+                                kind,
+                                inputs,
+                                targets,
+                                target_inputs,
+                            },
                         );
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {
