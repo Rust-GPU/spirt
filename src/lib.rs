@@ -153,8 +153,7 @@
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
-pub mod cfg;
-pub mod cfgssa;
+pub mod cf;
 mod context;
 pub mod func_at;
 pub mod print;
@@ -169,6 +168,7 @@ pub mod passes {
     pub mod link;
     pub mod qptr;
 }
+pub mod mem;
 pub mod qptr;
 pub mod spv;
 
@@ -397,6 +397,10 @@ pub enum Attr {
     // of `AttrSetDef::{dbg_src_loc,set_dbg_src_loc}`.
     DbgSrcLoc(OrdAssertEq<DbgSrcLoc>),
 
+    /// Memory-specific attributes (see [`mem::MemAttr`]).
+    #[from]
+    Mem(mem::MemAttr),
+
     /// `QPtr`-specific attributes (see [`qptr::QPtrAttr`]).
     #[from]
     QPtr(qptr::QPtrAttr),
@@ -489,7 +493,7 @@ pub enum DiagMsgPart {
     Attrs(AttrSet),
     Type(Type),
     Const(Const),
-    QPtrUsage(qptr::QPtrUsage),
+    MemAccesses(mem::MemAccesses),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])
@@ -638,7 +642,7 @@ pub struct GlobalVarDecl {
 
     /// When `type_of_ptr_to` is `QPtr`, `shape` must be used to describe the
     /// global variable (see `GlobalVarShape`'s documentation for more details).
-    pub shape: Option<qptr::shapes::GlobalVarShape>,
+    pub shape: Option<mem::shapes::GlobalVarShape>,
 
     /// The address space the global variable will be allocated into.
     pub addr_space: AddrSpace,
@@ -712,7 +716,9 @@ pub struct FuncDefBody {
     /// When present, it starts at `body` (more specifically, its exit),
     /// effectively replacing the structured return `body` otherwise implies,
     /// with `body` (or rather, its `children`) always being fully structured.
-    pub unstructured_cfg: Option<cfg::ControlFlowGraph>,
+    //
+    // FIXME(eddyb) replace this with a new `NodeKind` variant.
+    pub unstructured_cfg: Option<cf::unstructured::ControlFlowGraph>,
 }
 
 /// Entity handle for a [`RegionDef`](crate::RegionDef)
@@ -876,7 +882,7 @@ pub enum NodeKind {
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
+    Select { kind: cf::SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
 
     /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
     ///
@@ -905,21 +911,12 @@ pub enum NodeKind {
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
     ExitInvocation {
-        kind: cfg::ExitInvocationKind,
+        kind: cf::ExitInvocationKind,
 
         // FIXME(eddyb) centralize `Value` inputs across `Node`s,
         // and only use stricter types for building/traversing the IR.
         inputs: SmallVec<[Value; 2]>,
     },
-}
-
-#[derive(Clone)]
-pub enum SelectionKind {
-    /// Two-case selection based on boolean condition, i.e. `if`-`else`, with
-    /// the two cases being "then" and "else" (in that order).
-    BoolCond,
-
-    SpvInst(spv::Inst),
 }
 
 /// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
@@ -946,6 +943,10 @@ pub enum DataInstKind {
     // FIXME(eddyb) try to split this into recursive and non-recursive calls,
     // to avoid needing special handling for recursion where it's impossible.
     FuncCall(Func),
+
+    /// Memory-specific operations (see [`mem::MemOp`]).
+    #[from]
+    Mem(mem::MemOp),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]

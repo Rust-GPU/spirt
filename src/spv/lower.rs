@@ -1,13 +1,14 @@
 //! SPIR-V to SPIR-T lowering.
 
+use crate::cf::{self, SelectionKind};
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, print,
+    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind,
+    TypeOrConst, Value, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -750,7 +751,7 @@ impl Module {
                             nodes: Default::default(),
                             data_insts: Default::default(),
                             body,
-                            unstructured_cfg: Some(cfg::ControlFlowGraph::default()),
+                            unstructured_cfg: Some(cf::unstructured::ControlFlowGraph::default()),
                         })
                     }
                 };
@@ -867,7 +868,7 @@ impl Module {
                 const SPIRT_CFGSSA_UNDOMINATE: bool = true;
 
                 SPIRT_CFGSSA_UNDOMINATE.then(|| {
-                    let mut def_map = crate::cfgssa::DefMap::new();
+                    let mut def_map = cf::cfgssa::DefMap::new();
 
                     // HACK(eddyb) allow e.g. `OpFunctionParameter` to
                     // be treated like `OpPhi`s of the entry block.
@@ -1036,7 +1037,7 @@ impl Module {
             let mut cfgssa_use_accumulator = cfgssa_def_map
                 .as_ref()
                 .filter(|_| func_def_body.is_some())
-                .map(crate::cfgssa::UseAccumulator::new);
+                .map(cf::cfgssa::UseAccumulator::new);
             if let Some(use_acc) = &mut cfgssa_use_accumulator {
                 // HACK(eddyb) ensure e.g. `OpFunctionParameter`
                 // are treated like `OpPhi`s of the entry block.
@@ -1380,22 +1381,22 @@ impl Module {
 
                     let kind = if opcode == wk.OpUnreachable {
                         assert!(targets.is_empty() && inputs.is_empty());
-                        cfg::ControlInstKind::Unreachable
+                        cf::unstructured::ControlInstKind::Unreachable
                     } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
                         assert!(targets.is_empty() && inputs.len() <= 1);
-                        cfg::ControlInstKind::Return
+                        cf::unstructured::ControlInstKind::Return
                     } else if targets.is_empty() {
-                        cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(
-                            raw_inst.without_ids.clone(),
-                        ))
+                        cf::unstructured::ControlInstKind::ExitInvocation(
+                            cf::ExitInvocationKind::SpvInst(raw_inst.without_ids.clone()),
+                        )
                     } else if opcode == wk.OpBranch {
                         assert_eq!((targets.len(), inputs.len()), (1, 0));
-                        cfg::ControlInstKind::Branch
+                        cf::unstructured::ControlInstKind::Branch
                     } else if opcode == wk.OpBranchConditional {
                         assert_eq!((targets.len(), inputs.len()), (2, 1));
-                        cfg::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
+                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
                     } else if opcode == wk.OpSwitch {
-                        cfg::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
+                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
                             raw_inst.without_ids.clone(),
                         ))
                     } else {
@@ -1409,7 +1410,13 @@ impl Module {
                         .control_inst_on_exit_from
                         .insert(
                             current_block.region,
-                            cfg::ControlInst { attrs, kind, inputs, targets, target_inputs },
+                            cf::unstructured::ControlInst {
+                                attrs,
+                                kind,
+                                inputs,
+                                targets,
+                                target_inputs,
+                            },
                         );
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {
