@@ -1723,12 +1723,16 @@ impl Printer<'_> {
 
     /// Pretty-print a string literal with escaping and styling.
     fn pretty_string_literal(&self, s: &str) -> pretty::Fragment {
+        // HACK(eddyb) avoid using multiline formatting for trailing `\n`, which
+        // may be common in e.g. `debugPrintf("foo\n")`-style messages.
+        let use_multiline_format = s.trim_end_matches('\n').contains('\n');
+
         // HACK(eddyb) this is somewhat inefficient, but we need to allocate a
         // `String` for every piece anyway, so might as well make it convenient.
         pretty::Fragment::new(
             // HACK(eddyb) this allows aligning the actual string contents,
             // (see `c == '\n'` special-casing below for when this applies).
-            (s.contains('\n').then_some(Either::Left(' ')).into_iter())
+            (use_multiline_format.then_some(Either::Left(' ')).into_iter())
                 .chain([Either::Left('"')])
                 .chain(s.chars().flat_map(|c| {
                     let escaped = c.escape_debug();
@@ -1747,7 +1751,8 @@ impl Printer<'_> {
                     // HACK(eddyb) move escaped `\n` to the start of a new line,
                     // using Rust's trailing `\` on the previous line, which eats
                     // all following whitespace (and only stops at the escape).
-                    let extra_prefix_unescaped = if c == '\n' { "\\\n" } else { "" };
+                    let extra_prefix_unescaped =
+                        if c == '\n' && use_multiline_format { "\\\n" } else { "" };
 
                     (extra_prefix_unescaped.chars().map(Either::Left)).chain([maybe_escaped])
                 }))
