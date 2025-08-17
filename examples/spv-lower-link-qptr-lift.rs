@@ -80,10 +80,10 @@ fn main() -> std::io::Result<()> {
             after_pass("", &module)?;
 
             // HACK(eddyb) this is roughly what Rust-GPU would need.
-            let layout_config = &spirt::qptr::LayoutConfig {
+            let layout_config = &spirt::mem::LayoutConfig {
                 abstract_bool_size_align: (1, 1),
                 logical_ptr_size_align: (4, 4),
-                ..spirt::qptr::LayoutConfig::VULKAN_SCALAR_LAYOUT
+                ..spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT
             };
 
             eprint_duration(|| {
@@ -92,9 +92,11 @@ fn main() -> std::io::Result<()> {
             eprintln!("qptr::lower_from_spv_ptrs");
             after_pass("qptr::lower_from_spv_ptrs", &module)?;
 
-            eprint_duration(|| spirt::passes::qptr::analyze_uses(&mut module, layout_config));
-            eprintln!("qptr::analyze_uses");
-            after_pass("qptr::analyze_uses", &module)?;
+            eprint_duration(|| {
+                spirt::passes::qptr::analyze_mem_accesses(&mut module, layout_config)
+            });
+            eprintln!("mem::analyze_accesses");
+            after_pass("mem::analyze_accesses", &module)?;
 
             eprint_duration(|| spirt::passes::qptr::lift_to_spv_ptrs(&mut module, layout_config));
             eprintln!("qptr::lift_to_spv_ptrs");
