@@ -1,6 +1,6 @@
 // FIXME(eddyb) layouts are a bit tricky: this recomputes them from several passes.
 
-use crate::qptr::shapes;
+use crate::mem::shapes;
 use crate::{
     AddrSpace, Attr, Const, ConstKind, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst, spv,
 };
@@ -61,10 +61,10 @@ impl LayoutConfig {
         Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT };
 }
 
-pub(super) struct LayoutError(pub(super) Diag);
+pub(crate) struct LayoutError(pub(crate) Diag);
 
 #[derive(Clone)]
-pub(super) enum TypeLayout {
+pub(crate) enum TypeLayout {
     Handle(HandleLayout),
     HandleArray(HandleLayout, Option<NonZeroU32>),
 
@@ -73,16 +73,16 @@ pub(super) enum TypeLayout {
 }
 
 // NOTE(eddyb) `Handle` is parameterized over the `Buffer` layout.
-pub(super) type HandleLayout = shapes::Handle<Rc<MemTypeLayout>>;
+pub(crate) type HandleLayout = shapes::Handle<Rc<MemTypeLayout>>;
 
-pub(super) struct MemTypeLayout {
-    pub(super) original_type: Type,
-    pub(super) mem_layout: shapes::MaybeDynMemLayout,
-    pub(super) components: Components,
+pub(crate) struct MemTypeLayout {
+    pub(crate) original_type: Type,
+    pub(crate) mem_layout: shapes::MaybeDynMemLayout,
+    pub(crate) components: Components,
 }
 
 // FIXME(eddyb) use proper newtypes for byte sizes.
-pub(super) enum Components {
+pub(crate) enum Components {
     Scalar,
 
     /// Vector and array elements (all of them having the same `elem` layout).
@@ -106,7 +106,7 @@ impl Components {
     /// this can return multiple components, with at most one ever being non-ZST.
     //
     // FIXME(eddyb) be more aggressive in pruning ZSTs so this can be simpler.
-    pub(super) fn find_components_containing(
+    pub(crate) fn find_components_containing(
         &self,
         // FIXME(eddyb) consider renaming such offset ranges to "extent".
         offset_range: Range<u32>,
@@ -168,7 +168,7 @@ impl Components {
 }
 
 /// Context for computing `TypeLayout`s from `Type`s (with caching).
-pub(super) struct LayoutCache<'a> {
+pub(crate) struct LayoutCache<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
 
@@ -178,7 +178,7 @@ pub(super) struct LayoutCache<'a> {
 }
 
 impl<'a> LayoutCache<'a> {
-    pub(super) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
+    pub(crate) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
         Self { cx, wk: &spv::spec::Spec::get().well_known, config, cache: Default::default() }
     }
 
@@ -197,7 +197,7 @@ impl<'a> LayoutCache<'a> {
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
-    pub(super) fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
+    pub(crate) fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
         if let Some(cached) = self.cache.borrow().get(&ty).cloned() {
             return Ok(cached);
         }
@@ -348,7 +348,7 @@ impl<'a> LayoutCache<'a> {
         // FIXME(eddyb) !!! what if... types had a min/max size and then...
         // that would allow surrounding offsets to limit their size... but... ugh...
         // ugh this doesn't make any sense. maybe if the front-end specifies
-        // offsets with "abstract types", it must configure `qptr::layout`?
+        // offsets with "abstract types", it must configure `mem::layout`?
         let layout = if spv_inst.opcode == wk.OpTypeBool {
             // FIXME(eddyb) make this properly abstract instead of only configurable.
             scalar_with_size_and_align(self.config.abstract_bool_size_align)
