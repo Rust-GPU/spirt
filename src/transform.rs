@@ -9,7 +9,7 @@ use crate::{
     DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
     Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef, RegionInputDecl, Type,
-    TypeDef, TypeKind, TypeOrConst, Value, spv,
+    TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -721,7 +721,16 @@ impl InnerTransform for Value {
             Self::Const(ct) => transform!({
                 ct -> transformer.transform_const_use(*ct),
             } => Self::Const(ct)),
+            Self::Var(var) => transform!({
+                var -> var.inner_transform_with(transformer),
+            } => Self::Var(var)),
+        }
+    }
+}
 
+impl InnerTransform for VarKind {
+    fn inner_transform_with(&self, _transformer: &mut impl Transformer) -> Transformed<Self> {
+        match self {
             Self::RegionInput { region: _, input_idx: _ }
             | Self::NodeOutput { node: _, output_idx: _ } => Transformed::Unchanged,
         }

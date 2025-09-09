@@ -31,7 +31,7 @@ use crate::{
     EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
     Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -269,8 +269,12 @@ impl From<Value> for Use {
     fn from(value: Value) -> Self {
         match value {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
-            Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
-            Value::NodeOutput { node, output_idx } => Use::NodeOutput { node, output_idx },
+            Value::Var(VarKind::RegionInput { region, input_idx }) => {
+                Use::RegionInput { region, input_idx }
+            }
+            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
+                Use::NodeOutput { node, output_idx }
+            }
         }
     }
 }
@@ -644,7 +648,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
     fn visit_value_use(&mut self, v: &'a Value) {
         match *v {
             Value::Const(_) => {}
-            _ => *self.use_counts.entry(Use::from(*v)).or_default() += 1,
+            Value::Var(_) => *self.use_counts.entry(Use::from(*v)).or_default() += 1,
         }
         v.inner_visit_with(self);
     }
@@ -3530,10 +3534,10 @@ impl Print for FuncDecl {
                 params.iter().enumerate().map(|(i, param)| {
                     let param_name = match def {
                         DeclDef::Imported(_) => "_".into(),
-                        DeclDef::Present(def) => Value::RegionInput {
+                        DeclDef::Present(def) => Value::Var(VarKind::RegionInput {
                             region: def.body,
                             input_idx: i.try_into().unwrap(),
-                        }
+                        })
                         .print_as_def(printer),
                     };
                     param.print(printer).insert_name_before_def(param_name)
@@ -3566,10 +3570,10 @@ impl Print for FuncDecl {
                                         "(",
                                         inputs.iter().enumerate().map(|(input_idx, input)| {
                                             input.print(printer).insert_name_before_def(
-                                                Value::RegionInput {
+                                                Value::Var(VarKind::RegionInput {
                                                     region,
                                                     input_idx: input_idx.try_into().unwrap(),
-                                                }
+                                                })
                                                 .print_as_def(printer),
                                             )
                                         }),
@@ -3715,8 +3719,11 @@ impl Print for FuncAt<'_, Node> {
         let outputs_header = if !outputs.is_empty() {
             let mut outputs = outputs.iter().enumerate().map(|(output_idx, output)| {
                 output.print(printer).insert_name_before_def(
-                    Value::NodeOutput { node, output_idx: output_idx.try_into().unwrap() }
-                        .print_as_def(printer),
+                    Value::Var(VarKind::NodeOutput {
+                        node,
+                        output_idx: output_idx.try_into().unwrap(),
+                    })
+                    .print_as_def(printer),
                 )
             });
             let outputs_lhs = if outputs.len() == 1 {
@@ -3771,10 +3778,10 @@ impl Print for FuncAt<'_, Node> {
                         inputs.iter().enumerate().map(|(input_idx, input)| {
                             (
                                 input,
-                                Value::RegionInput {
+                                Value::Var(VarKind::RegionInput {
                                     region: body,
                                     input_idx: input_idx.try_into().unwrap(),
-                                },
+                                }),
                             )
                         });
                     (

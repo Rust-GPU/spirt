@@ -706,7 +706,7 @@ pub struct FuncDefBody {
     /// The [`Region`] representing the whole body of the function.
     ///
     /// Function parameters are provided via `body.inputs`, i.e. they can be
-    /// only accessed with `Value::RegionInputs { region: body, idx }`.
+    /// only accessed with `VarKind::RegionInput { region: body, idx }`.
     ///
     /// When `unstructured_cfg` is `None`, this includes the structured return
     /// of the function, with `body.outputs` as the returned values.
@@ -814,7 +814,7 @@ pub use context::Region;
 #[derive(Clone, Default)]
 pub struct RegionDef {
     /// Inputs to this [`Region`]:
-    /// * accessed using [`Value::RegionInput`]
+    /// * accessed using [`VarKind::RegionInput`]
     /// * values provided by the parent:
     ///   * when this is the function body: the function's parameters
     pub inputs: SmallVec<[RegionInputDecl; 2]>,
@@ -824,11 +824,11 @@ pub struct RegionDef {
     /// Output values from this [`Region`], provided to the parent:
     /// * when this is the function body: these are the structured return values
     /// * when this is a `Select` case: these are the values for the parent
-    ///   [`Node`]'s outputs (accessed using [`Value::NodeOutput`])
+    ///   [`Node`]'s outputs (accessed using [`VarKind::NodeOutput`])
     /// * when this is a `Loop` body: these are the values to be used for the
     ///   next loop iteration's body `inputs`
-    ///   * **not** accessible through [`Value::NodeOutput`] on the `Loop`,
-    ///     as it's both confusing regarding [`Value::RegionInput`], and
+    ///   * **not** accessible through [`VarKind::NodeOutput`] on the `Loop`,
+    ///     as it's both confusing regarding [`VarKind::RegionInput`], and
     ///     also there's nothing stopping body-defined values from directly being
     ///     used outside the loop (once that changes, this aspect can be flipped)
     pub outputs: SmallVec<[Value; 2]>,
@@ -863,7 +863,7 @@ pub struct NodeDef {
     pub child_regions: SmallVec<[Region; 2]>,
 
     /// Outputs from this [`Node`]:
-    /// * accessed using [`Value::NodeOutput`]
+    /// * accessed using [`VarKind::NodeOutput`]
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
@@ -942,15 +942,22 @@ pub type DataInstKind = NodeKind;
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Const(Const),
+    Var(Var),
+}
 
+type Var = VarKind;
+
+// FIXME(eddyb) document the fact that "variable" is used here in a sense
+// more like e.g. math/lambda calculus/SSA/Rust immutable variables,
+// and *not* some sort of "mutable slot" (like e.g. wasm local variables),
+// also mention `GlobalVar`/`mem::MemOp::FuncLocalVar`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum VarKind {
     /// One of the inputs to a [`Region`]:
     /// * declared by `region.inputs[input_idx]`
     /// * value provided by the parent of the `region`:
     ///   * when `region` is the function body: `input_idx`th function parameter
-    RegionInput {
-        region: Region,
-        input_idx: u32,
-    },
+    RegionInput { region: Region, input_idx: u32 },
 
     /// One of the outputs produced by a [`Node`]:
     /// * declared by `node.outputs[output_idx]`
@@ -958,8 +965,5 @@ pub enum Value {
     ///   executed child [`Region`] (of `node`):
     ///   * when `node` is a `Select`: the case that was chosen
     // TODO(eddyb) include former `DataInst`s in above docs.
-    NodeOutput {
-        node: Node,
-        output_idx: u32,
-    },
+    NodeOutput { node: Node, output_idx: u32 },
 }

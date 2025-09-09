@@ -8,7 +8,7 @@ use crate::{
     DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
     FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module,
     NodeOutputDecl, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst,
-    Value, print,
+    Value, VarKind, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -1260,10 +1260,10 @@ impl Module {
 
                         local_id_defs.insert(
                             result_id.unwrap(),
-                            LocalIdDef::Value(Value::RegionInput {
+                            LocalIdDef::Value(Value::Var(VarKind::RegionInput {
                                 region: func_def_body.body,
                                 input_idx,
-                            }),
+                            })),
                         );
                     }
                     continue;
@@ -1328,10 +1328,10 @@ impl Module {
 
                                 (
                                     used_id,
-                                    LocalIdDef::Value(Value::RegionInput {
+                                    LocalIdDef::Value(Value::Var(VarKind::RegionInput {
                                         region: current_block.region,
                                         input_idx,
-                                    }),
+                                    })),
                                 )
                             },
                         ),
@@ -1503,10 +1503,10 @@ impl Module {
 
                     local_id_defs.insert(
                         result_id.unwrap(),
-                        LocalIdDef::Value(Value::RegionInput {
+                        LocalIdDef::Value(Value::Var(VarKind::RegionInput {
                             region: current_block.region,
                             input_idx,
-                        }),
+                        })),
                     );
                 } else if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
                     let is_second_to_last_in_block = lookahead_raw_inst(2)
@@ -1636,7 +1636,7 @@ impl Module {
 
                     let inst = func_def_body.nodes.define(&cx, data_inst_def.into());
                     if let Some(result_id) = result_id {
-                        let output = Value::NodeOutput { node: inst, output_idx: 0 };
+                        let output = Value::Var(VarKind::NodeOutput { node: inst, output_idx: 0 });
                         local_id_defs.insert(result_id, LocalIdDef::Value(output));
                     }
 

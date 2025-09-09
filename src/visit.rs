@@ -9,7 +9,7 @@ use crate::{
     DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
     FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
     ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
-    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -547,8 +547,16 @@ impl InnerVisit for cf::unstructured::ControlInst {
 
 impl InnerVisit for Value {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
+        match self {
+            &Self::Const(ct) => visitor.visit_const_use(ct),
+            Self::Var(var) => var.inner_visit_with(visitor),
+        }
+    }
+}
+
+impl InnerVisit for VarKind {
+    fn inner_visit_with<'a>(&'a self, _visitor: &mut impl Visitor<'a>) {
         match *self {
-            Self::Const(ct) => visitor.visit_const_use(ct),
             Self::RegionInput { region: _, input_idx: _ }
             | Self::NodeOutput { node: _, output_idx: _ } => {}
         }

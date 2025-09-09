@@ -8,7 +8,7 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
     FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, NodeOutputDecl, Region,
-    Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -434,7 +434,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) maybe all this data should be packaged up together in a
         // type with fields like those of `DeferredPtrNoop` (or even more).
         let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::NodeOutput { node: v_data_inst, output_idx: 0 } = v
+            if let Value::Var(VarKind::NodeOutput { node: v_data_inst, output_idx: 0 }) = v
                 && let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst)
             {
                 return Ok((
@@ -805,8 +805,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         func.nodes,
                     );
 
-                    new_data_inst_def.inputs[input_idx] =
-                        Value::NodeOutput { node: access_chain_data_inst, output_idx: 0 };
+                    new_data_inst_def.inputs[input_idx] = Value::Var(VarKind::NodeOutput {
+                        node: access_chain_data_inst,
+                        output_idx: 0,
+                    });
                 }
 
                 new_data_inst_def
@@ -879,8 +881,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         func.nodes,
                     );
 
-                    new_data_inst_def.inputs[input_idx] =
-                        Value::NodeOutput { node: access_chain_data_inst, output_idx: 0 };
+                    new_data_inst_def.inputs[input_idx] = Value::Var(VarKind::NodeOutput {
+                        node: access_chain_data_inst,
+                        output_idx: 0,
+                    });
                 }
 
                 if let Some((addr_space, pointee_type)) = from_spv_ptr_output {
@@ -1023,7 +1027,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         for v in values {
             // FIXME(eddyb) the loop could theoretically be avoided, but that'd
             // make tracking use counts harder.
-            while let Value::NodeOutput { node: inst, output_idx: 0 } = *v {
+            while let Value::Var(VarKind::NodeOutput { node: inst, output_idx: 0 }) = *v {
                 match self.deferred_ptr_noops.get(&inst) {
                     Some(ptr_noop) => {
                         *v = ptr_noop.output_pointer;
@@ -1038,7 +1042,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
     fn add_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::NodeOutput { node: inst, .. } = v {
+            if let Value::Var(VarKind::NodeOutput { node: inst, .. }) = v {
                 let count = self.data_inst_use_counts.entry(inst);
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
@@ -1048,7 +1052,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     }
     fn remove_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::NodeOutput { node: inst, .. } = v {
+            if let Value::Var(VarKind::NodeOutput { node: inst, .. }) = v {
                 let count = self.data_inst_use_counts.entry(inst);
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }

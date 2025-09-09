@@ -9,7 +9,7 @@ use crate::{
     DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
     FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node,
     NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type, TypeDef, TypeKind,
-    TypeOrConst, Value,
+    TypeOrConst, Value, VarKind,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -263,7 +263,7 @@ struct FuncLifting<'a> {
     blocks: FxIndexMap<CfgPoint, BlockLifting<'a>>,
 }
 
-/// What determines the values for [`Value::RegionInput`]s, for a specific
+/// What determines the values for [`VarKind::RegionInput`]s, for a specific
 /// region (effectively the subset of "region parents" that support inputs).
 ///
 /// Note that this is not used when a [`cf::unstructured::ControlInst`] has `target_inputs`,
@@ -793,8 +793,7 @@ impl<'a> FuncLifting<'a> {
                                     }
                                     _ => false,
                                 },
-
-                                _ => false,
+                                Value::Var(_) => false,
                             };
                             if is_infinite_loop {
                                 Terminator {
@@ -1171,7 +1170,7 @@ impl LazyInst<'_, '_> {
 
                 _ => ids.globals[&Global::Const(ct)],
             },
-            Value::RegionInput { region, input_idx } => {
+            Value::Var(VarKind::RegionInput { region, input_idx }) => {
                 let input_idx = usize::try_from(input_idx).unwrap();
                 match parent_func.region_inputs_source.get(&region) {
                     Some(RegionInputsSource::FuncParams) => parent_func.param_ids[input_idx],
@@ -1184,7 +1183,7 @@ impl LazyInst<'_, '_> {
                     }
                 }
             }
-            Value::NodeOutput { node, output_idx } => {
+            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
                 if let Some(&data_inst_output_id) = parent_func.data_inst_output_ids.get(&node) {
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
                     assert_eq!(output_idx, 0);

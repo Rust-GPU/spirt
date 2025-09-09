@@ -9,7 +9,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value,
+    TypeKind, Value, VarKind,
 };
 use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
@@ -776,11 +776,11 @@ impl<'a> GatherAccesses<'a> {
                     for (v, accesses) in accesses_or_err_attrs_to_attach {
                         let attrs = match v {
                             Value::Const(_) => unreachable!(),
-                            Value::RegionInput { region, input_idx } => {
+                            Value::Var(VarKind::RegionInput { region, input_idx }) => {
                                 &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
                                     .attrs
                             }
-                            Value::NodeOutput { node, output_idx } => {
+                            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
                                 let node_def = func_def_body.at_mut(node).def();
 
                                 // HACK(eddyb) `NodeOutput { output_idx: !0, .. }`
@@ -886,16 +886,18 @@ impl<'a> GatherAccesses<'a> {
                         // FIXME(eddyb) may be relevant?
                         _ => unreachable!(),
                     },
-                    Value::RegionInput { region, input_idx } if region == func_def_body.body => {
+                    Value::Var(VarKind::RegionInput { region, input_idx })
+                        if region == func_def_body.body =>
+                    {
                         &mut param_accesses[input_idx as usize]
                     }
-                    Value::RegionInput { .. } => {
+                    Value::Var(VarKind::RegionInput { .. }) => {
                         // FIXME(eddyb) don't throw away `new_accesses`.
                         accesses_or_err_attrs_to_attach
                             .push((ptr, Err(AnalysisError(Diag::bug(["unsupported φ".into()])))));
                         return;
                     }
-                    Value::NodeOutput { node: ptr_node, output_idx } => {
+                    Value::Var(VarKind::NodeOutput { node: ptr_node, output_idx }) => {
                         let i = output_idx as usize;
                         let slots = node_to_per_output_accesses.entry(ptr_node).or_default();
                         if i >= slots.len() {
@@ -917,7 +919,10 @@ impl<'a> GatherAccesses<'a> {
             match &node_def.kind {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation { .. } => {
                     for (i, accesses) in per_output_accesses.iter().enumerate() {
-                        let output = Value::NodeOutput { node, output_idx: i.try_into().unwrap() };
+                        let output = Value::Var(VarKind::NodeOutput {
+                            node,
+                            output_idx: i.try_into().unwrap(),
+                        });
                         if let Some(_accesses) = accesses {
                             // FIXME(eddyb) don't throw away `accesses`.
                             accesses_or_err_attrs_to_attach.push((
@@ -961,7 +966,7 @@ impl<'a> GatherAccesses<'a> {
                         }
                         FuncGatherAccessesState::InProgress => {
                             accesses_or_err_attrs_to_attach.push((
-                                Value::NodeOutput { node, output_idx: 0 },
+                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
                                 Err(AnalysisError(Diag::bug(
                                     ["unsupported recursive call".into()],
                                 ))),
@@ -973,15 +978,19 @@ impl<'a> GatherAccesses<'a> {
                         .is_some_and(|o| is_qptr(o.ty))
                         && let Some(accesses) = output_accesses
                     {
-                        accesses_or_err_attrs_to_attach
-                            .push((Value::NodeOutput { node, output_idx: 0 }, accesses));
+                        accesses_or_err_attrs_to_attach.push((
+                            Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                            accesses,
+                        ));
                     }
                 }
 
                 DataInstKind::Mem(MemOp::FuncLocalVar(_)) => {
                     if let Some(accesses) = output_accesses {
-                        accesses_or_err_attrs_to_attach
-                            .push((Value::NodeOutput { node, output_idx: 0 }, accesses));
+                        accesses_or_err_attrs_to_attach.push((
+                            Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                            accesses,
+                        ));
                     }
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
@@ -1291,8 +1300,10 @@ impl<'a> GatherAccesses<'a> {
                     if has_from_spv_ptr_output_attr {
                         // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                         if let Some(accesses) = output_accesses {
-                            accesses_or_err_attrs_to_attach
-                                .push((Value::NodeOutput { node, output_idx: 0 }, accesses));
+                            accesses_or_err_attrs_to_attach.push((
+                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                                accesses,
+                            ));
                         }
                     }
                 }
