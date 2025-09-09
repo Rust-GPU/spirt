@@ -1,6 +1,9 @@
 //! Memory access analysis (for "type recovery", i.e. untyped -> typed memory).
 //
 // TODO(eddyb) consider renaming this to `mem::typed`.
+//
+// FIXME(eddyb) the `legalize`-vs-`analyze`+`lift` split can be confusing,
+// and may need more than documentation (but for now, see `qptr::legalize` docs).
 
 use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappFlags, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
