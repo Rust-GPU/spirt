@@ -475,8 +475,9 @@ impl<'a> FuncAt<'a, EntityListIter<Node>> {
 // requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
 impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let NodeDef { kind, outputs } = self.def();
+        let NodeDef { attrs, kind, outputs } = self.def();
 
+        visitor.visit_attr_set_use(*attrs);
         match kind {
             NodeKind::Block { insts } => {
                 for func_at_inst in self.at(*insts) {

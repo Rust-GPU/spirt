@@ -194,6 +194,9 @@ pub trait Transformer: Sized {
     fn in_place_transform_func_decl(&mut self, func_decl: &mut FuncDecl) {
         func_decl.inner_in_place_transform_with(self);
     }
+    fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
+        func_at_region.inner_in_place_transform_with(self);
+    }
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.inner_in_place_transform_with(self);
     }
@@ -569,13 +572,13 @@ impl InnerTransform for FuncParam {
 impl InnerInPlaceTransform for FuncDefBody {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         match &self.unstructured_cfg {
-            None => self.at_mut_body().inner_in_place_transform_with(transformer),
+            None => transformer.in_place_transform_region_def(self.at_mut_body()),
             Some(cfg) => {
                 // HACK(eddyb) have to compute this before borrowing any `self` fields.
                 let rpo = cfg.rev_post_order(self);
 
                 for region in rpo {
-                    self.at_mut(region).inner_in_place_transform_with(transformer);
+                    transformer.in_place_transform_region_def(self.at_mut(region));
 
                     let cfg = self.unstructured_cfg.as_mut().unwrap();
                     if let Some(control_inst) = cfg.control_inst_on_exit_from.get_mut(region) {
@@ -641,9 +644,11 @@ impl FuncAtMut<'_, Node> {
 
 impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        // HACK(eddyb) handle pre-child-regions parts of `kind` separately to
+        // HACK(eddyb) handle all pre-child-regions fields separately to
         // allow reborrowing `FuncAtMut` (for the child region recursion).
-        match &mut self.reborrow().def().kind {
+        let NodeDef { attrs, kind, outputs: _ } = self.reborrow().def();
+        transformer.transform_attr_set_use(*attrs).apply_to(attrs);
+        match kind {
             &mut NodeKind::Block { insts } => {
                 let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
                 while let Some(func_at_inst) = func_at_inst_iter.next() {
@@ -669,10 +674,10 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
         // in a `Vec` (or `SmallVec`), which requires workarounds like this.
         for child_region_idx in 0..self.child_regions().len() {
             let child_region = self.child_regions()[child_region_idx];
-            self.reborrow().at(child_region).inner_in_place_transform_with(transformer);
+            transformer.in_place_transform_region_def(self.reborrow().at(child_region));
         }
 
-        let NodeDef { kind, outputs } = self.reborrow().def();
+        let NodeDef { attrs: _, kind, outputs } = self.reborrow().def();
 
         match kind {
             // Fully handled above, before recursing into any child regions.

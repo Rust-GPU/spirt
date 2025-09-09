@@ -853,6 +853,8 @@ pub use context::Node;
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
 pub struct NodeDef {
+    pub attrs: AttrSet,
+
     pub kind: NodeKind,
 
     /// Outputs from this [`Node`]:
