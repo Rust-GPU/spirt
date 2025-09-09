@@ -157,6 +157,7 @@ def_well_known! {
 
         OpLoad,
         OpStore,
+        OpCopyMemory,
         OpArrayLength,
         OpAccessChain,
         OpInBoundsAccessChain,
