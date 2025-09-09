@@ -376,7 +376,7 @@ impl InnerVisit for MemAccesses {
 
 impl InnerVisit for DataHapp {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { max_size: _, kind } = self;
+        let Self { max_size: _, flags: _, kind } = self;
         kind.inner_visit_with(visitor);
     }
 }
@@ -591,7 +591,10 @@ impl<'a> FuncAt<'a, Node> {
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::Mem(
-                MemOp::FuncLocalVar(_) | MemOp::Load { .. } | MemOp::Store { .. },
+                MemOp::FuncLocalVar(_)
+                | MemOp::Load { .. }
+                | MemOp::Store { .. }
+                | MemOp::Copy { .. },
             )
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

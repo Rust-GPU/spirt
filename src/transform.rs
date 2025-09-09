@@ -394,12 +394,13 @@ impl<T: InnerTransform> InnerTransform for Rc<T> {
 
 impl InnerTransform for DataHapp {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { max_size, kind } = self;
+        let Self { max_size, flags, kind } = self;
 
         transform!({
             kind -> kind.inner_transform_with(transformer)
         } => Self {
             max_size: *max_size,
+            flags: *flags,
             kind,
         })
     }
@@ -661,7 +662,10 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::Mem(
-                MemOp::FuncLocalVar(_) | MemOp::Load { .. } | MemOp::Store { .. },
+                MemOp::FuncLocalVar(_)
+                | MemOp::Load { .. }
+                | MemOp::Store { .. }
+                | MemOp::Copy { .. },
             )
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

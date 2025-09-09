@@ -21,7 +21,7 @@ use itertools::Itertools as _;
 
 use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
-use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
+use crate::mem::{DataHapp, DataHappFlags, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::print::multiversion::Versions;
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::visit::{InnerVisit, Visit, Visitor};
@@ -2995,10 +2995,33 @@ impl Print for MemAccesses {
 impl Print for DataHapp {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        let Self { max_size, flags, kind } = self;
+
         // FIXME(eddyb) should this be a helper on `Printer`?
         let num_lit = |x: u32| printer.numeric_literal_style().apply(format!("{x}")).into();
 
-        match &self.kind {
+        let mut aspects = SmallVec::<[_; 4]>::new();
+
+        let is_copy_src = flags.contains(DataHappFlags::COPY_SRC);
+        let is_copy_dst = flags.contains(DataHappFlags::COPY_DST);
+        if is_copy_src || is_copy_dst {
+            // FIXME(eddyb) this isn't the cleanest possible representation.
+            let copy_kind = match (is_copy_src, is_copy_dst) {
+                (true, false) => "copy_src",
+                (false, true) => "copy_dst",
+                _ => "copy",
+            };
+            aspects.push(pretty::Fragment::new([
+                printer.declarative_keyword_style().apply(copy_kind).into(),
+                "(".into(),
+                num_lit(0),
+                "..".into(),
+                max_size.map(num_lit).unwrap_or_default(),
+                ")".into(),
+            ]));
+        }
+
+        aspects.push(match &kind {
             DataHappKind::Dead => "_".into(),
             // FIXME(eddyb) should the distinction be noted?
             &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => ty.print(printer),
@@ -3028,16 +3051,15 @@ impl Print for DataHapp {
                 "(".into(),
                 num_lit(0),
                 "..".into(),
-                self.max_size
-                    .map(|max_size| max_size / stride.get())
-                    .map(num_lit)
-                    .unwrap_or_default(),
+                max_size.map(|max_size| max_size / stride.get()).map(num_lit).unwrap_or_default(),
                 ") × ".into(),
                 num_lit(stride.get()),
                 " => ".into(),
                 element.print(printer),
             ]),
-        }
+        });
+
+        pretty::Fragment::new(aspects.into_iter().intersperse(" & ".into()))
     }
 }
 
@@ -4138,6 +4160,20 @@ impl FuncAt<'_, DataInst> {
                             ]);
                         }
                         ("store", [ptr, inputs[1].print(printer)].into_iter().collect())
+                    }
+
+                    &MemOp::Copy { size } => {
+                        assert_eq!(inputs.len(), 2);
+                        (
+                            "copy",
+                            [
+                                inputs[0].print(printer),
+                                inputs[1].print(printer),
+                                printer.numeric_literal_style().apply(format!("{size}")).into(),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        )
                     }
                 };
 

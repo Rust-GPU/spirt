@@ -11,6 +11,7 @@
 // FIXME(eddyb) consider taking this into a more (R)VSDG "state type" direction.
 
 use crate::{OrdAssertEq, Type};
+use bitflags::bitflags;
 use std::collections::BTreeMap;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::rc::Rc;
@@ -85,11 +86,66 @@ pub struct DataHapp {
     // *possible* `offset_range.end` values to describe a "maximum size").
     pub max_size: Option<u32>,
 
+    pub flags: DataHappFlags,
+
     pub kind: DataHappKind,
 }
 
 impl DataHapp {
-    pub const DEAD: Self = Self { max_size: Some(0), kind: DataHappKind::Dead };
+    pub const DEAD: Self =
+        Self { max_size: Some(0), flags: DataHappFlags::empty(), kind: DataHappKind::Dead };
+}
+
+bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct DataHappFlags: u8 {
+        /// Used as a source for `mem.copy` (of `0..max_size`), reading:
+        /// - alongside `COPY_DST`: all bytes (see `COPY_SRC_AND_DST` for details)
+        /// - without `COPY_DST`: leaf fields which could have only been written
+        ///   by direct accesses, already tracked by (nested) `DataHapp`s
+        ///
+        /// **Note**: as this flag semantically covers an offset range, it's
+        /// implicitly inherited by any (transitively) nested `DataHapp`s,
+        /// and must be considered effectively present throughout all of them
+        /// (e.g. for detecting and handling the `COPY_SRC_AND_DST` combination),
+        /// even if not explicitly propagated inwards ahead of time.
+        const COPY_SRC = 1 << 0;
+
+        /// Used as a destination for `mem.copy` (of `0..max_size`), writing:
+        /// - alongside `COPY_SRC`: all bytes (see `COPY_SRC_AND_DST` for details)
+        /// - without `COPY_SRC`: leaf fields which could only be later read
+        ///   by direct accesses, already tracked by (nested) `DataHapp`s
+        ///
+        /// **Note**: as this flag semantically covers an offset range, it's
+        /// implicitly inherited by any (transitively) nested `DataHapp`s,
+        /// and must be considered effectively present throughout all of them
+        /// (e.g. for detecting and handling the `COPY_SRC_AND_DST` combination),
+        /// even if not explicitly propagated inwards ahead of time.
+        const COPY_DST = 1 << 1;
+
+        /// Used as a source for some `mem.copy`s and a destination for others,
+        /// making it unsound to rely solely on the offset ranges covered by the
+        /// (nested) `DataHapp`s, as any contained bytes may be implicitly
+        /// expected to have been preserved by the copy, regardless of whether
+        /// direct accesses were observed by this `DataHapp` (so all gaps
+        /// between those known accesses must be fully filled with leaf fields).
+        ///
+        /// **Note**: not a flag of its own, but simply the combination of
+        /// `COPY_SRC` and `COPY_DST`, used to document their combined effect.
+        const COPY_SRC_AND_DST = Self::COPY_SRC.bits() | Self::COPY_DST.bits();
+
+        /// Mask for [`DataHappFlags::propagate_outwards`] (see its docs).
+        const PROPAGATE_OUTWARDS_MASK = Self::empty().bits();
+    }
+}
+
+impl DataHappFlags {
+    /// Return the subset of flags in `self` that should remain present on an
+    /// outer `DataHapp`, in which the `DataHapp` with `self` as flags will
+    /// become nested (e.g. through `Disjoint`/`Repeated`).
+    pub fn propagate_outwards(self) -> Self {
+        self & Self::PROPAGATE_OUTWARDS_MASK
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -161,6 +217,13 @@ pub enum MemOp {
         // (or more) stride(s) to allow direct array indexing at access time.
         offset: Option<NonZeroI32>,
     },
-    //
-    // FIXME(eddyb) implement more ops (e.g. copies, atomics).
+
+    /// Copy `size` bytes to a "destination" pointer (`inputs[0]`), from a "source"
+    /// pointer (`inputs[1]`), similar to a set of `Load`s and `Store`s, but with
+    /// the actual value types left undetermined for as long as possible.
+    Copy {
+        // FIXME(eddyb) add two immediate offsets? allow dynamic length?
+        size: NonZeroU32,
+    },
+    // FIXME(eddyb) implement more ops (e.g. atomics).
 }

@@ -1,7 +1,9 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lifting (e.g. to SPIR-V).
 
 use crate::func_at::{FuncAt, FuncAtMut};
-use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, const_data, shapes};
+use crate::mem::{
+    DataHapp, DataHappFlags, DataHappKind, MemAccesses, MemAttr, MemOp, const_data, shapes,
+};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
@@ -431,6 +433,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                                         field_offset,
                                         self.pointee_type_for_data_happ(
                                             field_happ,
+                                            data_happ.flags,
                                             max_size_allowed_by_shape
                                                 .and_then(|max| max.checked_sub(field_offset)),
                                         )?,
@@ -445,6 +448,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                                     0,
                                     self.pointee_type_for_data_happ(
                                         data_happ,
+                                        DataHappFlags::empty(),
                                         max_size_allowed_by_shape,
                                     )?,
                                 ))],
@@ -465,7 +469,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 }
             }
             (shapes::GlobalVarShape::UntypedData(layout), MemAccesses::Data(happ)) => {
-                self.pointee_type_for_data_happ(happ, Some(layout.size))
+                self.pointee_type_for_data_happ(happ, DataHappFlags::empty(), Some(layout.size))
             }
 
             // FIXME(eddyb) validate against accesses? (maybe in `mem::analyze`?)
@@ -478,28 +482,71 @@ impl<'a> LiftToSpvPtrs<'a> {
     fn pointee_type_for_data_happ(
         &self,
         happ: &DataHapp,
+        outer_effective_flags: DataHappFlags,
         // HACK(eddyb) `mem::analyze` should be merging shape and accesses itself.
         // FIXME(eddyb) this isn't actually used to validate anything, only as
         // a fallback for now (i.e. to avoid spurious `OpTypeRuntimeArray`s).
         max_size_allowed_by_shape: Option<u32>,
     ) -> Result<Type, LiftError> {
+        // FIXME(eddyb) does this make sense across all flags?
+        let effective_flags = outer_effective_flags | happ.flags;
+
+        // TODO(eddyb) implement (or at least validate that there are no gaps).
+        if effective_flags.contains(DataHappFlags::COPY_SRC_AND_DST) {
+            let already_valid = match &happ.kind {
+                // FIXME(eddyb) support more cases.
+                &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => ty
+                    .as_scalar(&self.cx)
+                    .is_some_and(|ty| happ.max_size == Some(ty.bit_width() / 8)),
+                _ => false,
+            };
+
+            if !already_valid {
+                return Err(LiftError(Diag::bug([
+                    "unimplemented `mem.copy` src+dst (gap filling) for ".into(),
+                    MemAccesses::Data(happ.clone()).into(),
+                ])));
+            }
+        }
+
         match &happ.kind {
             DataHappKind::Dead => self.spv_op_type_struct([], []),
             &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => Ok(ty),
-            DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
-                fields.iter().map(|(&field_offset, field_happ)| {
-                    Ok((
-                        field_offset,
-                        self.pointee_type_for_data_happ(
-                            field_happ,
-                            max_size_allowed_by_shape.and_then(|max| max.checked_sub(field_offset)),
-                        )?,
-                    ))
-                }),
-                [],
-            ),
+            DataHappKind::Disjoint(fields) => {
+                // HACK(eddyb) force the size of `OpTypeStruct`s that would be
+                // otherwise undersized (as e.g. `mem.copy` src/dst).
+                let size_forcing_zst_tail_field = happ
+                    .max_size
+                    .filter(|&size| {
+                        let inherent_unaligned_size =
+                            fields.last_key_value().map_or(0, |(&field_offset, field_usage)| {
+                                field_offset.checked_add(field_usage.max_size.unwrap()).unwrap()
+                            });
+                        size > inherent_unaligned_size
+                    })
+                    .map(|size| Ok((size, self.spv_op_type_struct([], [])?)));
+
+                self.spv_op_type_struct(
+                    fields
+                        .iter()
+                        .map(|(&field_offset, field_happ)| {
+                            Ok((
+                                field_offset,
+                                self.pointee_type_for_data_happ(
+                                    field_happ,
+                                    effective_flags,
+                                    max_size_allowed_by_shape
+                                        .and_then(|max| max.checked_sub(field_offset)),
+                                )?,
+                            ))
+                        })
+                        .chain(size_forcing_zst_tail_field),
+                    [],
+                )
+            }
             DataHappKind::Repeated { element, stride } => {
-                let element_type = self.pointee_type_for_data_happ(element, None)?;
+                let element_type =
+                    self.pointee_type_for_data_happ(element, effective_flags, None)?;
 
                 let fixed_len = happ
                     .max_size
@@ -904,6 +951,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             .checked_mul(stride.get())
                             .unwrap_or(0)
                     }),
+                    flags: DataHappFlags::empty(),
                     kind: DataHappKind::Repeated {
                         // FIXME(eddyb) allocating `Rc` a bit wasteful here.
                         element: Rc::new(DataHapp::DEAD),
@@ -1005,6 +1053,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     TypeLayout::Concrete(concrete) => MemAccesses::Data(DataHapp {
                         max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                             .then_some(concrete.mem_layout.fixed_base.size),
+                        flags: DataHappFlags::empty(),
                         kind: DataHappKind::Direct(concrete.original_type),
                     }),
                 };
@@ -1034,6 +1083,66 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 data_inst_def.kind = access_op.into();
                 data_inst_def.inputs[0] = adjusted_ptr;
 
+                data_inst_def
+            }
+            &DataInstKind::Mem(MemOp::Copy { size }) => {
+                let mut data_inst_def = data_inst_def.clone();
+
+                let max_size = Some(size.get());
+                // FIXME(eddyb) `DataHappKind::Dead` might
+                // make more sense data-structure wise, but it
+                // risks potentially losing the `flags`.
+                let kind = DataHappKind::Disjoint(Default::default());
+
+                let (dst_adjusted_ptr, (_, dst_adjusted_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_accesses(
+                        data_inst_def.inputs[0],
+                        0,
+                        &MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_DST,
+                            kind: kind.clone(),
+                        }),
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
+
+                let (src_adjusted_ptr, (_, src_adjusted_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_accesses(
+                        data_inst_def.inputs[1],
+                        0,
+                        &MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_SRC,
+                            kind: kind.clone(),
+                        }),
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
+
+                data_inst_def.inputs[0] = dst_adjusted_ptr;
+                data_inst_def.inputs[1] = src_adjusted_ptr;
+
+                let spv_opcode = match (dst_adjusted_pointee_layout, src_adjusted_pointee_layout) {
+                    (TypeLayout::Concrete(dst_concrete), TypeLayout::Concrete(src_concrete))
+                        if dst_concrete.original_type == src_concrete.original_type
+                            && dst_concrete.mem_layout.fixed_base.size == size.get()
+                            && dst_concrete.mem_layout.dyn_unit_stride.is_none() =>
+                    {
+                        wk.OpCopyMemory
+                    }
+
+                    // TODO(eddyb) implement by expanding pointee leaves in `0..size`.
+                    _ => {
+                        data_inst_def
+                            .inputs
+                            .push(Value::Const(cx.intern(scalar::Const::from_u32(size.get()))));
+                        wk.OpCopyMemorySized
+                    }
+                };
+
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(spv_opcode.into(), spv::InstLowering::default());
                 data_inst_def
             }
 
@@ -1092,6 +1201,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                 TypeLayout::Concrete(concrete) => MemAccesses::Data(DataHapp {
                                     max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                                         .then_some(concrete.mem_layout.fixed_base.size),
+                                    flags: DataHappFlags::empty(),
                                     kind: DataHappKind::StrictlyTyped(concrete.original_type),
                                 }),
                             };
