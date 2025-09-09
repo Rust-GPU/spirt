@@ -258,16 +258,11 @@ enum Use {
         node: Node,
         output_idx: u32,
     },
-    DataInstOutput {
-        inst: DataInst,
-        output_idx: u32,
-    },
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
     AlignmentAnchorForRegion(Region),
     AlignmentAnchorForNode(Node),
-    AlignmentAnchorForDataInst(DataInst),
 }
 
 impl From<Value> for Use {
@@ -276,7 +271,6 @@ impl From<Value> for Use {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
             Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
             Value::NodeOutput { node, output_idx } => Use::NodeOutput { node, output_idx },
-            Value::DataInstOutput { inst, output_idx } => Use::DataInstOutput { inst, output_idx },
         }
     }
 }
@@ -295,13 +289,11 @@ impl Use {
             Self::DbgScope { .. } => ("", "d"),
             Self::RegionLabel(_) => ("label", "L"),
 
-            Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput { .. } => {
-                ("", "v")
-            }
+            Self::RegionInput { .. } | Self::NodeOutput { .. } => ("", "v"),
 
-            Self::AlignmentAnchorForRegion(_)
-            | Self::AlignmentAnchorForNode(_)
-            | Self::AlignmentAnchorForDataInst(_) => ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX),
+            Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
+                ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX)
+            }
         }
     }
 }
@@ -1066,10 +1058,8 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|(&use_kind, &use_count)| {
                 // HACK(eddyb) these are assigned later.
-                if let Use::RegionLabel(_)
-                | Use::RegionInput { .. }
-                | Use::NodeOutput { .. }
-                | Use::DataInstOutput { .. } = use_kind
+                if let Use::RegionLabel(_) | Use::RegionInput { .. } | Use::NodeOutput { .. } =
+                    use_kind
                 {
                     return (use_kind, UseStyle::Inline);
                 }
@@ -1104,10 +1094,8 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput { .. }
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => unreachable!(),
+                    | Use::AlignmentAnchorForNode(_) => unreachable!(),
                 }
 
                 if let Some(name) =
@@ -1179,10 +1167,8 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput { .. }
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => {
+                    | Use::AlignmentAnchorForNode(_) => {
                         unreachable!()
                     }
                 };
@@ -1205,10 +1191,8 @@ impl<'a> Printer<'a> {
                         | Use::RegionLabel(_)
                         | Use::RegionInput { .. }
                         | Use::NodeOutput { .. }
-                        | Use::DataInstOutput { .. }
                         | Use::AlignmentAnchorForRegion(_)
-                        | Use::AlignmentAnchorForNode(_)
-                        | Use::AlignmentAnchorForDataInst(_) => {
+                        | Use::AlignmentAnchorForNode(_) => {
                             unreachable!()
                         }
                     };
@@ -1502,29 +1486,10 @@ impl<'a> Printer<'a> {
                             intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
                         });
 
-                        let NodeDef { attrs, kind, inputs: _, child_regions: _, outputs } =
+                        let NodeDef { attrs, kind: _, inputs: _, child_regions: _, outputs } =
                             func_at_node.def();
 
                         define(Use::AlignmentAnchorForNode(node), Some(*attrs));
-
-                        if let NodeKind::Block { insts } = *kind {
-                            for func_at_inst in func_def_body.at(insts) {
-                                define(
-                                    Use::AlignmentAnchorForDataInst(func_at_inst.position),
-                                    None,
-                                );
-                                let inst_def = func_at_inst.def();
-                                for (i, output_decl) in inst_def.outputs.iter().enumerate() {
-                                    define(
-                                        Use::DataInstOutput {
-                                            inst: func_at_inst.position,
-                                            output_idx: i.try_into().unwrap(),
-                                        },
-                                        Some(output_decl.attrs),
-                                    );
-                                }
-                            }
-                        }
 
                         for (i, output_decl) in outputs.iter().enumerate() {
                             define(
@@ -1554,15 +1519,11 @@ impl<'a> Printer<'a> {
                         (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::RegionInput { .. }
-                    | Use::NodeOutput { .. }
-                    | Use::DataInstOutput { .. } => {
+                    Use::RegionInput { .. } | Use::NodeOutput { .. } => {
                         (&mut value_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => (
+                    Use::AlignmentAnchorForRegion(_) | Use::AlignmentAnchorForNode(_) => (
                         &mut alignment_anchor_counter,
                         Some(use_styles.entry(use_kind).or_insert(UseStyle::Inline)),
                     ),
@@ -2118,8 +2079,7 @@ impl Use {
                 suffix.write_escaped_to(&mut anchor).unwrap();
 
                 let name = if let Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForNode(_)
-                | Self::AlignmentAnchorForDataInst(_) = self
+                | Self::AlignmentAnchorForNode(_) = self
                 {
                     vec![]
                 } else {
@@ -2182,15 +2142,15 @@ impl Use {
                         item.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
+
                 Self::DbgScope { .. }
                 | Self::RegionLabel(_)
                 | Self::RegionInput { .. }
-                | Self::NodeOutput { .. }
-                | Self::DataInstOutput { .. } => "_".into(),
+                | Self::NodeOutput { .. } => "_".into(),
 
-                Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForNode(_)
-                | Self::AlignmentAnchorForDataInst(_) => unreachable!(),
+                Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
+                    unreachable!()
+                }
             },
         }
     }
@@ -3774,16 +3734,6 @@ impl Print for FuncAt<'_, Node> {
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
         let node_body = match kind {
-            NodeKind::Block { insts } => {
-                assert!(outputs.is_empty());
-
-                pretty::Fragment::new(
-                    self.at(*insts)
-                        .into_iter()
-                        .map(|func_at_inst| func_at_inst.print_data_inst(printer))
-                        .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
-                )
-            }
             NodeKind::Select(kind) => kind.print_with_scrutinee_and_cases(
                 printer,
                 kw_style,
@@ -3887,7 +3837,14 @@ impl Print for FuncAt<'_, Node> {
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::SpvInst(_)
-            | DataInstKind::SpvExtInst { .. } => unreachable!(),
+            | DataInstKind::SpvExtInst { .. } => {
+                // FIXME(eddyb) `outputs_header` is wastefully built even in
+                // this case (though ideally the logic would just be shared).
+                return pretty::Fragment::new([
+                    pretty::Node::ForceLineSeparation.into(),
+                    self.print_data_inst(printer),
+                ]);
+            }
         };
         let def_without_name = pretty::Fragment::new([
             Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
@@ -3938,15 +3895,14 @@ impl FuncAt<'_, DataInst> {
         };
 
         let mut output_use_to_print_as_lhs =
-            output_type.map(|_| Use::DataInstOutput { inst: self.position, output_idx: 0 });
+            output_type.map(|_| Use::NodeOutput { node: self.position, output_idx: 0 });
 
         let mut output_type_to_print = output_type;
 
         let def_without_type = match kind {
-            NodeKind::Block { .. }
-            | NodeKind::Select(_)
-            | NodeKind::Loop { .. }
-            | NodeKind::ExitInvocation(_) => unreachable!(),
+            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                unreachable!()
+            }
 
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([
                 printer.declarative_keyword_style().apply("call").into(),
@@ -4296,7 +4252,7 @@ impl FuncAt<'_, DataInst> {
 
         // FIXME(eddyb) this is quite verbose for prepending.
         let def_without_name = pretty::Fragment::new([
-            Use::AlignmentAnchorForDataInst(self.position).print_as_def(printer),
+            Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
             def_without_name,
         ]);
 

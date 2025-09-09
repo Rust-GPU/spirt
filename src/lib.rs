@@ -867,6 +867,7 @@ pub struct NodeDef {
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
+    // TODO(eddyb) include former `DataInst`s in above docs.
     pub outputs: SmallVec<[NodeOutputDecl; 2]>,
 }
 
@@ -879,16 +880,6 @@ pub struct NodeOutputDecl {
 
 #[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum NodeKind {
-    /// Linear chain of [`DataInst`]s, executing in sequence.
-    ///
-    /// This is only an optimization over keeping [`DataInst`]s in [`Region`]
-    /// linear chains directly, or even merging [`DataInst`] with [`Node`].
-    Block {
-        // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
-        // linked directly into the `Region` `children` list?
-        insts: EntityList<DataInst>,
-    },
-
     /// Choose one [`Region`] out of `child_regions` to execute, based on a single
     /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
@@ -966,15 +957,9 @@ pub enum Value {
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
     ///   executed child [`Region`] (of `node`):
     ///   * when `node` is a `Select`: the case that was chosen
+    // TODO(eddyb) include former `DataInst`s in above docs.
     NodeOutput {
         node: Node,
-        output_idx: u32,
-    },
-
-    /// The output value of a [`DataInst`].
-    DataInstOutput {
-        inst: DataInst,
-        // HACK(eddyb) temporarily aligned with `NodeDef` pre-merger (always == 0).
         output_idx: u32,
     },
 }

@@ -87,9 +87,6 @@ impl FuncAt<'_, Value> {
             Value::NodeOutput { node, output_idx } => {
                 self.at(node).def().outputs[output_idx as usize].ty
             }
-            Value::DataInstOutput { inst, output_idx } => {
-                self.at(inst).def().outputs[output_idx as usize].ty
-            }
         }
     }
 }

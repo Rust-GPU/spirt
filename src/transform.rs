@@ -5,11 +5,11 @@ use crate::func_at::FuncAtMut;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstKind,
-    DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
-    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
+    DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
+    GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
+    Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef, RegionInputDecl, Type,
+    TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -198,9 +198,6 @@ pub trait Transformer: Sized {
     }
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.inner_in_place_transform_with(self);
-    }
-    fn in_place_transform_data_inst_def(&mut self, mut func_at_data_inst: FuncAtMut<'_, DataInst>) {
-        func_at_data_inst.inner_in_place_transform_with(self);
     }
 }
 
@@ -637,13 +634,6 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         match kind {
-            &mut NodeKind::Block { insts } => {
-                let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
-                while let Some(func_at_inst) = func_at_inst_iter.next() {
-                    transformer.in_place_transform_data_inst_def(func_at_inst);
-                }
-            }
-
             DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
 
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
@@ -733,8 +723,7 @@ impl InnerTransform for Value {
             } => Self::Const(ct)),
 
             Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput { inst: _, output_idx: _ } => Transformed::Unchanged,
+            | Self::NodeOutput { node: _, output_idx: _ } => Transformed::Unchanged,
         }
     }
 }

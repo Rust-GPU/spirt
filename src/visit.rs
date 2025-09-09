@@ -5,11 +5,11 @@ use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstKind,
-    DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
+    DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
+    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -64,9 +64,6 @@ pub trait Visitor<'a>: Sized {
     }
     fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
         func_at_node.inner_visit_with(self);
-    }
-    fn visit_data_inst_def(&mut self, func_at_inst: FuncAt<'a, DataInst>) {
-        func_at_inst.inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -478,12 +475,6 @@ impl<'a> FuncAt<'a, Node> {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            NodeKind::Block { insts } => {
-                for func_at_inst in self.at(*insts) {
-                    visitor.visit_data_inst_def(func_at_inst);
-                }
-            }
-
             &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
 
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
@@ -559,8 +550,7 @@ impl InnerVisit for Value {
         match *self {
             Self::Const(ct) => visitor.visit_const_use(ct),
             Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput { inst: _, output_idx: _ } => {}
+            | Self::NodeOutput { node: _, output_idx: _ } => {}
         }
     }
 }

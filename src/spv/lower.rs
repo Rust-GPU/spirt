@@ -5,10 +5,10 @@ use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
-    DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, RegionInputDecl, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, print,
+    DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module,
+    NodeOutputDecl, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst,
+    Value, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -1062,7 +1062,7 @@ impl Module {
                                     }
                                     .into(),
                                 );
-                                LocalIdDef::Value(Value::DataInstOutput { inst, output_idx: 0 })
+                                LocalIdDef::Value(Value::NodeOutput { node: inst, output_idx: 0 })
                             }
                         };
                         local_id_defs.insert(id, local_id_def);
@@ -1645,7 +1645,7 @@ impl Module {
                     };
                     let inst = match result_id {
                         Some(id) => match local_id_defs[&id] {
-                            LocalIdDef::Value(Value::DataInstOutput { inst, .. }) => {
+                            LocalIdDef::Value(Value::NodeOutput { node: inst, .. }) => {
                                 // A dummy was defined earlier, to be able to
                                 // have an entry in `local_id_defs`.
                                 func_def_body.nodes[inst] = data_inst_def.into();
@@ -1657,38 +1657,7 @@ impl Module {
                         None => func_def_body.nodes.define(&cx, data_inst_def.into()),
                     };
 
-                    let current_block_node = current_block_region_def
-                        .children
-                        .iter()
-                        .last
-                        .filter(|&last_node| {
-                            matches!(func_def_body.nodes[last_node].kind, NodeKind::Block { .. })
-                        })
-                        .unwrap_or_else(|| {
-                            let block_node = func_def_body.nodes.define(
-                                &cx,
-                                NodeDef {
-                                    attrs: AttrSet::default(),
-                                    kind: NodeKind::Block { insts: EntityList::empty() },
-                                    inputs: SmallVec::new(),
-                                    child_regions: SmallVec::new(),
-                                    outputs: SmallVec::new(),
-                                }
-                                .into(),
-                            );
-                            current_block_region_def
-                                .children
-                                .insert_last(block_node, &mut func_def_body.nodes);
-                            block_node
-                        });
-                    match func_def_body.nodes[current_block_node].kind {
-                        NodeKind::Block { mut insts } => {
-                            insts.insert_last(inst, &mut func_def_body.nodes);
-                            func_def_body.nodes[current_block_node].kind =
-                                NodeKind::Block { insts };
-                        }
-                        _ => unreachable!(),
-                    }
+                    current_block_region_def.children.insert_last(inst, &mut func_def_body.nodes);
                 }
             }
 

@@ -6,10 +6,10 @@ use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey, Exportee, Func, FuncDecl, FuncParam,
-    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type,
-    TypeDef, TypeKind, TypeOrConst, Value,
+    DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
+    FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node,
+    NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type, TypeDef, TypeKind,
+    TypeOrConst, Value,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -211,13 +211,10 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         attr.inner_visit_with(self);
     }
 
-    fn visit_data_inst_def(&mut self, func_at_inst: FuncAt<'_, DataInst>) {
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
         #[allow(clippy::match_same_arms)]
-        match func_at_inst.def().kind {
-            NodeKind::Block { .. }
-            | NodeKind::Select(_)
-            | NodeKind::Loop { .. }
-            | NodeKind::ExitInvocation(_) => unreachable!(),
+        match func_at_node.def().kind {
+            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {}
 
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
@@ -238,7 +235,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
             }
         }
-        func_at_inst.inner_visit_with(self);
+        func_at_node.inner_visit_with(self);
     }
 }
 
@@ -289,7 +286,7 @@ enum CfgPoint {
 
 struct BlockLifting<'a> {
     phis: SmallVec<[Phi; 2]>,
-    insts: SmallVec<[EntityList<DataInst>; 1]>,
+    insts: SmallVec<[DataInst; 4]>,
     terminator: Terminator<'a>,
 }
 
@@ -430,10 +427,6 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
 
             // Entering a `Node` depends entirely on the `NodeKind`.
             CfgPoint::NodeEntry(node) => match self.at(node).def().kind {
-                NodeKind::Block { .. } => {
-                    Some(CfgCursor { point: CfgPoint::NodeExit(node), parent: cursor.parent })
-                }
-
                 NodeKind::Select { .. }
                 | NodeKind::Loop { .. }
                 | NodeKind::ExitInvocation { .. } => None,
@@ -442,7 +435,9 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
-                | DataInstKind::SpvExtInst { .. } => unreachable!(),
+                | DataInstKind::SpvExtInst { .. } => {
+                    Some(CfgCursor { point: CfgPoint::NodeExit(node), parent: cursor.parent })
+                }
             },
 
             // Exiting a `Node` chains to a sibling/parent.
@@ -614,28 +609,39 @@ impl<'a> FuncLifting<'a> {
                         _ => SmallVec::new(),
                     }
                 }
-                CfgPoint::NodeExit(node) => func_def_body
-                    .at(node)
-                    .def()
-                    .outputs
-                    .iter()
-                    .map(|&NodeOutputDecl { attrs, ty }| {
-                        Ok(Phi {
-                            attrs,
-                            ty,
+                CfgPoint::NodeExit(node) => {
+                    let node_def = func_def_body.at(node).def();
+                    match &node_def.kind {
+                        NodeKind::Select(_) => node_def
+                            .outputs
+                            .iter()
+                            .map(|&NodeOutputDecl { attrs, ty }| {
+                                Ok(Phi {
+                                    attrs,
+                                    ty,
 
-                            result_id: alloc_id()?,
-                            cases: FxIndexMap::default(),
-                            default_value: None,
-                        })
-                    })
-                    .collect::<Result<_, _>>()?,
+                                    result_id: alloc_id()?,
+                                    cases: FxIndexMap::default(),
+                                    default_value: None,
+                                })
+                            })
+                            .collect::<Result<_, _>>()?,
+                        _ => SmallVec::new(),
+                    }
+                }
             };
 
             let insts = match point {
                 CfgPoint::NodeEntry(node) => match func_def_body.at(node).def().kind {
-                    NodeKind::Block { insts } => [insts].into_iter().collect(),
-                    _ => SmallVec::new(),
+                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                        SmallVec::new()
+                    }
+
+                    DataInstKind::FuncCall(_)
+                    | DataInstKind::Mem(_)
+                    | DataInstKind::QPtr(_)
+                    | DataInstKind::SpvInst(_)
+                    | DataInstKind::SpvExtInst { .. } => [node].into_iter().collect(),
                 },
                 _ => SmallVec::new(),
             };
@@ -691,10 +697,6 @@ impl<'a> FuncLifting<'a> {
                 (CfgPoint::NodeEntry(node), None) => {
                     let node_def = func_def_body.at(node).def();
                     match &node_def.kind {
-                        NodeKind::Block { .. } => {
-                            unreachable!()
-                        }
-
                         NodeKind::Select(kind) => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cf::unstructured::ControlInstKind::SelectBranch(
@@ -763,10 +765,6 @@ impl<'a> FuncLifting<'a> {
                     };
 
                     match func_def_body.at(parent_node).def().kind {
-                        NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => {
-                            unreachable!()
-                        }
-
                         NodeKind::Select { .. } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
@@ -823,7 +821,8 @@ impl<'a> FuncLifting<'a> {
                             }
                         }
 
-                        DataInstKind::FuncCall(_)
+                        NodeKind::ExitInvocation { .. }
+                        | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::SpvInst(_)
@@ -832,7 +831,14 @@ impl<'a> FuncLifting<'a> {
                 }
 
                 // Siblings in the same `Region` (including the
-                // implied edge from a `Block`'s `Entry` to its `Exit`).
+                // implied edge from a `DataInst`'s `Entry` to its `Exit`).
+                //
+                // FIXME(eddyb) reduce the cost of generating then removing most
+                // "basic blocks" (as each former-`DataInst` gets *two*!),
+                // which should be pretty doable in the common case of getting
+                // `NodeEntry(a), NodeExit(a), NodeEntry(b), NodeExit(b), ...`
+                // from `rev_post_order_try_for_each` and/or introducing an
+                // `unique_predecessor` helper (just like `unique_successor`).
                 (_, Some(succ_cursor)) => Terminator {
                     attrs: AttrSet::default(),
                     kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
@@ -936,7 +942,7 @@ impl<'a> FuncLifting<'a> {
                         } = &blocks[&target];
 
                         (phis.is_empty()
-                            && insts.iter().all(|insts| insts.is_empty())
+                            && insts.is_empty()
                             && *attrs == AttrSet::default()
                             && matches!(**kind, cf::unstructured::ControlInstKind::Branch)
                             && inputs.is_empty()
@@ -1045,9 +1051,7 @@ impl<'a> FuncLifting<'a> {
         let all_insts_with_output = blocks
             .values()
             .flat_map(|block| block.insts.iter().copied())
-            .flat_map(|insts| func_def_body.at(insts))
-            .filter(|&func_at_inst| !func_at_inst.def().outputs.is_empty())
-            .map(|func_at_inst| func_at_inst.position);
+            .filter(|&inst| !func_def_body.at(inst).def().outputs.is_empty());
 
         Ok(Self {
             func_id,
@@ -1181,14 +1185,15 @@ impl LazyInst<'_, '_> {
                 }
             }
             Value::NodeOutput { node, output_idx } => {
-                parent_func.blocks[&CfgPoint::NodeExit(node)].phis
-                    [usize::try_from(output_idx).unwrap()]
-                .result_id
-            }
-            Value::DataInstOutput { inst, output_idx } => {
-                // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                assert_eq!(output_idx, 0);
-                parent_func.data_inst_output_ids[&inst]
+                if let Some(&data_inst_output_id) = parent_func.data_inst_output_ids.get(&node) {
+                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                    assert_eq!(output_idx, 0);
+                    data_inst_output_id
+                } else {
+                    parent_func.blocks[&CfgPoint::NodeExit(node)].phis
+                        [usize::try_from(output_idx).unwrap()]
+                    .result_id
+                }
             }
         };
 
@@ -1328,10 +1333,9 @@ impl LazyInst<'_, '_> {
             },
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
-                    NodeKind::Block { .. }
-                    | NodeKind::Select(_)
-                    | NodeKind::Loop { .. }
-                    | NodeKind::ExitInvocation(_) => unreachable!(),
+                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                        unreachable!()
+                    }
 
                     DataInstKind::Mem(_) | DataInstKind::QPtr(_) => {
                         // Disallowed while visiting.
@@ -1525,27 +1529,17 @@ impl Module {
                                 phis.iter()
                                     .map(|phi| LazyInst::OpPhi { parent_func: func_lifting, phi }),
                             )
-                            .chain(
-                                insts
-                                    .iter()
-                                    .copied()
-                                    .flat_map(move |insts| func_def_body.unwrap().at(insts))
-                                    .map(move |func_at_inst| {
-                                        let data_inst_def = func_at_inst.def();
-                                        LazyInst::DataInst {
-                                            parent_func: func_lifting,
-                                            // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                                            result_id: (data_inst_def.outputs.iter().at_most_one())
-                                                .ok()
-                                                .unwrap()
-                                                .map(|_| {
-                                                    func_lifting.data_inst_output_ids
-                                                        [&func_at_inst.position]
-                                                }),
-                                            data_inst_def,
-                                        }
-                                    }),
-                            )
+                            .chain(insts.iter().copied().map(move |inst| {
+                                let data_inst_def = func_def_body.unwrap().at(inst).def();
+                                LazyInst::DataInst {
+                                    parent_func: func_lifting,
+                                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                                    result_id: (data_inst_def.outputs.iter().at_most_one().ok())
+                                        .unwrap()
+                                        .map(|_| func_lifting.data_inst_output_ids[&inst]),
+                                    data_inst_def,
+                                }
+                            }))
                             .chain(terminator.merge.map(|merge| {
                                 LazyInst::Merge(match merge {
                                     Merge::Selection(merge) => {
