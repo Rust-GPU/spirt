@@ -20,7 +20,8 @@ use std::rc::Rc;
 pub mod analyze;
 pub mod const_data;
 // FIXME(eddyb) make this public?
-pub(crate) mod layout;
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
+pub mod layout;
 pub mod shapes;
 
 pub use layout::LayoutConfig;
