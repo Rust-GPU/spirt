@@ -781,8 +781,16 @@ impl<'a> GatherAccesses<'a> {
                                     .attrs
                             }
                             Value::NodeOutput { node, output_idx } => {
-                                &mut func_def_body.at_mut(node).def().outputs[output_idx as usize]
-                                    .attrs
+                                let node_def = func_def_body.at_mut(node).def();
+
+                                // HACK(eddyb) `NodeOutput { output_idx: !0, .. }`
+                                // may be used to attach errors to a whole `Node`.
+                                if output_idx == !0 {
+                                    assert!(accesses.is_err());
+                                    &mut node_def.attrs
+                                } else {
+                                    &mut node_def.outputs[output_idx as usize].attrs
+                                }
                             }
                             Value::DataInstOutput(data_inst) => {
                                 &mut func_def_body.at_mut(data_inst).def().attrs

@@ -1504,9 +1504,9 @@ impl<'a> Printer<'a> {
                             intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
                         });
 
-                        define(Use::AlignmentAnchorForNode(node), None);
+                        let NodeDef { attrs, kind, outputs } = func_at_node.def();
 
-                        let NodeDef { kind, outputs } = func_at_node.def();
+                        define(Use::AlignmentAnchorForNode(node), Some(*attrs));
 
                         if let NodeKind::Block { insts } = *kind {
                             for func_at_inst in func_def_body.at(insts) {
@@ -3796,7 +3796,9 @@ impl Print for FuncAt<'_, Node> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let node = self.position;
-        let NodeDef { kind, outputs } = self.def();
+        let NodeDef { attrs, kind, outputs } = self.def();
+
+        let attrs = attrs.print(printer);
 
         let outputs_header = if !outputs.is_empty() {
             let mut outputs = outputs.iter().enumerate().map(|(output_idx, output)| {
@@ -3927,11 +3929,11 @@ impl Print for FuncAt<'_, Node> {
                 inputs.iter().map(|v| v.print(printer)),
             ),
         };
-        pretty::Fragment::new([
+        let def_without_name = pretty::Fragment::new([
             Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
-            outputs_header,
             node_body,
-        ])
+        ]);
+        AttrsAndDef { attrs, def_without_name }.insert_name_before_def(outputs_header)
     }
 }
 

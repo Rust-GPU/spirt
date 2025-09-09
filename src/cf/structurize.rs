@@ -8,9 +8,9 @@ use crate::cf::unstructured::{
 };
 use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
-    AttrSet, Const, ConstDef, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap,
-    FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, Type, TypeKind, Value,
-    spv,
+    AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
+    FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, Type,
+    TypeKind, Value, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -190,6 +190,14 @@ enum StructurizeRegionState {
 /// **Note**: `target` has a generic type `T` to reduce redundancy when it's
 /// already implied (e.g. by the key in [`DeferredEdgeBundleSet`]'s map).
 struct IncomingEdgeBundle<T> {
+    /// Attributes from the original [`ControlInst`]s (likely debuginfo), kept
+    /// when merging only when exactly identical, which can naturally be the case
+    /// for debuginfo (e.g. for branches from inside `if`-`else`/`switch` to a
+    /// common merge point, just after the whole control-flow construct).
+    //
+    // FIXME(eddyb) semantically filter these, maybe focus on debuginfo?
+    attrs: AttrSet,
+
     target: T,
     accumulated_count: IncomingEdgeCount,
 
@@ -200,8 +208,8 @@ struct IncomingEdgeBundle<T> {
 
 impl<T> IncomingEdgeBundle<T> {
     fn with_target<U>(self, target: U) -> IncomingEdgeBundle<U> {
-        let IncomingEdgeBundle { target: _, accumulated_count, target_inputs } = self;
-        IncomingEdgeBundle { target, accumulated_count, target_inputs }
+        let IncomingEdgeBundle { attrs, target: _, accumulated_count, target_inputs } = self;
+        IncomingEdgeBundle { attrs, target, accumulated_count, target_inputs }
     }
 }
 
@@ -429,6 +437,7 @@ impl DeferredEdgeBundleSet {
         search_target: DeferredTarget,
     ) -> Option<DeferredEdgeBundle<()>> {
         let steal_edge_bundle = |edge_bundle: &mut IncomingEdgeBundle<()>| IncomingEdgeBundle {
+            attrs: edge_bundle.attrs,
             target: (),
             accumulated_count: edge_bundle.accumulated_count,
             target_inputs: mem::take(&mut edge_bundle.target_inputs),
@@ -520,6 +529,7 @@ impl DeferredEdgeBundleSet {
                         DeferredEdgeBundle {
                             condition: LazyCond::False,
                             edge_bundle: IncomingEdgeBundle {
+                                attrs: Default::default(),
                                 target: Default::default(),
                                 accumulated_count: Default::default(),
                                 target_inputs: Default::default(),
@@ -674,6 +684,7 @@ impl<'a> Structurizer<'a> {
             let func_entry_pseudo_edge = {
                 let target = self.func_def_body.body;
                 move || IncomingEdgeBundle {
+                    attrs: Default::default(),
                     target,
                     accumulated_count: IncomingEdgeCount::ONE,
                     target_inputs: [].into_iter().collect(),
@@ -900,6 +911,9 @@ impl<'a> Structurizer<'a> {
             let loop_node = self.func_def_body.nodes.define(
                 self.cx,
                 NodeDef {
+                    // FIXME(eddyb) could it be possible to synthesize attrs
+                    // from `ControlInst`s' attrs and/or `OpLoopMerge`'s?
+                    attrs: AttrSet::default(),
                     kind: NodeKind::Loop { initial_inputs, body, repeat_condition },
                     outputs: [].into_iter().collect(),
                 }
@@ -928,11 +942,13 @@ impl<'a> Structurizer<'a> {
         } else {
             target
         };
-        Ok(ClaimedRegion {
-            structured_body,
-            structured_body_inputs: edge_bundle.target_inputs,
-            deferred_edges,
-        })
+        let IncomingEdgeBundle { attrs, target: _, accumulated_count: _, target_inputs } =
+            edge_bundle;
+
+        // FIXME(eddyb) this loses `attrs`.
+        let _ = attrs;
+
+        Ok(ClaimedRegion { structured_body, structured_body_inputs: target_inputs, deferred_edges })
     }
 
     /// Structurize `region` by absorbing into it the entire CFG subgraph which
@@ -977,13 +993,11 @@ impl<'a> Structurizer<'a> {
         let mut deferred_edges = {
             let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
 
-            // FIXME(eddyb) this loses `attrs`.
-            let _ = attrs;
-
             let target_regions: SmallVec<[_; 8]> = targets
                 .iter()
                 .map(|&target| {
                     self.try_claim_edge_bundle(IncomingEdgeBundle {
+                        attrs: if targets.len() == 1 { attrs } else { AttrSet::default() },
                         target,
                         accumulated_count: IncomingEdgeCount::ONE,
                         target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
@@ -1023,6 +1037,9 @@ impl<'a> Structurizer<'a> {
 
             match kind {
                 ControlInstKind::Unreachable => {
+                    // FIXME(eddyb) this loses `attrs`.
+                    let _ = attrs;
+
                     assert_eq!((inputs.len(), target_regions.len()), (0, 0));
 
                     // FIXME(eddyb) this may result in lost optimizations over
@@ -1051,6 +1068,7 @@ impl<'a> Structurizer<'a> {
                     let node = self.func_def_body.nodes.define(
                         self.cx,
                         NodeDef {
+                            attrs,
                             kind: NodeKind::ExitInvocation { kind, inputs },
                             outputs: [].into_iter().collect(),
                         }
@@ -1069,6 +1087,7 @@ impl<'a> Structurizer<'a> {
                     DeferredEdgeBundleSet::Always {
                         target: DeferredTarget::Return,
                         edge_bundle: IncomingEdgeBundle {
+                            attrs,
                             accumulated_count: IncomingEdgeCount::default(),
                             target: (),
                             target_inputs: inputs,
@@ -1077,11 +1096,11 @@ impl<'a> Structurizer<'a> {
                 }
 
                 ControlInstKind::Branch => {
-                    assert_eq!((inputs.len(), target_regions.len()), (0, 1));
+                    assert_eq!(inputs.len(), 0);
 
                     self.append_maybe_claimed_region(
                         region,
-                        target_regions.into_iter().next().unwrap(),
+                        target_regions.into_iter().exactly_one().ok().unwrap(),
                     )
                 }
 
@@ -1090,7 +1109,7 @@ impl<'a> Structurizer<'a> {
 
                     let scrutinee = inputs[0];
 
-                    self.structurize_select_into(region, kind, Ok(scrutinee), target_regions)
+                    self.structurize_select_into(region, attrs, kind, Ok(scrutinee), target_regions)
                 }
             }
         };
@@ -1108,8 +1127,9 @@ impl<'a> Structurizer<'a> {
                     DeferredTarget::Return => return Err(deferred),
                 };
 
+                let edge_bundle_attrs = edge_bundle.attrs;
                 match self.try_claim_edge_bundle(edge_bundle) {
-                    Ok(claimed_region) => Ok((condition, claimed_region)),
+                    Ok(claimed_region) => Ok((edge_bundle_attrs, condition, claimed_region)),
 
                     Err(new_edge_bundle) => {
                         let new_target = DeferredTarget::Region(new_edge_bundle.target);
@@ -1120,13 +1140,14 @@ impl<'a> Structurizer<'a> {
                     }
                 }
             });
-            let Some((condition, then_region)) = claimed else {
+            let Some((branch_attrs, condition, then_region)) = claimed else {
                 deferred_edges = else_deferred_edges;
                 break;
             };
 
             deferred_edges = self.structurize_select_into(
                 region,
+                branch_attrs,
                 SelectionKind::BoolCond,
                 Err(&condition),
                 [Ok(then_region), Err(else_deferred_edges)].into_iter().collect(),
@@ -1168,6 +1189,8 @@ impl<'a> Structurizer<'a> {
     fn structurize_select_into(
         &mut self,
         parent_region: Region,
+        // FIXME(eddyb) semantically filter these, maybe focus on debuginfo?
+        attrs: AttrSet,
         kind: SelectionKind,
         scrutinee: Result<Value, &LazyCond>,
         mut cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
@@ -1194,7 +1217,7 @@ impl<'a> Structurizer<'a> {
             // "`Select` node insertion cursor" (into `parent_region`), and
             // stashing `convergent_case`'s deferred edges to return later.
             let deferred_edges =
-                self.structurize_select_into(parent_region, kind, scrutinee, cases);
+                self.structurize_select_into(parent_region, attrs, kind, scrutinee, cases);
             assert!(matches!(deferred_edges, DeferredEdgeBundleSet::Unreachable));
 
             // The sole convergent case goes in the `parent_region`, and its
@@ -1202,6 +1225,119 @@ impl<'a> Structurizer<'a> {
             // is only at most one of side-effect sequencing.
             return self.append_maybe_claimed_region(parent_region, convergent_case);
         }
+
+        // Extends a debug location "forward", from `initial_loc` (typically
+        // the location of the conditional branch/switch being structurized),
+        // to end at a later location in the same file, before any merge targets,
+        // but after all of the cases (i.e. returns `None` if the `Select` is
+        // made up of disjoint source ranges).
+        let extend_dbg_src_loc =
+            |this: &Self,
+             mut initial_loc: DbgSrcLoc,
+             cases: &[Result<ClaimedRegion, DeferredEdgeBundleSet>]| {
+                // HACK(eddyb) see comment on `if initial_start_line == start_line` below.
+                let mut shrink_initial_start_col = initial_loc.start_line_col.1;
+
+                let mut relevant_dbg_src_loc = |attrs: AttrSet| {
+                    attrs
+                        .dbg_src_loc(this.cx)
+                        .filter(|dbg_src_loc| {
+                            // FIXME(eddyb) walk up `inlined_callee_name_and_call_site`
+                            // in case `initial_loc` is e.g. next to some callsite.
+                            dbg_src_loc.file_path == initial_loc.file_path
+                                && dbg_src_loc.inlined_callee_name_and_call_site
+                                    == initial_loc.inlined_callee_name_and_call_site
+                        })
+                        .filter(|dbg_src_loc| {
+                            let (initial_start_line, initial_start_col) =
+                                initial_loc.start_line_col;
+                            let (start_line, start_col) = dbg_src_loc.start_line_col;
+
+                            if (initial_start_line, initial_start_col) <= (start_line, start_col) {
+                                return true;
+                            }
+
+                            // HACK(eddyb) this only exists because the debuginfo
+                            // emited by Rust-GPU for `if cond { ... } else { ... }`'s
+                            // conditional branch points to the start of `cond`,
+                            // instead of at the `if`, but the merges *do* point
+                            // at the whole `if` (or rather its start).
+                            if initial_start_line == start_line {
+                                shrink_initial_start_col = shrink_initial_start_col.min(start_col);
+                            }
+
+                            false
+                        })
+                };
+
+                let max_cases_line_col = cases
+                    .iter()
+                    .filter_map(|case| {
+                        let &ClaimedRegion { structured_body, .. } = case.as_ref().ok()?;
+                        // FIXME(eddyb) maybe there should be a `FuncAt<Region>`
+                        // helper for "debug locations from all `Block` `DataInst`s
+                        // and non-`Block` `Node`"? (i.e. only flattening `Block`s)
+                        this.func_def_body
+                            .at(structured_body)
+                            .at_children()
+                            .into_iter()
+                            .flat_map(|func_at_child| {
+                                let child_def = func_at_child.def();
+                                if let NodeKind::Block { insts } = child_def.kind {
+                                    Either::Left(
+                                        func_at_child
+                                            .at(insts)
+                                            .into_iter()
+                                            .map(|func_at_inst| func_at_inst.def().attrs),
+                                    )
+                                } else {
+                                    Either::Right([child_def.attrs].into_iter())
+                                }
+                            })
+                            .rev()
+                            .find_map(&mut relevant_dbg_src_loc)
+                            .map(|dbg_src_loc| dbg_src_loc.end_line_col)
+                    })
+                    .max();
+                let min_merges_line_col = cases
+                    .iter()
+                    .flat_map(|case| {
+                        let case_deferred_edges = match case {
+                            Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => {
+                                deferred_edges
+                            }
+                        };
+                        case_deferred_edges.iter_targets_with_edge_bundle().map(|(_, e)| e.attrs)
+                    })
+                    .filter_map(&mut relevant_dbg_src_loc)
+                    .map(|dbg_src_loc| dbg_src_loc.start_line_col)
+                    .min();
+
+                // HACK(eddyb) see comment on `if initial_start_line == start_line` above.
+                initial_loc.start_line_col.1 = shrink_initial_start_col;
+
+                // HACK(eddyb) prefers merges because otherwise the end location
+                // ends up pointing into one of the cases (e.g. at the end of
+                // `expr` in `if ... { ... } else { ... expr }`).
+                // FIXME(eddyb) this doesn't pan out because the merges point
+                // at the *start* of the `if` in Rust-GPU-emitted debuginfo
+                // currently (it's likely a range being shrunk to its start
+                // point - Rust-GPU's custom debuginfo could probably fix that).
+                let end_line_col =
+                    min_merges_line_col.or(max_cases_line_col).unwrap_or(initial_loc.end_line_col);
+
+                if let Some(max_cases_line_col) = max_cases_line_col {
+                    // NOTE(eddyb) can only realistically be the case if
+                    // some of the merges are inside a larger high-level
+                    // control-flow construct that doesn't map to fully
+                    // structured control-flow (e.g. `switch` fallthrough).
+                    if max_cases_line_col > end_line_col {
+                        return None;
+                    }
+                }
+
+                Some(DbgSrcLoc { end_line_col, ..initial_loc })
+            };
 
         // Support lazily defining the `Select` node, as soon as it's necessary
         // (i.e. to plumb per-case dataflow through `Value::NodeOutput`s),
@@ -1213,6 +1349,13 @@ impl<'a> Structurizer<'a> {
         let mut non_move_kind = Some(kind);
         let mut get_or_define_select_node = |this: &mut Self, cases: &[_]| {
             *cached_select_node.get_or_insert_with(|| {
+                let mut attrs = attrs;
+                if let Some(select_dbg_src_loc) = attrs.dbg_src_loc(this.cx)
+                    && let Some(dbg_src_loc) = extend_dbg_src_loc(this, select_dbg_src_loc, cases)
+                {
+                    attrs.set_dbg_src_loc(this.cx, dbg_src_loc);
+                }
+
                 let kind = non_move_kind.take().unwrap();
                 let cases = cases
                     .iter()
@@ -1235,6 +1378,7 @@ impl<'a> Structurizer<'a> {
                 let select_node = this.func_def_body.nodes.define(
                     this.cx,
                     NodeDef {
+                        attrs,
                         kind: NodeKind::Select { kind, scrutinee, cases },
                         outputs: [].into_iter().collect(),
                     }
@@ -1443,6 +1587,15 @@ impl<'a> Structurizer<'a> {
             DeferredEdgeBundle {
                 condition,
                 edge_bundle: IncomingEdgeBundle {
+                    // FIXME(eddyb) merge debug locations when attributes differ.
+                    attrs: per_case_deferred
+                        .iter()
+                        .filter_map(|d| d.as_ref().ok())
+                        .map(|e| e.edge_bundle.attrs)
+                        .unique()
+                        .exactly_one()
+                        .ok()
+                        .unwrap_or_default(),
                     target,
                     accumulated_count: total_edge_count,
                     target_inputs,
@@ -1500,7 +1653,8 @@ impl<'a> Structurizer<'a> {
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let NodeDef { kind, outputs: output_decls } = &mut *self.func_def_body.nodes[node];
+                let NodeDef { attrs: _, kind, outputs: output_decls } =
+                    &mut *self.func_def_body.nodes[node];
                 let cases = match kind {
                     NodeKind::Select { kind, scrutinee, cases } => {
                         assert_eq!(cases.len(), per_case_conds.len());
