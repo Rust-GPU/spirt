@@ -9,6 +9,7 @@
 
 use crate::spv::{self, spec};
 use crate::{Const, ConstKind, Context, NodeKind, Type, TypeKind, TypeOrConst, scalar, vector};
+use itertools::Itertools;
 use lazy_static::lazy_static;
 use smallvec::SmallVec;
 
@@ -17,12 +18,14 @@ macro_rules! def_mappable_ops {
     (
         type { $($ty_op:ident),+ $(,)? }
         const { $($ct_op:ident),+ $(,)? }
+        node { $($di_op:ident),+ $(,)? }
         $($enum_path:path { $($variant_op:ident <=> $variant:ident$(($($variant_args:tt)*))?),+ $(,)? })*
     ) => {
         #[allow(non_snake_case)]
         struct MappableOps {
             $($ty_op: spec::Opcode,)+
             $($ct_op: spec::Opcode,)+
+            $($di_op: spec::Opcode,)+
             $($($variant_op: spec::Opcode,)+)*
         }
         impl MappableOps {
@@ -35,6 +38,7 @@ macro_rules! def_mappable_ops {
                         MappableOps {
                             $($ty_op: spv_spec.instructions.lookup(stringify!($ty_op)).unwrap(),)+
                             $($ct_op: spv_spec.instructions.lookup(stringify!($ct_op)).unwrap(),)+
+                            $($di_op: spv_spec.instructions.lookup(stringify!($di_op)).unwrap(),)+
                             $($($variant_op: spv_spec.instructions.lookup(stringify!($variant_op)).unwrap(),)+)*
                         }
                     };
@@ -73,6 +77,11 @@ def_mappable_ops! {
         OpConstantFalse,
         OpConstantTrue,
         OpConstant,
+    }
+    node {
+        OpVectorExtractDynamic,
+        OpVectorInsertDynamic,
+        OpVectorTimesScalar,
     }
     scalar::BoolUnOp {
         OpLogicalNot <=> Not,
@@ -163,6 +172,11 @@ def_mappable_ops! {
         OpFUnordGreaterThan <=> CmpOrUnord(scalar::FloatCmp::Gt),
         OpFUnordLessThanEqual <=> CmpOrUnord(scalar::FloatCmp::Le),
         OpFUnordGreaterThanEqual <=> CmpOrUnord(scalar::FloatCmp::Ge),
+    }
+    vector::ReduceOp {
+        OpDot <=> Dot,
+        OpAny <=> Any,
+        OpAll <=> All,
     }
 }
 
@@ -410,7 +424,12 @@ impl spv::Inst {
     }
 
     // HACK(eddyb) exported to facilitate `OpSpecConstantOp` handling elsewhere.
-    pub fn as_canonical_node_kind(&self, cx: &Context, output_types: &[Type]) -> Option<NodeKind> {
+    pub fn as_canonical_node_kind(
+        &self,
+        cx: &Context,
+        output_types: impl ExactSizeIterator<Item = Type>,
+        input_types: impl ExactSizeIterator<Item = Type>,
+    ) -> Option<NodeKind> {
         let Self { opcode, imms } = self;
         let (&opcode, imms) = (opcode, &imms[..]);
 
@@ -423,16 +442,84 @@ impl spv::Inst {
         if let Some(op) = scalar_op {
             assert_eq!(imms.len(), 0);
 
-            // FIXME(eddyb) support vector versions of these ops as well.
-            if output_types.len() == op.output_count()
-                && output_types.iter().all(|ty| ty.as_scalar(cx).is_some())
-            {
-                Some(op.into())
+            let (_scalar_type, vec_elem_count) = (output_types.len() == op.output_count())
+                .then(|| {
+                    output_types.map(|ty| match cx[ty].kind {
+                        TypeKind::Scalar(ty) => Some((ty, None)),
+                        TypeKind::Vector(ty) => Some((ty.elem, Some(ty.elem_count))),
+                        _ => None,
+                    })
+                })
+                .and_then(|outputs| outputs.dedup().exactly_one().ok()?)?;
+
+            Some(if vec_elem_count.is_some() {
+                vector::Op::Distribute(op).into()
             } else {
-                None
-            }
+                op.into()
+            })
+        } else if let Some(op) = vector::ReduceOp::try_from_opcode(opcode).map(vector::Op::from) {
+            assert_eq!(imms.len(), 0);
+            Some(op.into())
         } else {
-            None
+            let wk = &spec::Spec::get().well_known;
+            let mo = MappableOps::get();
+
+            // FIXME(eddyb) automate this by supporting immediates in the macro.
+            let v_whole = |op| Some(vector::Op::Whole(op).into());
+            match imms {
+                // FIXME(eddyb) should these kind of checks be done here?
+                // (if so, other ops above don't check anywhere near as much)
+                [] if opcode == wk.OpCompositeConstruct => {
+                    output_types.exactly_one().ok()?.as_vector(cx).filter(|vec_ty| {
+                        input_types.len() == usize::from(vec_ty.elem_count.get())
+                            && input_types
+                                .map(|ty| ty.as_scalar(cx))
+                                .dedup()
+                                .exactly_one()
+                                .ok()
+                                .flatten()
+                                == Some(vec_ty.elem)
+                    })?;
+                    v_whole(vector::WholeOp::New)
+                }
+                &[spv::Imm::Short(_, elem_idx)] if opcode == wk.OpCompositeExtract => {
+                    let (vec_ty, _extracted_ty) = input_types
+                        .exactly_one()
+                        .ok()
+                        .and_then(|vec_ty| {
+                            Some((
+                                vec_ty.as_vector(cx)?,
+                                output_types.exactly_one().ok()?.as_scalar(cx)?,
+                            ))
+                        })
+                        .filter(|&(vec_ty, extracted_ty)| vec_ty.elem == extracted_ty)?;
+                    v_whole(vector::WholeOp::Extract {
+                        elem_idx: elem_idx
+                            .try_into()
+                            .ok()
+                            .filter(|&elem_idx| elem_idx < vec_ty.elem_count.get())?,
+                    })
+                }
+                &[spv::Imm::Short(_, elem_idx)] if opcode == wk.OpCompositeInsert => {
+                    let (vec_ty, _inserted_ty) = input_types
+                        .collect_tuple::<(_, _)>()
+                        .filter(|&(vec_ty, _)| Some(vec_ty) == output_types.exactly_one().ok())
+                        .and_then(|(vec_ty, inserted_ty)| {
+                            Some((vec_ty.as_vector(cx)?, inserted_ty.as_scalar(cx)?))
+                        })
+                        .filter(|&(vec_ty, inserted_ty)| vec_ty.elem == inserted_ty)?;
+                    v_whole(vector::WholeOp::Insert {
+                        elem_idx: elem_idx
+                            .try_into()
+                            .ok()
+                            .filter(|&elem_idx| elem_idx < vec_ty.elem_count.get())?,
+                    })
+                }
+                [] if opcode == mo.OpVectorExtractDynamic => v_whole(vector::WholeOp::DynExtract),
+                [] if opcode == mo.OpVectorInsertDynamic => v_whole(vector::WholeOp::DynInsert),
+                [] if opcode == mo.OpVectorTimesScalar => v_whole(vector::WholeOp::Mul),
+                _ => None,
+            }
         }
     }
 
@@ -446,7 +533,46 @@ impl spv::Inst {
                 scalar::Op::FloatUnary(op) => op.to_opcode().into(),
                 scalar::Op::FloatBinary(op) => op.to_opcode().into(),
             }),
-            _ => None,
+            &NodeKind::Vector(op) => Some(match op {
+                vector::Op::Distribute(op) => {
+                    Self::from_canonical_node_kind(&NodeKind::Scalar(op)).unwrap()
+                }
+                vector::Op::Reduce(op) => op.to_opcode().into(),
+                vector::Op::Whole(op) => {
+                    let wk = &spec::Spec::get().well_known;
+                    let mo = MappableOps::get();
+
+                    // FIXME(eddyb) automate this by supporting immediates in the macro.
+                    match op {
+                        vector::WholeOp::New => wk.OpCompositeConstruct.into(),
+                        vector::WholeOp::Extract { elem_idx } => spv::Inst {
+                            opcode: wk.OpCompositeExtract,
+                            imms: [spv::Imm::Short(wk.LiteralInteger, elem_idx.into())]
+                                .into_iter()
+                                .collect(),
+                        },
+                        vector::WholeOp::Insert { elem_idx } => spv::Inst {
+                            opcode: wk.OpCompositeInsert,
+                            imms: [spv::Imm::Short(wk.LiteralInteger, elem_idx.into())]
+                                .into_iter()
+                                .collect(),
+                        },
+                        vector::WholeOp::DynExtract => mo.OpVectorExtractDynamic.into(),
+                        vector::WholeOp::DynInsert => mo.OpVectorInsertDynamic.into(),
+                        vector::WholeOp::Mul => mo.OpVectorTimesScalar.into(),
+                    }
+                }
+            }),
+
+            NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_)
+            | NodeKind::FuncCall(_)
+            | NodeKind::Mem(_)
+            | NodeKind::QPtr(_)
+            | NodeKind::ThunkBind(_)
+            | NodeKind::SpvInst(..)
+            | NodeKind::SpvExtInst { .. } => None,
         }
     }
 }

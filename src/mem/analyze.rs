@@ -932,6 +932,7 @@ impl<'a> GatherAccesses<'a> {
                 }
 
                 DataInstKind::Scalar(_)
+                | DataInstKind::Vector(_)
                 | DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
@@ -951,7 +952,7 @@ impl<'a> GatherAccesses<'a> {
                     unreachable!()
                 }
 
-                DataInstKind::Scalar(_) => {}
+                DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
 
                 &DataInstKind::FuncCall(callee) => {
                     match self.gather_accesses_in_func(module, callee) {

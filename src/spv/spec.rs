@@ -129,6 +129,7 @@ def_well_known! {
         OpTypeSampledImage,
         OpTypeAccelerationStructureKHR,
 
+        // FIXME(eddyb) hide these from code, lowering should handle most cases.
         OpConstantComposite,
         OpConstantFunctionPointerINTEL,
 
@@ -160,6 +161,11 @@ def_well_known! {
         OpPtrAccessChain,
         OpInBoundsPtrAccessChain,
         OpBitcast,
+
+        // FIXME(eddyb) hide these from code, lowering should handle most cases.
+        OpCompositeInsert,
+        OpCompositeExtract,
+        OpCompositeConstruct,
     ],
     operand_kind: OperandKind = [
         Capability,

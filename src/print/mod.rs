@@ -31,7 +31,7 @@ use crate::{
     EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
     Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region,
-    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv,
+    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv, vector,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -3096,7 +3096,7 @@ impl Print for ConstDef {
 
         let kw = |kw| printer.declarative_keyword_style().apply(kw).into();
 
-        // FIXME(eddyb) should this just a method on `scalar::Const` instead?
+        // FIXME(eddyb) should this be a method on `scalar::Const` instead?
         let print_scalar = |ct: scalar::Const, include_type_suffix: bool| match ct {
             scalar::Const::FALSE => kw("false"),
             scalar::Const::TRUE => kw("true"),
@@ -3746,6 +3746,7 @@ impl Print for FuncAt<'_, Node> {
             ),
 
             DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::FuncCall(_)
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
@@ -3788,21 +3789,66 @@ impl FuncAt<'_, DataInst> {
 
         let mut output_type_to_print = output_type;
 
+        // FIXME(eddyb) should this be a method on `scalar::Op` instead?
+        let print_scalar = |op: scalar::Op| {
+            let name = op.name();
+            let (namespace_prefix, name) = name.split_at(name.find('.').unwrap() + 1);
+            pretty::Fragment::new([
+                printer
+                    .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                    .apply(namespace_prefix),
+                printer.declarative_keyword_style().apply(name),
+            ])
+        };
+
         let def_without_type = match kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                 unreachable!()
             }
 
-            &DataInstKind::Scalar(op) => {
-                let name = op.name();
+            &DataInstKind::Scalar(op) => pretty::Fragment::new([
+                print_scalar(op),
+                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+            ]),
+
+            &DataInstKind::Vector(op) => {
+                let (name, extra_last_input) = match op {
+                    vector::Op::Distribute(_) => ("vec.distribute", None),
+                    vector::Op::Reduce(op) => (op.name(), None),
+                    vector::Op::Whole(op) => (
+                        op.name(),
+                        match op {
+                            vector::WholeOp::Extract { elem_idx }
+                            | vector::WholeOp::Insert { elem_idx } => Some(
+                                printer.numeric_literal_style().apply(elem_idx.to_string()).into(),
+                            ),
+                            vector::WholeOp::New
+                            | vector::WholeOp::DynExtract
+                            | vector::WholeOp::DynInsert
+                            | vector::WholeOp::Mul => None,
+                        },
+                    ),
+                };
                 let (namespace_prefix, name) = name.split_at(name.find('.').unwrap() + 1);
-                pretty::Fragment::new([
+                let mut pretty_name = pretty::Fragment::new([
                     printer
                         .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
-                        .apply(namespace_prefix)
-                        .into(),
-                    printer.declarative_keyword_style().apply(name).into(),
-                    pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+                        .apply(namespace_prefix),
+                    printer.declarative_keyword_style().apply(name),
+                ]);
+                if let vector::Op::Distribute(op) = op {
+                    pretty_name = pretty::Fragment::new([
+                        pretty_name,
+                        pretty::join_comma_sep("(", [print_scalar(op)], ")"),
+                    ]);
+                }
+                pretty::Fragment::new([
+                    pretty_name,
+                    pretty::join_comma_sep(
+                        "(",
+                        inputs.iter().map(|v| v.print(printer)).chain(extra_last_input),
+                        ")",
+                    ),
                 ])
             }
 

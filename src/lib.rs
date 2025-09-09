@@ -1000,6 +1000,12 @@ pub enum NodeKind {
     #[from]
     Scalar(scalar::Op),
 
+    /// Vector (small array of [`scalar`]s) pure operations.
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    #[from]
+    Vector(vector::Op),
+
     FuncCall(Func),
 
     /// Memory-specific operations (see [`mem::MemOp`]).
