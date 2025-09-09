@@ -7,8 +7,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, print,
+    Module, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, RegionInputDecl, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -1058,11 +1058,12 @@ impl Module {
                                         attrs: AttrSet::default(),
                                         kind: DataInstKind::SpvInst(wk.OpNop.into()),
                                         inputs: [].into_iter().collect(),
-                                        output_type: None,
+                                        child_regions: [].into_iter().collect(),
+                                        outputs: [].into_iter().collect(),
                                     }
                                     .into(),
                                 );
-                                LocalIdDef::Value(Value::DataInstOutput(inst))
+                                LocalIdDef::Value(Value::DataInstOutput { inst, output_idx: 0 })
                             }
                         };
                         local_id_defs.insert(id, local_id_def);
@@ -1625,7 +1626,8 @@ impl Module {
                                 }
                             })
                             .collect::<io::Result<_>>()?,
-                        output_type: result_id
+                        child_regions: [].into_iter().collect(),
+                        outputs: result_id
                             .map(|_| {
                                 result_type.ok_or_else(|| {
                                     invalid(
@@ -1634,11 +1636,17 @@ impl Module {
                                     )
                                 })
                             })
-                            .transpose()?,
+                            .transpose()?
+                            .into_iter()
+                            .map(|ty| {
+                                // FIXME(eddyb) split attrs between output and inst.
+                                NodeOutputDecl { attrs: AttrSet::default(), ty }
+                            })
+                            .collect(),
                     };
                     let inst = match result_id {
                         Some(id) => match local_id_defs[&id] {
-                            LocalIdDef::Value(Value::DataInstOutput(inst)) => {
+                            LocalIdDef::Value(Value::DataInstOutput { inst, .. }) => {
                                 // A dummy was defined earlier, to be able to
                                 // have an entry in `local_id_defs`.
                                 func_def_body.data_insts[inst] = data_inst_def.into();

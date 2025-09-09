@@ -11,6 +11,7 @@ use crate::{
     ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type,
     TypeDef, TypeKind, TypeOrConst, Value,
 };
+use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -1022,7 +1023,7 @@ impl<'a> FuncLifting<'a> {
             .values()
             .flat_map(|block| block.insts.iter().copied())
             .flat_map(|insts| func_def_body.at(insts))
-            .filter(|&func_at_inst| func_at_inst.def().output_type.is_some())
+            .filter(|&func_at_inst| !func_at_inst.def().outputs.is_empty())
             .map(|func_at_inst| func_at_inst.position);
 
         Ok(Self {
@@ -1161,7 +1162,11 @@ impl LazyInst<'_, '_> {
                     [usize::try_from(output_idx).unwrap()]
                 .result_id
             }
-            Value::DataInstOutput(inst) => parent_func.data_inst_output_ids[&inst],
+            Value::DataInstOutput { inst, output_idx } => {
+                // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                assert_eq!(output_idx, 0);
+                parent_func.data_inst_output_ids[&inst]
+            }
         };
 
         let (result_id, attrs, _) = self.result_id_attrs_and_import(module, ids);
@@ -1318,9 +1323,9 @@ impl LazyInst<'_, '_> {
                 };
                 spv::InstWithIds {
                     without_ids: inst,
-                    result_type_id: data_inst_def
-                        .output_type
-                        .map(|ty| ids.globals[&Global::Type(ty)]),
+                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                    result_type_id: (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
+                        .map(|o| ids.globals[&Global::Type(o.ty)]),
                     result_id,
                     ids: extra_initial_id_operand
                         .into_iter()
@@ -1499,10 +1504,14 @@ impl Module {
                                         let data_inst_def = func_at_inst.def();
                                         LazyInst::DataInst {
                                             parent_func: func_lifting,
-                                            result_id: data_inst_def.output_type.map(|_| {
-                                                func_lifting.data_inst_output_ids
-                                                    [&func_at_inst.position]
-                                            }),
+                                            // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                                            result_id: (data_inst_def.outputs.iter().at_most_one())
+                                                .ok()
+                                                .unwrap()
+                                                .map(|_| {
+                                                    func_lifting.data_inst_output_ids
+                                                        [&func_at_inst.position]
+                                                }),
                                             data_inst_def,
                                         }
                                     }),

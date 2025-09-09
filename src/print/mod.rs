@@ -258,7 +258,10 @@ enum Use {
         node: Node,
         output_idx: u32,
     },
-    DataInstOutput(DataInst),
+    DataInstOutput {
+        inst: DataInst,
+        output_idx: u32,
+    },
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
@@ -273,7 +276,7 @@ impl From<Value> for Use {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
             Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
             Value::NodeOutput { node, output_idx } => Use::NodeOutput { node, output_idx },
-            Value::DataInstOutput(inst) => Use::DataInstOutput(inst),
+            Value::DataInstOutput { inst, output_idx } => Use::DataInstOutput { inst, output_idx },
         }
     }
 }
@@ -292,7 +295,7 @@ impl Use {
             Self::DbgScope { .. } => ("", "d"),
             Self::RegionLabel(_) => ("label", "L"),
 
-            Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput(_) => {
+            Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput { .. } => {
                 ("", "v")
             }
 
@@ -1066,7 +1069,7 @@ impl<'a> Printer<'a> {
                 if let Use::RegionLabel(_)
                 | Use::RegionInput { .. }
                 | Use::NodeOutput { .. }
-                | Use::DataInstOutput(_) = use_kind
+                | Use::DataInstOutput { .. } = use_kind
                 {
                     return (use_kind, UseStyle::Inline);
                 }
@@ -1101,7 +1104,7 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput(_)
+                    | Use::DataInstOutput { .. }
                     | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => unreachable!(),
@@ -1176,7 +1179,7 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput(_)
+                    | Use::DataInstOutput { .. }
                     | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => {
@@ -1202,7 +1205,7 @@ impl<'a> Printer<'a> {
                         | Use::RegionLabel(_)
                         | Use::RegionInput { .. }
                         | Use::NodeOutput { .. }
-                        | Use::DataInstOutput(_)
+                        | Use::DataInstOutput { .. }
                         | Use::AlignmentAnchorForRegion(_)
                         | Use::AlignmentAnchorForNode(_)
                         | Use::AlignmentAnchorForDataInst(_) => {
@@ -1511,10 +1514,13 @@ impl<'a> Printer<'a> {
                                     None,
                                 );
                                 let inst_def = func_at_inst.def();
-                                if inst_def.output_type.is_some() {
+                                for (i, output_decl) in inst_def.outputs.iter().enumerate() {
                                     define(
-                                        Use::DataInstOutput(func_at_inst.position),
-                                        Some(inst_def.attrs),
+                                        Use::DataInstOutput {
+                                            inst: func_at_inst.position,
+                                            output_idx: i.try_into().unwrap(),
+                                        },
+                                        Some(output_decl.attrs),
                                     );
                                 }
                             }
@@ -1548,7 +1554,9 @@ impl<'a> Printer<'a> {
                         (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::RegionInput { .. } | Use::NodeOutput { .. } | Use::DataInstOutput(_) => {
+                    Use::RegionInput { .. }
+                    | Use::NodeOutput { .. }
+                    | Use::DataInstOutput { .. } => {
                         (&mut value_counter, use_styles.get_mut(&use_kind))
                     }
 
@@ -2178,7 +2186,7 @@ impl Use {
                 | Self::RegionLabel(_)
                 | Self::RegionInput { .. }
                 | Self::NodeOutput { .. }
-                | Self::DataInstOutput(_) => "_".into(),
+                | Self::DataInstOutput { .. } => "_".into(),
 
                 Self::AlignmentAnchorForRegion(_)
                 | Self::AlignmentAnchorForNode(_)
@@ -3910,14 +3918,24 @@ impl Print for NodeOutputDecl {
 impl Print for FuncAt<'_, DataInst> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let DataInstDef { attrs, kind, inputs, output_type } = self.def();
+        let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.def();
+
+        assert_eq!(child_regions.len(), 0);
 
         let attrs = attrs.print(printer);
 
-        let mut output_use_to_print_as_lhs =
-            output_type.map(|_| Use::DataInstOutput(self.position));
+        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+        let output_type = if !outputs.is_empty() {
+            assert_eq!(outputs.len(), 1);
+            Some(outputs[0].ty)
+        } else {
+            None
+        };
 
-        let mut output_type_to_print = *output_type;
+        let mut output_use_to_print_as_lhs =
+            output_type.map(|_| Use::DataInstOutput { inst: self.position, output_idx: 0 });
+
+        let mut output_type_to_print = output_type;
 
         let def_without_type = match kind {
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([

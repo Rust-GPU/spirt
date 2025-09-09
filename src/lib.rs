@@ -852,10 +852,13 @@ pub use context::Node;
 ///
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
-pub struct NodeDef {
+pub struct NodeDef<
+    // HACK(eddyb) generic so `DataInstDef` can reuse it, pre-merger.
+    K = NodeKind,
+> {
     pub attrs: AttrSet,
 
-    pub kind: NodeKind,
+    pub kind: K,
 
     // FIXME(eddyb) change the inline size of this to fit most nodes.
     pub inputs: SmallVec<[Value; 2]>,
@@ -928,19 +931,10 @@ pub use context::DataInst;
 
 /// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
 //
-// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `NodeKind`,
-// but also `DataInst` vs `Node` is a purely artificial distinction.
-#[derive(Clone)]
-pub struct DataInstDef {
-    pub attrs: AttrSet,
-
-    pub kind: DataInstKind,
-
-    // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub inputs: SmallVec<[Value; 2]>,
-
-    pub output_type: Option<Type>,
-}
+// HACK(eddyb) temporarily reusing `NodeDef` pre-merger, with:
+// - `child_regions` always empty
+// - `outputs.len` always <= 1
+pub type DataInstDef = NodeDef<DataInstKind>;
 
 #[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum DataInstKind {
@@ -988,5 +982,9 @@ pub enum Value {
     },
 
     /// The output value of a [`DataInst`].
-    DataInstOutput(DataInst),
+    DataInstOutput {
+        inst: DataInst,
+        // HACK(eddyb) temporarily aligned with `NodeDef` pre-merger (always == 0).
+        output_idx: u32,
+    },
 }

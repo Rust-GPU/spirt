@@ -517,15 +517,16 @@ impl InnerVisit for NodeOutputDecl {
 
 impl InnerVisit for DataInstDef {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, output_type } = self;
+        let Self { attrs, kind, inputs, child_regions, outputs } = self;
 
         visitor.visit_attr_set_use(*attrs);
         kind.inner_visit_with(visitor);
         for v in inputs {
             visitor.visit_value_use(v);
         }
-        if let Some(ty) = *output_type {
-            visitor.visit_type_use(ty);
+        assert_eq!(child_regions.len(), 0);
+        for output in outputs {
+            output.inner_visit_with(visitor);
         }
     }
 }
@@ -582,7 +583,7 @@ impl InnerVisit for Value {
             Self::Const(ct) => visitor.visit_const_use(ct),
             Self::RegionInput { region: _, input_idx: _ }
             | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput(_) => {}
+            | Self::DataInstOutput { inst: _, output_idx: _ } => {}
         }
     }
 }

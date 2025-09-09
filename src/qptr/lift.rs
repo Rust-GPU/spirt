@@ -7,8 +7,8 @@ use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Trans
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
-    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, spv,
+    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, NodeOutputDecl, Type,
+    TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -431,7 +431,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) maybe all this data should be packaged up together in a
         // type with fields like those of `DeferredPtrNoop` (or even more).
         let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::DataInstOutput(v_data_inst) = v
+            if let Value::DataInstOutput { inst: v_data_inst, output_idx: 0 } = v
                 && let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst)
             {
                 return Ok((
@@ -460,22 +460,22 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
-                let mem_accesses = self.lifter.find_mem_accesses_attr(data_inst_def.attrs)?;
+                let mem_accesses =
+                    self.lifter.find_mem_accesses_attr(data_inst_def.outputs[0].attrs)?;
 
                 // FIXME(eddyb) validate against `mem_layout`!
                 let pointee_type = self.lifter.pointee_type_for_accesses(mem_accesses)?;
-                DataInstDef {
-                    attrs: self.lifter.strip_mem_accesses_attr(data_inst_def.attrs),
-                    kind: DataInstKind::SpvInst(spv::Inst {
-                        opcode: wk.OpVariable,
-                        imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
-                    }),
-                    inputs: data_inst_def.inputs.clone(),
-                    output_type: Some(
-                        self.lifter
-                            .spv_ptr_type(AddrSpace::SpvStorageClass(wk.Function), pointee_type),
-                    ),
-                }
+
+                let mut data_inst_def = data_inst_def.clone();
+                data_inst_def.kind = DataInstKind::SpvInst(spv::Inst {
+                    opcode: wk.OpVariable,
+                    imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
+                });
+                data_inst_def.outputs[0].attrs =
+                    self.lifter.strip_mem_accesses_attr(data_inst_def.outputs[0].attrs);
+                data_inst_def.outputs[0].ty =
+                    self.lifter.spv_ptr_type(AddrSpace::SpvStorageClass(wk.Function), pointee_type);
+                data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
                 let (addr_space, layout) =
@@ -496,12 +496,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     shapes::Handle::Opaque(ty) => ty,
                     shapes::Handle::Buffer(_, buf) => buf.original_type,
                 };
-                DataInstDef {
-                    attrs: data_inst_def.attrs,
-                    kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                    inputs: data_inst_def.inputs.clone(),
-                    output_type: Some(self.lifter.spv_ptr_type(addr_space, handle_type)),
-                }
+
+                let mut data_inst_def = data_inst_def.clone();
+                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.outputs[0].ty = self.lifter.spv_ptr_type(addr_space, handle_type);
+                data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::BufferData) => {
                 let buf_ptr = data_inst_def.inputs[0];
@@ -522,13 +521,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     },
                 );
 
-                DataInstDef {
-                    kind: QPtrOp::BufferData.into(),
-                    // FIXME(eddyb) avoid the repeated call to `type_of_val`,
-                    // maybe don't even replace the `QPtrOp::BufferData` instruction?
-                    output_type: Some(type_of_val(buf_ptr)),
-                    ..data_inst_def.clone()
-                }
+                // FIXME(eddyb) avoid the repeated call to `type_of_val`,
+                // maybe don't even replace the `QPtrOp::BufferData` instruction?
+                let mut data_inst_def = data_inst_def.clone();
+                data_inst_def.outputs[0].ty = type_of_val(buf_ptr);
+                data_inst_def
             }
             &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
                 let buf_ptr = data_inst_def.inputs[0];
@@ -645,6 +642,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
                 }
 
+                let mut data_inst_def = data_inst_def.clone();
                 if access_chain_inputs.len() == 1 {
                     self.deferred_ptr_noops.insert(
                         data_inst,
@@ -658,21 +656,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                     // FIXME(eddyb) avoid the repeated call to `type_of_val`,
                     // maybe don't even replace the `QPtrOp::Offset` instruction?
-                    DataInstDef {
-                        kind: QPtrOp::Offset(0).into(),
-                        output_type: Some(type_of_val(base_ptr)),
-                        ..data_inst_def.clone()
-                    }
+                    data_inst_def.kind = QPtrOp::Offset(0).into();
+                    data_inst_def.outputs[0].ty = type_of_val(base_ptr);
                 } else {
-                    DataInstDef {
-                        attrs: data_inst_def.attrs,
-                        kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                        inputs: access_chain_inputs,
-                        output_type: Some(
-                            self.lifter.spv_ptr_type(addr_space, layout.original_type),
-                        ),
-                    }
+                    data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                    data_inst_def.inputs = access_chain_inputs;
+                    data_inst_def.outputs[0].ty =
+                        self.lifter.spv_ptr_type(addr_space, layout.original_type);
                 }
+                data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
                 let base_ptr = data_inst_def.inputs[0];
@@ -745,18 +737,18 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         Components::Fields { layouts, .. } => layouts[idx].clone(),
                     };
                 }
-                DataInstDef {
-                    attrs: data_inst_def.attrs,
-                    kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                    inputs: access_chain_inputs,
-                    output_type: Some(self.lifter.spv_ptr_type(addr_space, layout.original_type)),
-                }
+                let mut data_inst_def = data_inst_def.clone();
+                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.inputs = access_chain_inputs;
+                data_inst_def.outputs[0].ty =
+                    self.lifter.spv_ptr_type(addr_space, layout.original_type);
+                data_inst_def
             }
             DataInstKind::Mem(op @ (MemOp::Load | MemOp::Store)) => {
                 // HACK(eddyb) `_` will match multiple variants soon.
                 #[allow(clippy::match_wildcard_for_single_variants)]
                 let (spv_opcode, access_type) = match op {
-                    MemOp::Load => (wk.OpLoad, data_inst_def.output_type.unwrap()),
+                    MemOp::Load => (wk.OpLoad, data_inst_def.outputs[0].ty),
                     MemOp::Store => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
                     _ => unreachable!(),
                 };
@@ -808,7 +800,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
 
                     new_data_inst_def.inputs[input_idx] =
-                        Value::DataInstOutput(access_chain_data_inst);
+                        Value::DataInstOutput { inst: access_chain_data_inst, output_idx: 0 };
                 }
 
                 new_data_inst_def
@@ -883,12 +875,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
 
                     new_data_inst_def.inputs[input_idx] =
-                        Value::DataInstOutput(access_chain_data_inst);
+                        Value::DataInstOutput { inst: access_chain_data_inst, output_idx: 0 };
                 }
 
                 if let Some((addr_space, pointee_type)) = from_spv_ptr_output {
-                    new_data_inst_def.output_type =
-                        Some(self.lifter.spv_ptr_type(addr_space, pointee_type));
+                    new_data_inst_def.outputs[0].ty =
+                        self.lifter.spv_ptr_type(addr_space, pointee_type);
                 }
 
                 new_data_inst_def
@@ -1004,7 +996,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 attrs: Default::default(),
                 kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
                 inputs: access_chain_inputs,
-                output_type: Some(self.lifter.spv_ptr_type(addr_space, access_type)),
+                child_regions: [].into_iter().collect(),
+                outputs: [NodeOutputDecl {
+                    attrs: Default::default(),
+                    ty: self.lifter.spv_ptr_type(addr_space, access_type),
+                }]
+                .into_iter()
+                .collect(),
             })
         } else {
             None
@@ -1020,8 +1018,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         for v in values {
             // FIXME(eddyb) the loop could theoretically be avoided, but that'd
             // make tracking use counts harder.
-            while let Value::DataInstOutput(data_inst) = *v {
-                match self.deferred_ptr_noops.get(&data_inst) {
+            while let Value::DataInstOutput { inst, output_idx: 0 } = *v {
+                match self.deferred_ptr_noops.get(&inst) {
                     Some(ptr_noop) => {
                         *v = ptr_noop.output_pointer;
                     }
@@ -1035,8 +1033,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
     fn add_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::DataInstOutput(data_inst) = v {
-                let count = self.data_inst_use_counts.entry(data_inst);
+            if let Value::DataInstOutput { inst, .. } = v {
+                let count = self.data_inst_use_counts.entry(inst);
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
                 );
@@ -1045,8 +1043,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     }
     fn remove_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::DataInstOutput(data_inst) = v {
-                let count = self.data_inst_use_counts.entry(data_inst);
+            if let Value::DataInstOutput { inst, .. } = v {
+                let count = self.data_inst_use_counts.entry(inst);
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }
         }
@@ -1097,12 +1095,15 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                     if let DataInstKind::QPtr(_) = data_inst_def.kind {
                         lifted =
                             Err(LiftError(Diag::bug(["unimplemented qptr instruction".into()])));
-                    } else if let Some(ty) = data_inst_def.output_type
-                        && matches!(self.lifter.cx[ty].kind, TypeKind::QPtr)
-                    {
-                        lifted = Err(LiftError(Diag::bug([
-                            "unimplemented qptr-producing instruction".into(),
-                        ])));
+                    } else {
+                        for output in &data_inst_def.outputs {
+                            if matches!(self.lifter.cx[output.ty].kind, TypeKind::QPtr) {
+                                lifted = Err(LiftError(Diag::bug([
+                                    "unimplemented qptr-producing instruction".into(),
+                                ])));
+                                break;
+                            }
+                        }
                     }
                 }
                 match lifted {

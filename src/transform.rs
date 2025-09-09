@@ -687,15 +687,16 @@ impl InnerTransform for NodeOutputDecl {
 
 impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let DataInstDef { attrs, kind, inputs, output_type } = self.reborrow().def();
+        let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.reborrow().def();
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         kind.inner_in_place_transform_with(transformer);
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
         }
-        if let Some(output_type) = output_type {
-            transformer.transform_type_use(*output_type).apply_to(output_type);
+        assert_eq!(child_regions.len(), 0);
+        for output in outputs {
+            output.inner_transform_with(transformer).apply_to(output);
         }
     }
 }
@@ -755,7 +756,7 @@ impl InnerTransform for Value {
 
             Self::RegionInput { region: _, input_idx: _ }
             | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput(_) => Transformed::Unchanged,
+            | Self::DataInstOutput { inst: _, output_idx: _ } => Transformed::Unchanged,
         }
     }
 }
