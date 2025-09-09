@@ -234,9 +234,14 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         attr.inner_visit_with(self);
     }
 
-    fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
+    fn visit_data_inst_def(&mut self, func_at_inst: FuncAt<'_, DataInst>) {
         #[allow(clippy::match_same_arms)]
-        match data_inst_def.kind {
+        match func_at_inst.def().kind {
+            NodeKind::Block { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => unreachable!(),
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::Mem(_) => {
@@ -256,7 +261,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
             }
         }
-        data_inst_def.inner_visit_with(self);
+        func_at_inst.inner_visit_with(self);
     }
 }
 
@@ -473,6 +478,12 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 NodeKind::Select { .. }
                 | NodeKind::Loop { .. }
                 | NodeKind::ExitInvocation { .. } => None,
+
+                DataInstKind::FuncCall(_)
+                | DataInstKind::Mem(_)
+                | DataInstKind::QPtr(_)
+                | DataInstKind::SpvInst(_)
+                | DataInstKind::SpvExtInst { .. } => unreachable!(),
             },
 
             // Exiting a `Node` chains to a sibling/parent.
@@ -772,6 +783,12 @@ impl<'a> FuncLifting<'a> {
                             target_phi_values: FxIndexMap::default(),
                             merge: None,
                         },
+
+                        DataInstKind::FuncCall(_)
+                        | DataInstKind::Mem(_)
+                        | DataInstKind::QPtr(_)
+                        | DataInstKind::SpvInst(_)
+                        | DataInstKind::SpvExtInst { .. } => unreachable!(),
                     }
                 }
 
@@ -846,6 +863,12 @@ impl<'a> FuncLifting<'a> {
                                 }
                             }
                         }
+
+                        DataInstKind::FuncCall(_)
+                        | DataInstKind::Mem(_)
+                        | DataInstKind::QPtr(_)
+                        | DataInstKind::SpvInst(_)
+                        | DataInstKind::SpvExtInst { .. } => unreachable!(),
                     }
                 }
 
@@ -1343,8 +1366,15 @@ impl LazyInst<'_, '_> {
             },
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
-                    // Disallowed while visiting.
-                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
+                    NodeKind::Block { .. }
+                    | NodeKind::Select(_)
+                    | NodeKind::Loop { .. }
+                    | NodeKind::ExitInvocation(_) => unreachable!(),
+
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => {
+                        // Disallowed while visiting.
+                        unreachable!()
+                    }
 
                     &DataInstKind::FuncCall(callee) => {
                         (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))

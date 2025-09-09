@@ -922,6 +922,11 @@ impl<'a> GatherAccesses<'a> {
                     });
                 };
                 match &data_inst_def.kind {
+                    NodeKind::Block { .. }
+                    | NodeKind::Select(_)
+                    | NodeKind::Loop { .. }
+                    | NodeKind::ExitInvocation(_) => unreachable!(),
+
                     &DataInstKind::FuncCall(callee) => {
                         match self.gather_accesses_in_func(module, callee) {
                             FuncGatherAccessesState::Complete(callee_results) => {

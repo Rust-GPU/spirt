@@ -484,11 +484,11 @@ impl<K: EntityOrientedMapKey<V>, V> std::ops::IndexMut<K> for EntityOrientedDens
 /// [`EntityListNode<E, _>`] (to hold the "previous/next node" links).
 ///
 /// Fields are private to avoid arbitrary user interactions.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct EntityList<E: sealed::Entity>(Option<FirstLast<E, E>>);
 
 // HACK(eddyb) this only exists to give field names to the non-empty case.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct FirstLast<F, L> {
     first: F,
     last: L,
@@ -957,5 +957,4 @@ entities! {
     Func => chunk_size(0x1_0000) crate::FuncDecl,
     Region => chunk_size(0x1000) crate::RegionDef,
     Node => chunk_size(0x1000) EntityListNode<Node, crate::NodeDef>,
-    DataInst => chunk_size(0x1000) EntityListNode<DataInst, crate::DataInstDef>,
 }
