@@ -10,7 +10,7 @@ use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
     FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, Type,
-    TypeKind, Value, spv,
+    TypeKind, Value, VarKind, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -72,20 +72,20 @@ pub struct Structurizer<'a> {
     structurize_region_state: FxIndexMap<Region, StructurizeRegionState>,
 
     /// Accumulated rewrites (caused by e.g. `target_inputs`s, but not only),
-    /// i.e.: `Value::RegionInput { region, input_idx }` must be
+    /// i.e.: `VarKind::RegionInput { region, input_idx }` must be
     /// rewritten based on `region_input_rewrites[region]`, as either
     /// the original `region` wasn't reused, or its inputs were renumbered.
     region_input_rewrites: EntityOrientedDenseMap<Region, RegionInputRewrites>,
 }
 
-/// How all `Value::RegionInput { region, input_idx }` for a `region`
+/// How all `VarKind::RegionInput { region, input_idx }` for a `region`
 /// must be rewritten (see also `region_input_rewrites` docs).
 enum RegionInputRewrites {
     /// Complete replacement with another value (which can take any form), as
     /// `region` wasn't kept in its original form in the final structured IR.
     ///
     /// **Note**: such replacement can be chained, i.e. a replacement value can
-    /// be `Value::RegionInput { region: other_region, .. }`, and then
+    /// be `VarKind::RegionInput { region: other_region, .. }`, and then
     /// `other_region` itself may have its inputs written.
     ReplaceWith(SmallVec<[Value; 2]>),
 
@@ -119,7 +119,7 @@ impl RegionInputRewrites {
 
         ReplaceValueWith(move |v| {
             let mut new_v = v;
-            while let Value::RegionInput { region, input_idx } = new_v {
+            while let Value::Var(VarKind::RegionInput { region, input_idx }) = new_v {
                 match rewrites.get(region) {
                     // NOTE(eddyb) this needs to be able to apply multiple replacements,
                     // due to the input potentially having redundantly chained `OpPhi`s.
@@ -135,7 +135,7 @@ impl RegionInputRewrites {
                         renumbering_and_replacements,
                     )) => match renumbering_and_replacements[input_idx as usize] {
                         Ok(new_idx) => {
-                            new_v = Value::RegionInput { region, input_idx: new_idx };
+                            new_v = Value::Var(VarKind::RegionInput { region, input_idx: new_idx });
                             break;
                         }
                         Err(replacement) => new_v = replacement,
@@ -201,7 +201,7 @@ struct IncomingEdgeBundle<T> {
     target: T,
     accumulated_count: IncomingEdgeCount,
 
-    /// The [`Value`]s that `Value::RegionInput { region, .. }` will get
+    /// The [`Value`]s that `VarKind::RegionInput { region, .. }` will get
     /// on entry into `region`, through this "edge bundle".
     target_inputs: SmallVec<[Value; 2]>,
 }
@@ -268,7 +268,7 @@ impl<T> DeferredEdgeBundle<T> {
 
 /// A recipe for computing a control-flow-sensitive (boolean) condition [`Value`],
 /// potentially requiring merging through an arbitrary number of `Select`s
-/// (via per-case outputs and [`Value::NodeOutput`], for each `Select`).
+/// (via per-case outputs and [`VarKind::NodeOutput`], for each `Select`).
 ///
 /// This should largely be equivalent to eagerly generating all region outputs
 /// that might be needed, and then removing the unused ones, but this way we
@@ -573,11 +573,11 @@ struct ClaimedRegion {
     // perspective of being "inside" `structured_body` (wrt hermeticity).
     structured_body: Region,
 
-    /// The [`Value`]s that `Value::RegionInput { region: structured_body, .. }`
+    /// The [`Value`]s that `VarKind::RegionInput { region: structured_body, .. }`
     /// will get on entry into `structured_body`, when this region ends up
     /// merged into a larger region, or as a child of a new [`Node`].
     //
-    // FIXME(eddyb) don't replace `Value::RegionInput { region: structured_body, .. }`
+    // FIXME(eddyb) don't replace `VarKind::RegionInput { region: structured_body, .. }`
     // with `region_inputs` when `structured_body` ends up a `Node` child,
     // but instead make all `Region`s entirely hermetic wrt inputs.
     structured_body_inputs: SmallVec<[Value; 2]>,
@@ -768,7 +768,7 @@ impl<'a> Structurizer<'a> {
         // while structurizing (i.e. `region_input_rewrites`).
         //
         // FIXME(eddyb) obsolete this by fully taking advantage of hermeticity,
-        // and only replacing `Value::RegionInput { region, .. }` within
+        // and only replacing `VarKind::RegionInput { region, .. }` within
         // `region`'s children, shallowly, whenever `region` gets claimed.
         self.func_def_body.inner_in_place_transform_with(&mut RegionInputRewrites::rewrite_all(
             &self.region_input_rewrites,
@@ -880,21 +880,24 @@ impl<'a> Structurizer<'a> {
 
                         let original_idx = u32::try_from(original_idx).unwrap();
                         if backedge_value
-                            == (Value::RegionInput { region: body, input_idx: original_idx })
+                            == Value::Var(VarKind::RegionInput {
+                                region: body,
+                                input_idx: original_idx,
+                            })
                         {
                             // FIXME(eddyb) does this have to be general purpose,
                             // or could this be handled as `None` with a single
                             // `wrapper_region` per `RegionInputRewrites`?
-                            Err(Value::RegionInput {
+                            Err(Value::Var(VarKind::RegionInput {
                                 region: wrapper_region,
                                 input_idx: original_idx,
-                            })
+                            }))
                         } else {
                             let renumbered_idx = u32::try_from(body_def.inputs.len()).unwrap();
-                            initial_inputs.push(Value::RegionInput {
+                            initial_inputs.push(Value::Var(VarKind::RegionInput {
                                 region: wrapper_region,
                                 input_idx: original_idx,
-                            });
+                            }));
                             body_def.inputs.push(original_input_decls[original_idx as usize]);
                             body_def.outputs.push(backedge_value);
                             Ok(renumbered_idx)
@@ -1329,7 +1332,7 @@ impl<'a> Structurizer<'a> {
             };
 
         // Support lazily defining the `Select` node, as soon as it's necessary
-        // (i.e. to plumb per-case dataflow through `Value::NodeOutput`s),
+        // (i.e. to plumb per-case dataflow through `VarKind::NodeOutput`s),
         // but also if any of the cases actually have non-empty regions, which
         // is checked after the special-cases (which return w/o a `Select` at all).
         //
@@ -1419,7 +1422,7 @@ impl<'a> Structurizer<'a> {
         // only get applied after structurization fully completes, but here it's
         // very useful to have the fully resolved values across all `cases`'
         // incoming/outgoing edges (note, however, that within outgoing edges,
-        // i.e. `case_deferred_edges`' `target_inputs`, `Value::RegionInput`
+        // i.e. `case_deferred_edges`' `target_inputs`, `VarKind::RegionInput`
         // are not resolved using the contents of `case_structured_body_inputs`,
         // which is kept hermetic until just before `structurize_select` returns).
         for case in &mut cases {
@@ -1496,12 +1499,12 @@ impl<'a> Structurizer<'a> {
                                     ..
                                 }) => match v {
                                     Value::Const(_) => Ok(v),
-                                    Value::RegionInput { region, input_idx }
+                                    Value::Var(VarKind::RegionInput { region, input_idx })
                                         if region == *structured_body =>
                                     {
                                         Ok(structured_body_inputs[input_idx as usize])
                                     }
-                                    _ => Err(()),
+                                    Value::Var(_) => Err(()),
                                 },
 
                                 // `case` has no region of its own, so everything
@@ -1544,10 +1547,10 @@ impl<'a> Structurizer<'a> {
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
                     }
-                    Value::NodeOutput {
+                    Value::Var(VarKind::NodeOutput {
                         node: select_node,
                         output_idx: output_idx.try_into().unwrap(),
-                    }
+                    })
                 })
                 .collect();
 
@@ -1596,7 +1599,7 @@ impl<'a> Structurizer<'a> {
         // Only as the very last step, can per-case `region_inputs` be added to
         // `region_input_rewrites`.
         //
-        // FIXME(eddyb) don't replace `Value::RegionInput { region, .. }`
+        // FIXME(eddyb) don't replace `VarKind::RegionInput { region, .. }`
         // with `region_inputs` when the `region` ends up a `Node` child,
         // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
@@ -1678,7 +1681,7 @@ impl<'a> Structurizer<'a> {
                     assert_eq!(outputs.len(), output_decls.len());
                 }
 
-                Value::NodeOutput { node, output_idx }
+                Value::Var(VarKind::NodeOutput { node, output_idx })
             }
         }
     }

@@ -13,7 +13,7 @@
 
 use crate::{
     Context, EntityDefs, EntityList, EntityListIter, FuncDefBody, Node, NodeDef, Region, RegionDef,
-    Type, Value,
+    Type, Value, Var, VarKind,
 };
 
 /// Immutable traversal (i.e. visiting) helper for intra-function entities.
@@ -81,10 +81,19 @@ impl FuncAt<'_, Value> {
     pub fn type_of(self, cx: &Context) -> Type {
         match self.position {
             Value::Const(ct) => cx[ct].ty,
-            Value::RegionInput { region, input_idx } => {
+            Value::Var(var) => self.at(var).type_of(),
+        }
+    }
+}
+
+impl FuncAt<'_, Var> {
+    /// Return the [`Type`] of this [`Var`].
+    pub fn type_of(self) -> Type {
+        match self.position {
+            VarKind::RegionInput { region, input_idx } => {
                 self.at(region).def().inputs[input_idx as usize].ty
             }
-            Value::NodeOutput { node, output_idx } => {
+            VarKind::NodeOutput { node, output_idx } => {
                 self.at(node).def().outputs[output_idx as usize].ty
             }
         }

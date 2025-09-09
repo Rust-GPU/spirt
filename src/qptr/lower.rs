@@ -7,7 +7,7 @@ use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, Type, TypeKind, TypeOrConst, Value, spv,
+    Region, Type, TypeKind, TypeOrConst, Value, VarKind, spv,
 };
 use itertools::Itertools as _;
 use smallvec::SmallVec;
@@ -284,7 +284,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let const_idx_as_i32 = |idx| match idx {
             // FIXME(eddyb) figure out the signedness semantics here.
             Value::Const(idx) => self.lowerer.const_as_u32(idx).map(|idx_u32| idx_u32 as i32),
-            _ => None,
+            Value::Var(_) => None,
         };
 
         let mut steps: SmallVec<[QPtrChainStep; 4]> = SmallVec::new();
@@ -576,7 +576,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     func.nodes,
                 );
 
-                ptr = Value::NodeOutput { node: step_data_inst, output_idx: 0 };
+                ptr = Value::Var(VarKind::NodeOutput { node: step_data_inst, output_idx: 0 });
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
         } else if spv_inst.opcode == wk.OpBitcast {
