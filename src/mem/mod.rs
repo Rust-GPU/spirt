@@ -29,6 +29,9 @@ pub use layout::LayoutConfig;
 pub enum MemAttr {
     /// When applied to a `GlobalVar` or `FuncLocalVar`, this tracks all possible
     /// access patterns its memory may be subjected to (see [`MemAccesses`]).
+    //
+    // FIXME(eddyb) either document that `qptr` offsetting ops also get this
+    // attribute applied to them, or undo that change entirely.
     Accesses(OrdAssertEq<MemAccesses>),
 }
 
