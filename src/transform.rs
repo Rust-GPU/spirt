@@ -465,7 +465,7 @@ impl InnerTransform for TypeDef {
                 | TypeKind::SpvTypeOperand
                 | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, value_lowering } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
                     |ty_or_ct| match *ty_or_ct {
                         TypeOrConst::Type(ty) => transform!({
@@ -479,6 +479,7 @@ impl InnerTransform for TypeDef {
                 ).map(|new_iter| TypeKind::SpvInst {
                     spv_inst: spv_inst.clone(),
                     type_and_const_inputs: new_iter.collect(),
+                    value_lowering: value_lowering.clone(),
                 }),
             },
         } => Self {
@@ -576,10 +577,12 @@ impl InnerInPlaceTransform for GlobalVarDefBody {
 
 impl InnerInPlaceTransform for FuncDecl {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        transformer.transform_type_use(*ret_type).apply_to(ret_type);
+        for ty in ret_types {
+            transformer.transform_type_use(*ty).apply_to(ty);
+        }
         for param in params {
             param.inner_transform_with(transformer).apply_to(param);
         }
@@ -673,9 +676,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. },
             )
-            | DataInstKind::ThunkBind(_)
-            | DataInstKind::SpvInst(_)
-            | DataInstKind::SpvExtInst { .. } => {}
+            | DataInstKind::ThunkBind(_) => {}
+
+            DataInstKind::SpvInst(_, lowering)
+            | DataInstKind::SpvExtInst { ext_set: _, inst: _, lowering } => {
+                lowering.inner_in_place_transform_with(transformer);
+            }
         }
 
         for v in &mut self.reborrow().def().inputs {
@@ -709,6 +715,19 @@ impl InnerInPlaceTransform for VarDecl {
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         transformer.transform_type_use(*ty).apply_to(ty);
+    }
+}
+
+impl InnerInPlaceTransform for spv::InstLowering {
+    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
+        let Self { disaggregated_output, disaggregated_inputs } = self;
+
+        if let Some(disaggregated_output) = disaggregated_output {
+            transformer.transform_type_use(*disaggregated_output).apply_to(disaggregated_output);
+        }
+        for (_range, ty) in disaggregated_inputs {
+            transformer.transform_type_use(*ty).apply_to(ty);
+        }
     }
 }
 

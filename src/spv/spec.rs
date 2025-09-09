@@ -132,6 +132,7 @@ def_well_known! {
 
         // FIXME(eddyb) hide these from code, lowering should handle most cases.
         OpConstantComposite,
+        OpSpecConstantComposite,
         OpConstantFunctionPointerINTEL,
 
         OpVariable,
@@ -153,6 +154,7 @@ def_well_known! {
         OpSwitch,
 
         OpFunctionCall,
+        OpFunctionPointerCallINTEL,
 
         OpLoad,
         OpStore,

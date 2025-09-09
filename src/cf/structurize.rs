@@ -600,15 +600,7 @@ impl<'a> Structurizer<'a> {
             const_true,
             const_false,
 
-            func_ret_types: {
-                let is_void = match &cx[func_decl.ret_type].kind {
-                    TypeKind::SpvInst { spv_inst, .. } => {
-                        spv_inst.opcode == crate::spv::spec::Spec::get().well_known.OpTypeVoid
-                    }
-                    _ => false,
-                };
-                if is_void { &[][..] } else { std::slice::from_ref(&func_decl.ret_type) }
-            },
+            func_ret_types: &func_decl.ret_types,
             func_def_body,
 
             loop_header_to_exit_targets,
