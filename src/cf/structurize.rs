@@ -6,11 +6,11 @@ use crate::cf::SelectionKind;
 use crate::cf::unstructured::{
     ControlFlowGraph, ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder, TraversalState,
 };
-use crate::transform::{InnerInPlaceTransform as _, Transformer};
+use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
-    FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, Type,
-    TypeKind, Value, VarKind, spv,
+    FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, Region, RegionDef, Type, TypeKind, Value, Var,
+    VarDecl, VarKind, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -71,80 +71,33 @@ pub struct Structurizer<'a> {
     // FIXME(eddyb) use `EntityOrientedDenseMap` (which lacks iteration by design).
     structurize_region_state: FxIndexMap<Region, StructurizeRegionState>,
 
-    /// Accumulated rewrites (caused by e.g. `target_inputs`s, but not only),
-    /// i.e.: `VarKind::RegionInput { region, input_idx }` must be
-    /// rewritten based on `region_input_rewrites[region]`, as either
-    /// the original `region` wasn't reused, or its inputs were renumbered.
-    region_input_rewrites: EntityOrientedDenseMap<Region, RegionInputRewrites>,
+    // FIXME(eddyb) perhaps come up with a centralized abstraction for this
+    // (in theory `VarDecl`s could indicate aliases, but that's a tradeoff).
+    var_replacements: EntityOrientedDenseMap<Var, Value>,
 }
 
-/// How all `VarKind::RegionInput { region, input_idx }` for a `region`
-/// must be rewritten (see also `region_input_rewrites` docs).
-enum RegionInputRewrites {
-    /// Complete replacement with another value (which can take any form), as
-    /// `region` wasn't kept in its original form in the final structured IR.
-    ///
-    /// **Note**: such replacement can be chained, i.e. a replacement value can
-    /// be `VarKind::RegionInput { region: other_region, .. }`, and then
-    /// `other_region` itself may have its inputs written.
-    ReplaceWith(SmallVec<[Value; 2]>),
+// FIXME(eddyb) maybe this should be provided by `transform`.
+struct VarReplacer<'a>(&'a EntityOrientedDenseMap<Var, Value>);
+impl Transformer for VarReplacer<'_> {
+    fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
+        let mut new_v = *v;
 
-    /// The value may remain an input of the same `region`, only changing its
-    /// `input_idx` (e.g. if indices need compaction after removing some inputs),
-    /// or get replaced anyway, depending on the `Result` for `input_idx`.
-    ///
-    /// **Note**: renumbering can only be the last rewrite step of a value,
-    /// as `region` must've been chosen to be kept in the final structured IR,
-    /// but the `Err` cases are transitive just like `ReplaceWith`.
-    //
-    // FIXME(eddyb) this is a bit silly, maybe try to rely more on hermeticity
-    // to get rid of this?
-    RenumberOrReplaceWith(SmallVec<[Result<u32, Value>; 2]>),
-}
-
-impl RegionInputRewrites {
-    // HACK(eddyb) this is here because it depends on a field of `Structurizer`
-    // and borrowing issues ensue if it's made a method of `Structurizer`.
-    fn rewrite_all(
-        rewrites: &EntityOrientedDenseMap<Region, Self>,
-    ) -> impl crate::transform::Transformer + '_ {
-        // FIXME(eddyb) maybe this should be provided by `transform`.
-        use crate::transform::*;
-        struct ReplaceValueWith<F>(F);
-        impl<F: Fn(Value) -> Option<Value>> Transformer for ReplaceValueWith<F> {
-            fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
-                self.0(*v).map_or(Transformed::Unchanged, Transformed::Changed)
-            }
+        // NOTE(eddyb) this needs to be able to apply multiple replacements,
+        // due to the input potentially having redundantly chained `OpPhi`s.
+        //
+        // FIXME(eddyb) union-find-style "path compression" could record the
+        // final value inside `self.0` while replacements are being made,
+        // (e.g. using the type `EntityOrientedDenseMap<Var, Cell<Value>>`?)
+        // to avoid going through a chain more than once (and some of these
+        // replacements could also be applied early).
+        while let Value::Var(var) = new_v {
+            new_v = match self.0.get(var) {
+                Some(&v) => v,
+                None => break,
+            };
         }
 
-        ReplaceValueWith(move |v| {
-            let mut new_v = v;
-            while let Value::Var(VarKind::RegionInput { region, input_idx }) = new_v {
-                match rewrites.get(region) {
-                    // NOTE(eddyb) this needs to be able to apply multiple replacements,
-                    // due to the input potentially having redundantly chained `OpPhi`s.
-                    //
-                    // FIXME(eddyb) union-find-style "path compression" could record the
-                    // final value inside `rewrites` while replacements are being made,
-                    // to avoid going through a chain more than once (and some of these
-                    // replacements could also be applied early).
-                    Some(RegionInputRewrites::ReplaceWith(replacements)) => {
-                        new_v = replacements[input_idx as usize];
-                    }
-                    Some(RegionInputRewrites::RenumberOrReplaceWith(
-                        renumbering_and_replacements,
-                    )) => match renumbering_and_replacements[input_idx as usize] {
-                        Ok(new_idx) => {
-                            new_v = Value::Var(VarKind::RegionInput { region, input_idx: new_idx });
-                            break;
-                        }
-                        Err(replacement) => new_v = replacement,
-                    },
-                    None => break,
-                }
-            }
-            (v != new_v).then_some(new_v)
-        })
+        (*v != new_v).then_some(new_v).map_or(Transformed::Unchanged, Transformed::Changed)
     }
 }
 
@@ -578,7 +531,7 @@ struct ClaimedRegion {
     /// merged into a larger region, or as a child of a new [`Node`].
     //
     // FIXME(eddyb) don't replace `VarKind::RegionInput { region: structured_body, .. }`
-    // with `region_inputs` when `structured_body` ends up a `Node` child,
+    // with `structured_body_inputs` when `structured_body` ends up a `Node` child,
     // but instead make all `Region`s entirely hermetic wrt inputs.
     structured_body_inputs: SmallVec<[Value; 2]>,
 
@@ -668,7 +621,7 @@ impl<'a> Structurizer<'a> {
             incoming_edge_counts_including_loop_exits,
 
             structurize_region_state: FxIndexMap::default(),
-            region_input_rewrites: EntityOrientedDenseMap::new(),
+            var_replacements: EntityOrientedDenseMap::new(),
         }
     }
 
@@ -764,15 +717,13 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        // The last step of structurization is applying rewrites accumulated
-        // while structurizing (i.e. `region_input_rewrites`).
+        // The last step of structurization is applying replacements accumulated
+        // while structurizing (i.e. `var_replacements`).
         //
         // FIXME(eddyb) obsolete this by fully taking advantage of hermeticity,
         // and only replacing `VarKind::RegionInput { region, .. }` within
         // `region`'s children, shallowly, whenever `region` gets claimed.
-        self.func_def_body.inner_in_place_transform_with(&mut RegionInputRewrites::rewrite_all(
-            &self.region_input_rewrites,
-        ));
+        self.func_def_body.inner_in_place_transform_with(&mut VarReplacer(&self.var_replacements));
     }
 
     fn try_claim_edge_bundle(
@@ -857,8 +808,8 @@ impl<'a> Structurizer<'a> {
             // FIXME(eddyb) `Loop` `Node`s should be changed to be hermetic
             // and have the loop state be output from the whole node itself,
             // for any outside uses of values defined within the loop body.
-            let body_def = self.func_def_body.at_mut(body).def();
-            let original_input_decls = mem::take(&mut body_def.inputs);
+            let body_def = &mut self.func_def_body.regions[body];
+            let original_body_input_vars = mem::take(&mut body_def.inputs);
             assert!(body_def.outputs.is_empty());
 
             // HACK(eddyb) some dataflow through the loop body is redundant,
@@ -868,45 +819,54 @@ impl<'a> Structurizer<'a> {
             // feasible to move `body`'s children into a new region without
             // wasting it completely (i.e. can't swap with `wrapper_region`).
             let mut initial_inputs = SmallVec::<[_; 2]>::new();
-            let body_input_rewrites = RegionInputRewrites::RenumberOrReplaceWith(
-                backedge
-                    .target_inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(original_idx, mut backedge_value)| {
-                        RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
-                            .transform_value_use(&backedge_value)
-                            .apply_to(&mut backedge_value);
 
-                        let original_idx = u32::try_from(original_idx).unwrap();
-                        if backedge_value
-                            == Value::Var(VarKind::RegionInput {
-                                region: body,
-                                input_idx: original_idx,
-                            })
-                        {
-                            // FIXME(eddyb) does this have to be general purpose,
-                            // or could this be handled as `None` with a single
-                            // `wrapper_region` per `RegionInputRewrites`?
-                            Err(Value::Var(VarKind::RegionInput {
-                                region: wrapper_region,
-                                input_idx: original_idx,
-                            }))
-                        } else {
-                            let renumbered_idx = u32::try_from(body_def.inputs.len()).unwrap();
-                            initial_inputs.push(Value::Var(VarKind::RegionInput {
-                                region: wrapper_region,
-                                input_idx: original_idx,
-                            }));
-                            body_def.inputs.push(original_input_decls[original_idx as usize]);
-                            body_def.outputs.push(backedge_value);
-                            Ok(renumbered_idx)
-                        }
-                    })
-                    .collect(),
-            );
-            self.region_input_rewrites.insert(body, body_input_rewrites);
+            // FIXME(eddyb) optimize this (also, maybe it's worth introducing
+            // a high-level `retain` for `body_def.inputs`, also updating decls).
+            for (original_body_input_var, mut backedge_value) in
+                original_body_input_vars.into_iter().zip_eq(backedge.target_inputs)
+            {
+                VarReplacer(&self.var_replacements)
+                    .transform_value_use(&backedge_value)
+                    .apply_to(&mut backedge_value);
 
+                // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                let input_var_decl = self.func_def_body.vars[original_body_input_var].clone();
+
+                let wrapper_region_input_vars =
+                    &mut self.func_def_body.regions[wrapper_region].inputs;
+                let wrapper_region_input_decl = VarDecl {
+                    def_parent: Either::Left(wrapper_region),
+                    def_idx: wrapper_region_input_vars.len().try_into().unwrap(),
+                    ..input_var_decl.clone()
+                };
+
+                if backedge_value == Value::Var(original_body_input_var) {
+                    // Move this redundant input to `wrapper_region`, instead of
+                    // allocating a new `Var`, to avoid wasting the now-unused
+                    // `original_body_input_var` (which would've also needed a
+                    // `var_replacements` entry, mapping it to the new `Var`).
+                    self.func_def_body.vars[original_body_input_var] = wrapper_region_input_decl;
+                    wrapper_region_input_vars.push(original_body_input_var);
+                } else {
+                    let wrapper_region_input_var =
+                        self.func_def_body.vars.define(self.cx, wrapper_region_input_decl);
+                    wrapper_region_input_vars.push(wrapper_region_input_var);
+
+                    initial_inputs.push(Value::Var(wrapper_region_input_var));
+
+                    let body_def = &mut self.func_def_body.regions[body];
+                    self.func_def_body.vars[original_body_input_var] = VarDecl {
+                        def_parent: Either::Left(body),
+                        def_idx: body_def.inputs.len().try_into().unwrap(),
+                        ..input_var_decl
+                    };
+                    body_def.inputs.push(original_body_input_var);
+
+                    body_def.outputs.push(backedge_value);
+                }
+            }
+
+            let body_def = &mut self.func_def_body.regions[body];
             assert_eq!(initial_inputs.len(), body_def.inputs.len());
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
 
@@ -925,9 +885,9 @@ impl<'a> Structurizer<'a> {
                 .into(),
             );
 
-            let wrapper_region_def = &mut self.func_def_body.regions[wrapper_region];
-            wrapper_region_def.inputs = original_input_decls;
-            wrapper_region_def.children.insert_last(loop_node, &mut self.func_def_body.nodes);
+            self.func_def_body.regions[wrapper_region]
+                .children
+                .insert_last(loop_node, &mut self.func_def_body.nodes);
 
             // HACK(eddyb) we've treated loop exits as extra "false edges", so
             // here they have to be added to the loop (potentially unlocking
@@ -1417,7 +1377,7 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        // FIXME(eddyb) `region_input_rewrites` mappings, generated
+        // FIXME(eddyb) `var_replacements` (`Var` -> `Value`) mappings, generated
         // for every `ClaimedRegion` that has been merged into a larger region,
         // only get applied after structurization fully completes, but here it's
         // very useful to have the fully resolved values across all `cases`'
@@ -1438,9 +1398,7 @@ impl<'a> Structurizer<'a> {
                     .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs),
             );
             for v in all_values {
-                RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
-                    .transform_value_use(v)
-                    .apply_to(v);
+                VarReplacer(&self.var_replacements).transform_value_use(v).apply_to(v);
             }
         }
 
@@ -1499,12 +1457,14 @@ impl<'a> Structurizer<'a> {
                                     ..
                                 }) => match v {
                                     Value::Const(_) => Ok(v),
-                                    Value::Var(VarKind::RegionInput { region, input_idx })
-                                        if region == *structured_body =>
-                                    {
-                                        Ok(structured_body_inputs[input_idx as usize])
-                                    }
-                                    Value::Var(_) => Err(()),
+                                    Value::Var(v) => match self.func_def_body.at(v).decl().kind() {
+                                        VarKind::RegionInput { region, input_idx }
+                                            if region == *structured_body =>
+                                        {
+                                            Ok(structured_body_inputs[input_idx as usize])
+                                        }
+                                        _ => Err(()),
+                                    },
                                 },
 
                                 // `case` has no region of its own, so everything
@@ -1520,7 +1480,10 @@ impl<'a> Structurizer<'a> {
 
                     let ty = match target {
                         DeferredTarget::Region(target) => {
-                            self.func_def_body.at(target).def().inputs[target_input_idx].ty
+                            self.func_def_body
+                                .at(self.func_def_body.at(target).def().inputs[target_input_idx])
+                                .decl()
+                                .ty
                         }
                         // HACK(eddyb) in the absence of `FuncDecl`, infer the
                         // type from each returned value (and require they match).
@@ -1535,9 +1498,18 @@ impl<'a> Structurizer<'a> {
                     };
 
                     let select_node = get_or_define_select_node(self, &cases);
-                    let output_decls = &mut self.func_def_body.at_mut(select_node).def().outputs;
-                    let output_idx = output_decls.len();
-                    output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty });
+                    let output_vars = &mut self.func_def_body.nodes[select_node].outputs;
+                    let output_idx = output_vars.len();
+                    let output_var = self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl {
+                            attrs: AttrSet::default(),
+                            ty,
+                            def_parent: Either::Right(select_node),
+                            def_idx: output_idx.try_into().unwrap(),
+                        },
+                    );
+                    output_vars.push(output_var);
                     for (case_idx, v) in per_case_target_input.enumerate() {
                         let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
 
@@ -1547,10 +1519,7 @@ impl<'a> Structurizer<'a> {
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
                     }
-                    Value::Var(VarKind::NodeOutput {
-                        node: select_node,
-                        output_idx: output_idx.try_into().unwrap(),
-                    })
+                    Value::Var(output_var)
                 })
                 .collect();
 
@@ -1596,22 +1565,20 @@ impl<'a> Structurizer<'a> {
         });
         let deferred_edges = deferred_edges.collect();
 
-        // Only as the very last step, can per-case `region_inputs` be added to
-        // `region_input_rewrites`.
+        // Only as the very last step, can per-case `structured_body_inputs` be added to
+        // `var_replacements`.
         //
         // FIXME(eddyb) don't replace `VarKind::RegionInput { region, .. }`
-        // with `region_inputs` when the `region` ends up a `Node` child,
+        // with `structured_body_inputs` when the `region` ends up a `Node` child,
         // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
         for case in cases {
-            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case
-                && !structured_body_inputs.is_empty()
-            {
-                self.region_input_rewrites.insert(
-                    structured_body,
-                    RegionInputRewrites::ReplaceWith(structured_body_inputs),
-                );
-                self.func_def_body.at_mut(structured_body).def().inputs.clear();
+            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
+                let input_vars =
+                    mem::take(&mut self.func_def_body.at_mut(structured_body).def().inputs);
+                for (input_var, v) in input_vars.into_iter().zip_eq(structured_body_inputs) {
+                    self.var_replacements.insert(input_var, v);
+                }
             }
         }
 
@@ -1645,7 +1612,7 @@ impl<'a> Structurizer<'a> {
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let NodeDef { attrs: _, kind, inputs, child_regions, outputs: output_decls } =
+                let NodeDef { attrs: _, kind, inputs, child_regions, outputs: output_vars } =
                     &mut *self.func_def_body.nodes[node];
                 let cases = match kind {
                     NodeKind::Select(kind) => {
@@ -1672,16 +1639,24 @@ impl<'a> Structurizer<'a> {
                     _ => unreachable!(),
                 };
 
-                let output_idx = u32::try_from(output_decls.len()).unwrap();
-                output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty: self.type_bool });
+                let output_var = self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        attrs: AttrSet::default(),
+                        ty: self.type_bool,
+                        def_parent: Either::Right(node),
+                        def_idx: output_vars.len().try_into().unwrap(),
+                    },
+                );
+                output_vars.push(output_var);
 
                 for (&case, cond) in cases.iter().zip_eq(per_case_conds) {
                     let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
                     outputs.push(cond);
-                    assert_eq!(outputs.len(), output_decls.len());
+                    assert_eq!(outputs.len(), output_vars.len());
                 }
 
-                Value::Var(VarKind::NodeOutput { node, output_idx })
+                Value::Var(output_var)
             }
         }
     }
@@ -1698,14 +1673,14 @@ impl<'a> Structurizer<'a> {
     ) -> DeferredEdgeBundleSet {
         match maybe_claimed_region {
             Ok(ClaimedRegion { structured_body, structured_body_inputs, deferred_edges }) => {
-                if !structured_body_inputs.is_empty() {
-                    self.region_input_rewrites.insert(
-                        structured_body,
-                        RegionInputRewrites::ReplaceWith(structured_body_inputs),
-                    );
+                let structured_body_def = self.func_def_body.at_mut(structured_body).def();
+
+                let input_vars = mem::take(&mut structured_body_def.inputs);
+                for (input_var, v) in input_vars.into_iter().zip_eq(structured_body_inputs) {
+                    self.var_replacements.insert(input_var, v);
                 }
-                let new_children =
-                    mem::take(&mut self.func_def_body.at_mut(structured_body).def().children);
+
+                let new_children = mem::take(&mut structured_body_def.children);
                 self.func_def_body.regions[parent_region]
                     .children
                     .append(new_children, &mut self.func_def_body.nodes);

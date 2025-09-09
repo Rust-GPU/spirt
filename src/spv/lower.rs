@@ -6,10 +6,10 @@ use crate::spv::{self, spec};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module,
-    NodeOutputDecl, Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst,
-    Value, VarKind, print,
+    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, Region,
+    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, VarDecl, print,
 };
+use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -817,6 +817,7 @@ impl Module {
                         DeclDef::Present(FuncDefBody {
                             regions,
                             nodes: Default::default(),
+                            vars: Default::default(),
                             body,
                             unstructured_cfg: Some(cf::unstructured::ControlFlowGraph::default()),
                         })
@@ -959,6 +960,8 @@ impl Module {
                     def_map
                 })
             };
+            // FIXME(eddyb) remove the now-unnecessary indentation.
+            // FIXME(eddyb) rethink this first part as "allocating `Var`s".
             {
                 for raw_inst in &raw_insts {
                     let IntraFuncInst {
@@ -1253,19 +1256,25 @@ impl Module {
 
                     let ty = result_type.unwrap();
                     params.push(FuncParam { attrs, ty });
-                    if let Some(func_def_body) = &mut func_def_body {
-                        let body_inputs = &mut func_def_body.at_mut_body().def().inputs;
-                        let input_idx = u32::try_from(body_inputs.len()).unwrap();
-                        body_inputs.push(RegionInputDecl { attrs, ty });
 
-                        local_id_defs.insert(
-                            result_id.unwrap(),
-                            LocalIdDef::Value(Value::Var(VarKind::RegionInput {
-                                region: func_def_body.body,
-                                input_idx,
-                            })),
+                    if let Some(func_def_body) = &mut func_def_body {
+                        let body_inputs = &mut func_def_body.regions[func_def_body.body].inputs;
+                        let input_var = func_def_body.vars.define(
+                            &cx,
+                            VarDecl {
+                                attrs,
+                                ty: result_type.unwrap(),
+
+                                def_parent: Either::Left(func_def_body.body),
+                                def_idx: body_inputs.len().try_into().unwrap(),
+                            },
                         );
+                        body_inputs.push(input_var);
+
+                        local_id_defs
+                            .insert(result_id.unwrap(), LocalIdDef::Value(Value::Var(input_var)));
                     }
+
                     continue;
                 }
                 let func_def_body = func_def_body.as_deref_mut().unwrap();
@@ -1320,19 +1329,23 @@ impl Module {
                     current_block.shadowed_local_id_defs.extend(
                         current_block.details.cfgssa_inter_block_uses.iter().map(
                             |(&used_id, &ty)| {
-                                let input_idx =
-                                    u32::try_from(current_block_region_def.inputs.len()).unwrap();
-                                current_block_region_def
-                                    .inputs
-                                    .push(RegionInputDecl { attrs: AttrSet::default(), ty });
+                                let input_var = func_def_body.vars.define(
+                                    &cx,
+                                    VarDecl {
+                                        attrs: AttrSet::default(),
+                                        ty,
 
-                                (
-                                    used_id,
-                                    LocalIdDef::Value(Value::Var(VarKind::RegionInput {
-                                        region: current_block.region,
-                                        input_idx,
-                                    })),
-                                )
+                                        def_parent: Either::Left(current_block.region),
+                                        def_idx: current_block_region_def
+                                            .inputs
+                                            .len()
+                                            .try_into()
+                                            .unwrap(),
+                                    },
+                                );
+                                current_block_region_def.inputs.push(input_var);
+
+                                (used_id, LocalIdDef::Value(Value::Var(input_var)))
                             },
                         ),
                     );
@@ -1498,16 +1511,20 @@ impl Module {
 
                     let ty = result_type.unwrap();
 
-                    let input_idx = u32::try_from(current_block_region_def.inputs.len()).unwrap();
-                    current_block_region_def.inputs.push(RegionInputDecl { attrs, ty });
+                    let input_var = func_def_body.vars.define(
+                        &cx,
+                        VarDecl {
+                            attrs,
+                            ty,
 
-                    local_id_defs.insert(
-                        result_id.unwrap(),
-                        LocalIdDef::Value(Value::Var(VarKind::RegionInput {
-                            region: current_block.region,
-                            input_idx,
-                        })),
+                            def_parent: Either::Left(current_block.region),
+                            def_idx: current_block_region_def.inputs.len().try_into().unwrap(),
+                        },
                     );
+                    current_block_region_def.inputs.push(input_var);
+
+                    local_id_defs
+                        .insert(result_id.unwrap(), LocalIdDef::Value(Value::Var(input_var)));
                 } else if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
                     let is_second_to_last_in_block = lookahead_raw_inst(2)
                         .is_none_or(|next_raw_inst| next_raw_inst.without_ids.opcode == wk.OpLabel);
@@ -1616,28 +1633,33 @@ impl Module {
                             })
                             .collect::<io::Result<_>>()?,
                         child_regions: [].into_iter().collect(),
-                        outputs: result_id
-                            .map(|_| {
-                                result_type.ok_or_else(|| {
-                                    invalid(
-                                        "expected value-producing instruction, \
-                                         with a result type",
-                                    )
-                                })
-                            })
-                            .transpose()?
-                            .into_iter()
-                            .map(|ty| {
-                                // FIXME(eddyb) split attrs between output and inst.
-                                NodeOutputDecl { attrs: AttrSet::default(), ty }
-                            })
-                            .collect(),
+                        outputs: [].into_iter().collect(),
                     };
 
                     let inst = func_def_body.nodes.define(&cx, data_inst_def.into());
                     if let Some(result_id) = result_id {
-                        let output = Value::Var(VarKind::NodeOutput { node: inst, output_idx: 0 });
-                        local_id_defs.insert(result_id, LocalIdDef::Value(output));
+                        let ty = result_type.ok_or_else(|| {
+                            invalid(
+                                "expected value-producing instruction, \
+                                 with a result type",
+                            )
+                        })?;
+
+                        let outputs = &mut func_def_body.nodes[inst].outputs;
+                        let output_var = func_def_body.vars.define(
+                            &cx,
+                            VarDecl {
+                                // FIXME(eddyb) split attrs between output and inst.
+                                attrs: AttrSet::default(),
+                                ty,
+
+                                def_parent: Either::Right(inst),
+                                def_idx: outputs.len().try_into().unwrap(),
+                            },
+                        );
+                        outputs.push(output_var);
+
+                        local_id_defs.insert(result_id, LocalIdDef::Value(Value::Var(output_var)));
                     }
 
                     current_block_region_def.children.insert_last(inst, &mut func_def_body.nodes);

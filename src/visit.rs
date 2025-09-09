@@ -8,8 +8,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
     DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
     FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
-    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
+    ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -64,6 +64,9 @@ pub trait Visitor<'a>: Sized {
     }
     fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
         func_at_node.inner_visit_with(self);
+    }
+    fn visit_var_decl(&mut self, func_at_var: FuncAt<'a, Var>) {
+        func_at_var.decl().inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -438,22 +441,13 @@ impl<'a> FuncAt<'a, Region> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
         let RegionDef { inputs, children, outputs } = self.def();
 
-        for input in inputs {
-            input.inner_visit_with(visitor);
+        for &input in inputs {
+            visitor.visit_var_decl(self.at(input));
         }
         self.at(*children).into_iter().inner_visit_with(visitor);
         for v in outputs {
             visitor.visit_value_use(v);
         }
-    }
-}
-
-impl InnerVisit for RegionInputDecl {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ty } = *self;
-
-        visitor.visit_attr_set_use(attrs);
-        visitor.visit_type_use(ty);
     }
 }
 
@@ -503,15 +497,15 @@ impl<'a> FuncAt<'a, Node> {
             visitor.visit_value_use(repeat_condition);
         }
 
-        for output in outputs {
-            output.inner_visit_with(visitor);
+        for &output in outputs {
+            visitor.visit_var_decl(self.at(output));
         }
     }
 }
 
-impl InnerVisit for NodeOutputDecl {
+impl InnerVisit for VarDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ty } = *self;
+        let Self { attrs, ty, def_parent: _, def_idx: _ } = *self;
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
@@ -549,16 +543,8 @@ impl InnerVisit for Value {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
             &Self::Const(ct) => visitor.visit_const_use(ct),
-            Self::Var(var) => var.inner_visit_with(visitor),
-        }
-    }
-}
-
-impl InnerVisit for VarKind {
-    fn inner_visit_with<'a>(&'a self, _visitor: &mut impl Visitor<'a>) {
-        match *self {
-            Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ } => {}
+            // FIXME(eddyb) maybe there should be a `visit_var_use`?
+            Self::Var(_) => {}
         }
     }
 }

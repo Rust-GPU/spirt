@@ -8,8 +8,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
     DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
-    Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef, RegionInputDecl, Type,
-    TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
+    Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type, TypeDef, TypeKind, TypeOrConst,
+    Value, Var, VarDecl, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -198,6 +198,9 @@ pub trait Transformer: Sized {
     }
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.inner_in_place_transform_with(self);
+    }
+    fn in_place_transform_var_decl(&mut self, func_at_var: FuncAtMut<'_, Var>) {
+        func_at_var.decl().inner_in_place_transform_with(self);
     }
 }
 
@@ -591,8 +594,11 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
         // HACK(eddyb) handle the fields of `Region` separately, to
         // allow reborrowing `FuncAtMut` (for recursing into `Node`s).
         let RegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
-        for input in inputs {
-            input.inner_transform_with(transformer).apply_to(input);
+
+        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
+        for input_idx in 0..inputs.len() {
+            let input = self.reborrow().def().inputs[input_idx];
+            transformer.in_place_transform_var_decl(self.reborrow().at(input));
         }
 
         self.reborrow().at_children().into_iter().inner_in_place_transform_with(transformer);
@@ -601,20 +607,6 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
         for v in outputs {
             transformer.transform_value_use(v).apply_to(v);
         }
-    }
-}
-
-impl InnerTransform for RegionInputDecl {
-    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { attrs, ty } = self;
-
-        transform!({
-            attrs -> transformer.transform_attr_set_use(*attrs),
-            ty -> transformer.transform_type_use(*ty),
-        } => Self {
-            attrs,
-            ty,
-        })
     }
 }
 
@@ -668,23 +660,20 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
         }
 
-        for output in outputs {
-            output.inner_transform_with(transformer).apply_to(output);
+        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
+        for output_idx in 0..outputs.len() {
+            let output = self.reborrow().def().outputs[output_idx];
+            transformer.in_place_transform_var_decl(self.reborrow().at(output));
         }
     }
 }
 
-impl InnerTransform for NodeOutputDecl {
-    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { attrs, ty } = self;
+impl InnerInPlaceTransform for VarDecl {
+    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
+        let Self { attrs, ty, def_parent: _, def_idx: _ } = self;
 
-        transform!({
-            attrs -> transformer.transform_attr_set_use(*attrs),
-            ty -> transformer.transform_type_use(*ty),
-        } => Self {
-            attrs,
-            ty,
-        })
+        transformer.transform_attr_set_use(*attrs).apply_to(attrs);
+        transformer.transform_type_use(*ty).apply_to(ty);
     }
 }
 
@@ -721,18 +710,8 @@ impl InnerTransform for Value {
             Self::Const(ct) => transform!({
                 ct -> transformer.transform_const_use(*ct),
             } => Self::Const(ct)),
-            Self::Var(var) => transform!({
-                var -> var.inner_transform_with(transformer),
-            } => Self::Var(var)),
-        }
-    }
-}
-
-impl InnerTransform for VarKind {
-    fn inner_transform_with(&self, _transformer: &mut impl Transformer) -> Transformed<Self> {
-        match self {
-            Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ } => Transformed::Unchanged,
+            // FIXME(eddyb) maybe there should be a `transform_var_use`?
+            Self::Var(_) => Transformed::Unchanged,
         }
     }
 }

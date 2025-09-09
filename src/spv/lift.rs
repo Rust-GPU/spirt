@@ -8,8 +8,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
     FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node,
-    NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, VarKind,
+    NodeKind, OrdAssertEq, Region, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl,
+    VarKind,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -251,6 +251,10 @@ struct AllocatedIds<'a> {
 
 // FIXME(eddyb) should this use ID ranges instead of `SmallVec<[spv::Id; 4]>`?
 struct FuncLifting<'a> {
+    // HACK(eddyb) temporary workaround before it's clear how to map everything
+    // to use the new `Var` abstraction effectively.
+    vars: Option<&'a crate::EntityDefs<Var>>,
+
     func_id: spv::Id,
     param_ids: SmallVec<[spv::Id; 4]>,
 
@@ -530,6 +534,8 @@ impl<'a> FuncLifting<'a> {
         let func_def_body = match &func_decl.def {
             DeclDef::Imported(_) => {
                 return Ok(Self {
+                    vars: None,
+
                     func_id,
                     param_ids,
                     region_inputs_source: Default::default(),
@@ -560,7 +566,8 @@ impl<'a> FuncLifting<'a> {
                             .def()
                             .inputs
                             .iter()
-                            .map(|&RegionInputDecl { attrs, ty }| {
+                            .map(|&input_var| {
+                                let &VarDecl { attrs, ty, .. } = func_def_body.at(input_var).decl();
                                 Ok(Phi {
                                     attrs,
                                     ty,
@@ -593,15 +600,17 @@ impl<'a> FuncLifting<'a> {
 
                             loop_body_inputs
                                 .iter()
-                                .enumerate()
-                                .map(|(i, &RegionInputDecl { attrs, ty })| {
+                                .zip_eq(&node_def.inputs)
+                                .map(|(&input_var, &initial_value)| {
+                                    let &VarDecl { attrs, ty, .. } =
+                                        func_def_body.at(input_var).decl();
                                     Ok(Phi {
                                         attrs,
                                         ty,
 
                                         result_id: alloc_id()?,
                                         cases: FxIndexMap::default(),
-                                        default_value: Some(node_def.inputs[i]),
+                                        default_value: Some(initial_value),
                                     })
                                 })
                                 .collect::<Result<_, _>>()?
@@ -615,7 +624,9 @@ impl<'a> FuncLifting<'a> {
                         NodeKind::Select(_) => node_def
                             .outputs
                             .iter()
-                            .map(|&NodeOutputDecl { attrs, ty }| {
+                            .map(|&output_var| {
+                                let &VarDecl { attrs, ty, .. } =
+                                    func_def_body.at(output_var).decl();
                                 Ok(Phi {
                                     attrs,
                                     ty,
@@ -1053,6 +1064,8 @@ impl<'a> FuncLifting<'a> {
             .filter(|&inst| !func_def_body.at(inst).def().outputs.is_empty());
 
         Ok(Self {
+            vars: Some(&func_def_body.vars),
+
             func_id,
             param_ids,
             region_inputs_source,
@@ -1170,30 +1183,34 @@ impl LazyInst<'_, '_> {
 
                 _ => ids.globals[&Global::Const(ct)],
             },
-            Value::Var(VarKind::RegionInput { region, input_idx }) => {
-                let input_idx = usize::try_from(input_idx).unwrap();
-                match parent_func.region_inputs_source.get(&region) {
-                    Some(RegionInputsSource::FuncParams) => parent_func.param_ids[input_idx],
-                    Some(&RegionInputsSource::LoopHeaderPhis(loop_node)) => {
-                        parent_func.blocks[&CfgPoint::NodeEntry(loop_node)].phis[input_idx]
-                            .result_id
-                    }
-                    None => {
-                        parent_func.blocks[&CfgPoint::RegionEntry(region)].phis[input_idx].result_id
+            Value::Var(v) => match parent_func.vars.unwrap()[v].kind() {
+                VarKind::RegionInput { region, input_idx } => {
+                    let input_idx = usize::try_from(input_idx).unwrap();
+                    match parent_func.region_inputs_source.get(&region) {
+                        Some(RegionInputsSource::FuncParams) => parent_func.param_ids[input_idx],
+                        Some(&RegionInputsSource::LoopHeaderPhis(loop_node)) => {
+                            parent_func.blocks[&CfgPoint::NodeEntry(loop_node)].phis[input_idx]
+                                .result_id
+                        }
+                        None => {
+                            parent_func.blocks[&CfgPoint::RegionEntry(region)].phis[input_idx]
+                                .result_id
+                        }
                     }
                 }
-            }
-            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
-                if let Some(&data_inst_output_id) = parent_func.data_inst_output_ids.get(&node) {
-                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                    assert_eq!(output_idx, 0);
-                    data_inst_output_id
-                } else {
-                    parent_func.blocks[&CfgPoint::NodeExit(node)].phis
-                        [usize::try_from(output_idx).unwrap()]
-                    .result_id
+                VarKind::NodeOutput { node, output_idx } => {
+                    if let Some(&data_inst_output_id) = parent_func.data_inst_output_ids.get(&node)
+                    {
+                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                        assert_eq!(output_idx, 0);
+                        data_inst_output_id
+                    } else {
+                        parent_func.blocks[&CfgPoint::NodeExit(node)].phis
+                            [usize::try_from(output_idx).unwrap()]
+                        .result_id
+                    }
                 }
-            }
+            },
         };
 
         let (result_id, attrs, _) = self.result_id_attrs_and_import(module, ids);
@@ -1358,7 +1375,7 @@ impl LazyInst<'_, '_> {
                     without_ids: inst,
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
                     result_type_id: (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                        .map(|o| ids.globals[&Global::Type(o.ty)]),
+                        .map(|&o| ids.globals[&Global::Type(parent_func.vars.unwrap()[o].ty)]),
                     result_id,
                     ids: extra_initial_id_operand
                         .into_iter()

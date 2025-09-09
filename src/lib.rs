@@ -548,8 +548,8 @@ pub enum TypeKind {
     /// (e.g. "points to variable `x`" or "accessed at offset `y`") can be found
     /// attached as `Attr`s on those `Value`s (see [`Attr::QPtr`]).
     //
-    // FIXME(eddyb) a "refinement system" that's orthogonal from types, and kept
-    // separately in e.g. `RegionInputDecl`, might be a better approach?
+    // FIXME(eddyb) a "refinement system" that's orthogonal from types,
+    // and kept separately in `VarDecl`, might be a better approach?
     QPtr,
 
     SpvInst {
@@ -702,6 +702,7 @@ pub struct FuncParam {
 pub struct FuncDefBody {
     pub regions: EntityDefs<Region>,
     pub nodes: EntityDefs<Node>,
+    pub vars: EntityDefs<Var>,
 
     /// The [`Region`] representing the whole body of the function.
     ///
@@ -817,7 +818,7 @@ pub struct RegionDef {
     /// * accessed using [`VarKind::RegionInput`]
     /// * values provided by the parent:
     ///   * when this is the function body: the function's parameters
-    pub inputs: SmallVec<[RegionInputDecl; 2]>,
+    pub inputs: SmallVec<[Var; 2]>,
 
     pub children: EntityList<Node>,
 
@@ -832,13 +833,6 @@ pub struct RegionDef {
     ///     also there's nothing stopping body-defined values from directly being
     ///     used outside the loop (once that changes, this aspect can be flipped)
     pub outputs: SmallVec<[Value; 2]>,
-}
-
-#[derive(Copy, Clone)]
-pub struct RegionInputDecl {
-    pub attrs: AttrSet,
-
-    pub ty: Type,
 }
 
 /// Entity handle for a [`NodeDef`](crate::NodeDef)
@@ -868,14 +862,7 @@ pub struct NodeDef {
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
     // TODO(eddyb) include former `DataInst`s in above docs.
-    pub outputs: SmallVec<[NodeOutputDecl; 2]>,
-}
-
-#[derive(Copy, Clone)]
-pub struct NodeOutputDecl {
-    pub attrs: AttrSet,
-
-    pub ty: Type,
+    pub outputs: SmallVec<[Var; 2]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
@@ -939,19 +926,42 @@ pub type DataInst = Node;
 pub type DataInstDef = NodeDef;
 pub type DataInstKind = NodeKind;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Value {
-    Const(Const),
-    Var(Var),
-}
-
-type Var = VarKind;
-
+// FIXME(eddyb) should this be above region/node?
 // FIXME(eddyb) document the fact that "variable" is used here in a sense
 // more like e.g. math/lambda calculus/SSA/Rust immutable variables,
 // and *not* some sort of "mutable slot" (like e.g. wasm local variables),
 // also mention `GlobalVar`/`mem::MemOp::FuncLocalVar`.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub use context::Var;
+
+/// Declaration for a [`Var`]: a [`Region`] input or [`Node`] output.
+#[derive(Clone)]
+pub struct VarDecl {
+    pub attrs: AttrSet,
+
+    pub ty: Type,
+
+    // FIXME(eddyb) add a `context::PackedEither` using the sign of s/u32/i32/
+    // interned/entity, and use it to be more compact than `Either<Region, Node>`.
+    pub def_parent: itertools::Either<Region, Node>,
+    pub def_idx: u32,
+}
+
+impl VarDecl {
+    // FIXME(eddyb) `VarKind` maybe should've been `VarDef`, but the `Def` suffix
+    // can get confusing, and `VarKind` was picked early in the refactor.
+    // FIXME(eddyb) document that the indices returned are only valid while the
+    // `Var`s (`RegionDef` `inputs` or `NodeDef` `outputs`) remain unchanged.
+    pub fn kind(&self) -> VarKind {
+        self.def_parent.either(
+            |region| VarKind::RegionInput { region, input_idx: self.def_idx },
+            |node| VarKind::NodeOutput { node, output_idx: self.def_idx },
+        )
+    }
+}
+
+// FIXME(eddyb) consider using `usize` (still packed as `u32`) for indices.
+// FIXME(eddyb) document that the indices contained are only valid while the
+// `Var`s (`RegionDef` `inputs` or `NodeDef` `outputs`) remain unchanged.
 pub enum VarKind {
     /// One of the inputs to a [`Region`]:
     /// * declared by `region.inputs[input_idx]`
@@ -966,4 +976,12 @@ pub enum VarKind {
     ///   * when `node` is a `Select`: the case that was chosen
     // TODO(eddyb) include former `DataInst`s in above docs.
     NodeOutput { node: Node, output_idx: u32 },
+}
+
+// FIXME(eddyb) add a `context::PackedEither` using the sign of s/u32/i32/
+// interned/entity, and use it to be more compact than `Either<Const, Var>`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Value {
+    Const(Const),
+    Var(Var),
 }

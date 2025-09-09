@@ -6,11 +6,11 @@ use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
-    DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, Func, FuncDecl, FxIndexMap,
-    GlobalVar, GlobalVarDecl, Module, Node, NodeKind, NodeOutputDecl, Region, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, VarKind, spv,
+    DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
+    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, Region, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
 };
-use rustc_hash::FxHashMap;
+use itertools::Either;
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::mem;
@@ -398,10 +398,9 @@ struct LiftToSpvPtrInstsInFunc<'a> {
     ///
     /// The `QPtrOp` itself is only removed after the entire function is lifted,
     /// (using `var_use_counts` to determine whether they're truly unused).
-    deferred_ptr_noops: FxIndexMap<DataInst, DeferredPtrNoop>,
+    deferred_ptr_noops: FxIndexMap<Var, DeferredPtrNoop>,
 
-    // TODO(eddyb) switch this back to `EntityOrientedDenseMap` (removing `Option`).
-    var_use_counts: FxHashMap<VarKind, Option<NonZeroU32>>,
+    var_use_counts: EntityOrientedDenseMap<Var, NonZeroU32>,
 
     // HACK(eddyb) this is used to avoid noise when `mem::analyze` failed.
     func_has_mem_analysis_bug_diags: bool,
@@ -435,8 +434,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) maybe all this data should be packaged up together in a
         // type with fields like those of `DeferredPtrNoop` (or even more).
         let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::Var(VarKind::NodeOutput { node: v_data_inst, output_idx: 0 }) = v
-                && let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst)
+            if let Value::Var(var) = v
+                && let Some(ptr_noop) = self.deferred_ptr_noops.get(&var)
             {
                 return Ok((
                     ptr_noop.output_pointer_addr_space,
@@ -468,8 +467,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
-                let mem_accesses =
-                    self.lifter.find_mem_accesses_attr(data_inst_def.outputs[0].attrs)?;
+                let mem_accesses = self
+                    .lifter
+                    .find_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)?;
 
                 // FIXME(eddyb) validate against `mem_layout`!
                 let pointee_type = self.lifter.pointee_type_for_accesses(mem_accesses)?;
@@ -479,9 +479,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     opcode: wk.OpVariable,
                     imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
                 });
-                data_inst_def.outputs[0].attrs =
-                    self.lifter.strip_mem_accesses_attr(data_inst_def.outputs[0].attrs);
-                data_inst_def.outputs[0].ty =
+                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
+                output_decl.ty =
                     self.lifter.spv_ptr_type(AddrSpace::SpvStorageClass(wk.Function), pointee_type);
                 data_inst_def
             }
@@ -507,7 +507,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
-                data_inst_def.outputs[0].ty = self.lifter.spv_ptr_type(addr_space, handle_type);
+                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.ty = self.lifter.spv_ptr_type(addr_space, handle_type);
                 data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::BufferData) => {
@@ -520,7 +521,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 self.deferred_ptr_noops.insert(
-                    data_inst,
+                    data_inst_def.outputs[0],
                     DeferredPtrNoop {
                         output_pointer: buf_ptr,
                         output_pointer_addr_space: addr_space,
@@ -531,8 +532,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 // FIXME(eddyb) avoid the repeated call to `type_of_val`,
                 // maybe don't even replace the `QPtrOp::BufferData` instruction?
-                let mut data_inst_def = data_inst_def.clone();
-                data_inst_def.outputs[0].ty = type_of_val(buf_ptr);
+                let data_inst_def = data_inst_def.clone();
+
+                let new_output_ty = type_of_val(buf_ptr);
+                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.ty = new_output_ty;
+
                 data_inst_def
             }
             &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
@@ -653,7 +658,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let mut data_inst_def = data_inst_def.clone();
                 if access_chain_inputs.len() == 1 {
                     self.deferred_ptr_noops.insert(
-                        data_inst,
+                        data_inst_def.outputs[0],
                         DeferredPtrNoop {
                             output_pointer: base_ptr,
                             output_pointer_addr_space: addr_space,
@@ -665,12 +670,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // FIXME(eddyb) avoid the repeated call to `type_of_val`,
                     // maybe don't even replace the `QPtrOp::Offset` instruction?
                     data_inst_def.kind = QPtrOp::Offset(0).into();
-                    data_inst_def.outputs[0].ty = type_of_val(base_ptr);
+                    let new_output_ty = type_of_val(base_ptr);
+                    let output_decl =
+                        func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                    output_decl.ty = new_output_ty;
                 } else {
                     data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
                     data_inst_def.inputs = access_chain_inputs;
-                    data_inst_def.outputs[0].ty =
-                        self.lifter.spv_ptr_type(addr_space, layout.original_type);
+                    let output_decl =
+                        func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                    output_decl.ty = self.lifter.spv_ptr_type(addr_space, layout.original_type);
                 }
                 data_inst_def
             }
@@ -748,15 +757,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
                 data_inst_def.inputs = access_chain_inputs;
-                data_inst_def.outputs[0].ty =
-                    self.lifter.spv_ptr_type(addr_space, layout.original_type);
+                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.ty = self.lifter.spv_ptr_type(addr_space, layout.original_type);
                 data_inst_def
             }
             DataInstKind::Mem(op @ (MemOp::Load | MemOp::Store)) => {
                 // HACK(eddyb) `_` will match multiple variants soon.
                 #[allow(clippy::match_wildcard_for_single_variants)]
                 let (spv_opcode, access_type) = match op {
-                    MemOp::Load => (wk.OpLoad, data_inst_def.outputs[0].ty),
+                    MemOp::Load => (wk.OpLoad, func.at(data_inst_def.outputs[0]).decl().ty),
                     MemOp::Store => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
                     _ => unreachable!(),
                 };
@@ -766,14 +775,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     let input_idx = 0;
                     let ptr = data_inst_def.inputs[input_idx];
                     let (addr_space, pointee_layout) = type_of_val_as_spv_ptr_with_layout(ptr)?;
-                    self.maybe_adjust_pointer_for_access(
-                        ptr,
-                        addr_space,
-                        pointee_layout,
-                        access_type,
-                    )?
-                    .map(|access_chain_data_inst_def| (input_idx, access_chain_data_inst_def))
-                    .into_iter()
+                    self.maybe_adjust_pointer_for_access(ptr, pointee_layout, access_type)?
+                        .map(|access_chain_data_inst_def| {
+                            (
+                                input_idx,
+                                self.lifter.spv_ptr_type(addr_space, access_type),
+                                access_chain_data_inst_def,
+                            )
+                        })
+                        .into_iter()
                 };
 
                 let mut new_data_inst_def = DataInstDef {
@@ -782,15 +792,27 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 // FIXME(eddyb) written in a more general style for future deduplication.
-                for (input_idx, mut access_chain_data_inst_def) in maybe_ajustment {
+                for (input_idx, access_chain_output_ptr_type, mut access_chain_data_inst_def) in
+                    maybe_ajustment
+                {
                     // HACK(eddyb) account for `deferred_ptr_noops` interactions.
                     self.resolve_deferred_ptr_noop_uses(&mut access_chain_data_inst_def.inputs);
                     self.add_value_uses(&access_chain_data_inst_def.inputs);
 
-                    let access_chain_data_inst = func_at_data_inst
-                        .reborrow()
-                        .nodes
-                        .define(cx, access_chain_data_inst_def.into());
+                    let func = func_at_data_inst.reborrow().at(());
+
+                    let access_chain_data_inst =
+                        func.nodes.define(cx, access_chain_data_inst_def.into());
+                    let access_chain_output_var = func.vars.define(
+                        cx,
+                        VarDecl {
+                            attrs: Default::default(),
+                            ty: access_chain_output_ptr_type,
+                            def_parent: Either::Right(access_chain_data_inst),
+                            def_idx: 0,
+                        },
+                    );
+                    func.nodes[access_chain_data_inst].outputs.push(access_chain_output_var);
 
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `regions` and `nodes`
@@ -798,18 +820,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
-                    let data_inst = func_at_data_inst.position;
-                    let func = func_at_data_inst.reborrow().at(());
                     func.regions[self.parent_region.unwrap()].children.insert_before(
                         access_chain_data_inst,
                         data_inst,
                         func.nodes,
                     );
 
-                    new_data_inst_def.inputs[input_idx] = Value::Var(VarKind::NodeOutput {
-                        node: access_chain_data_inst,
-                        output_idx: 0,
-                    });
+                    new_data_inst_def.inputs[input_idx] = Value::Var(access_chain_output_var);
                 }
 
                 new_data_inst_def
@@ -834,13 +851,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             if let Some(access_chain_data_inst_def) = self
                                 .maybe_adjust_pointer_for_access(
                                     input_ptr,
-                                    input_ptr_addr_space,
                                     input_pointee_layout,
                                     expected_pointee_type,
                                 )?
                             {
-                                to_spv_ptr_input_adjustments
-                                    .push((input_idx, access_chain_data_inst_def));
+                                to_spv_ptr_input_adjustments.push((
+                                    input_idx,
+                                    self.lifter
+                                        .spv_ptr_type(input_ptr_addr_space, expected_pointee_type),
+                                    access_chain_data_inst_def,
+                                ));
                             }
                         }
                         Attr::QPtr(QPtrAttr::FromSpvPtrOutput { addr_space, pointee }) => {
@@ -857,16 +877,28 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 let mut new_data_inst_def = data_inst_def.clone();
 
+                let func = func_at_data_inst.reborrow().at(());
+
                 // FIXME(eddyb) deduplicate with `Load`/`Store`.
-                for (input_idx, mut access_chain_data_inst_def) in to_spv_ptr_input_adjustments {
+                for (input_idx, access_chain_output_ptr_type, mut access_chain_data_inst_def) in
+                    to_spv_ptr_input_adjustments
+                {
                     // HACK(eddyb) account for `deferred_ptr_noops` interactions.
                     self.resolve_deferred_ptr_noop_uses(&mut access_chain_data_inst_def.inputs);
                     self.add_value_uses(&access_chain_data_inst_def.inputs);
 
-                    let access_chain_data_inst = func_at_data_inst
-                        .reborrow()
-                        .nodes
-                        .define(cx, access_chain_data_inst_def.into());
+                    let access_chain_data_inst =
+                        func.nodes.define(cx, access_chain_data_inst_def.into());
+                    let access_chain_output_var = func.vars.define(
+                        cx,
+                        VarDecl {
+                            attrs: Default::default(),
+                            ty: access_chain_output_ptr_type,
+                            def_parent: Either::Right(access_chain_data_inst),
+                            def_idx: 0,
+                        },
+                    );
+                    func.nodes[access_chain_data_inst].outputs.push(access_chain_output_var);
 
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `regions` and `nodes`
@@ -874,22 +906,17 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
-                    let data_inst = func_at_data_inst.position;
-                    let func = func_at_data_inst.reborrow().at(());
                     func.regions[self.parent_region.unwrap()].children.insert_before(
                         access_chain_data_inst,
                         data_inst,
                         func.nodes,
                     );
 
-                    new_data_inst_def.inputs[input_idx] = Value::Var(VarKind::NodeOutput {
-                        node: access_chain_data_inst,
-                        output_idx: 0,
-                    });
+                    new_data_inst_def.inputs[input_idx] = Value::Var(access_chain_output_var);
                 }
 
                 if let Some((addr_space, pointee_type)) = from_spv_ptr_output {
-                    new_data_inst_def.outputs[0].ty =
+                    func.vars[new_data_inst_def.outputs[0]].ty =
                         self.lifter.spv_ptr_type(addr_space, pointee_type);
                 }
 
@@ -902,12 +929,14 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     /// If necessary, construct an `OpAccessChain` instruction to turn `ptr`
     /// (pointing to a type with `pointee_layout`) into a pointer to `access_type`
     /// (which can then be used with e.g. `OpLoad`/`OpStore`).
+    ///
+    /// **Note**: the returned instruction has empty `outputs`, the caller must
+    /// add one (of type `self.lifter.spv_ptr_type(addr_space, access_type)`).
     //
     // FIXME(eddyb) customize errors, to tell apart Load/Store/ToSpvPtrInput.
     fn maybe_adjust_pointer_for_access(
         &self,
         ptr: Value,
-        addr_space: AddrSpace,
         mut pointee_layout: TypeLayout,
         access_type: Type,
     ) -> Result<Option<DataInstDef>, LiftError> {
@@ -1007,12 +1036,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
                 inputs: access_chain_inputs,
                 child_regions: [].into_iter().collect(),
-                outputs: [NodeOutputDecl {
-                    attrs: Default::default(),
-                    ty: self.lifter.spv_ptr_type(addr_space, access_type),
-                }]
-                .into_iter()
-                .collect(),
+                outputs: [].into_iter().collect(),
             })
         } else {
             None
@@ -1028,8 +1052,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         for v in values {
             // FIXME(eddyb) the loop could theoretically be avoided, but that'd
             // make tracking use counts harder.
-            while let Value::Var(VarKind::NodeOutput { node: inst, output_idx: 0 }) = *v {
-                match self.deferred_ptr_noops.get(&inst) {
+            while let Value::Var(var) = *v {
+                match self.deferred_ptr_noops.get(&var) {
                     Some(ptr_noop) => {
                         *v = ptr_noop.output_pointer;
                     }
@@ -1044,7 +1068,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     fn add_value_uses(&mut self, values: &[Value]) {
         for &v in values {
             if let Value::Var(v) = v {
-                let count = self.var_use_counts.entry(v).or_default();
+                let count = self.var_use_counts.entry(v);
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
                 );
@@ -1054,7 +1078,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     fn remove_value_uses(&mut self, values: &[Value]) {
         for &v in values {
             if let Value::Var(v) = v {
-                let count = self.var_use_counts.entry(v).or_default();
+                let count = self.var_use_counts.entry(v);
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }
         }
@@ -1095,12 +1119,16 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
 
         let mut lifted = self.try_lift_data_inst_def(func_at_node.reborrow());
         if let Ok(Transformed::Unchanged) = lifted {
-            let data_inst_def = func_at_node.reborrow().def();
+            let func_at_node = func_at_node.reborrow().freeze();
+            let data_inst_def = func_at_node.def();
             if let DataInstKind::QPtr(_) = data_inst_def.kind {
                 lifted = Err(LiftError(Diag::bug(["unimplemented qptr instruction".into()])));
             } else {
-                for output in &data_inst_def.outputs {
-                    if matches!(self.lifter.cx[output.ty].kind, TypeKind::QPtr) {
+                for &output_var in &data_inst_def.outputs {
+                    if matches!(
+                        self.lifter.cx[func_at_node.at(output_var).decl().ty].kind,
+                        TypeKind::QPtr
+                    ) {
                         lifted = Err(LiftError(Diag::bug([
                             "unimplemented qptr-producing instruction".into(),
                         ])));
@@ -1151,19 +1179,11 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             let deferred_ptr_noops = mem::take(&mut self.deferred_ptr_noops);
             // NOTE(eddyb) reverse order is important, as each removal can reduce
             // use counts of an earlier definition, allowing further removal.
-            for (inst, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
-                let is_used = func_def_body
-                    .at(inst)
-                    .def()
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| VarKind::NodeOutput {
-                        node: inst,
-                        output_idx: i.try_into().unwrap(),
-                    })
-                    .any(|v| self.var_use_counts.get(&v).is_some_and(|count| count.is_some()));
+            for (output_var, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
+                let is_used = self.var_use_counts.get(output_var).is_some();
                 if !is_used {
+                    let inst = func_def_body.at(output_var).decl().def_parent.right().unwrap();
+
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `regions` and `nodes`
                     // at the same time - perhaps some kind of `FuncAtMut` position

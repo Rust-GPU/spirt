@@ -6,10 +6,10 @@ use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, Type, TypeKind, TypeOrConst, Value, VarKind, spv,
+    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Region, Type,
+    TypeKind, TypeOrConst, Value, VarDecl, spv,
 };
-use itertools::Itertools as _;
+use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::num::NonZeroU32;
@@ -420,7 +420,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
             assert!(data_inst_def.inputs.len() <= 1);
             let (_, var_data_type) =
-                self.lowerer.as_spv_ptr_type(outputs[0].ty).ok_or_else(|| {
+                self.lowerer.as_spv_ptr_type(func.at(outputs[0]).decl().ty).ok_or_else(|| {
                     LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
                 })?;
             match self.lowerer.layout_of(var_data_type)? {
@@ -545,23 +545,30 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
             let mut ptr = base_ptr;
             for step in steps {
+                let func = func_at_data_inst.reborrow().at(());
+
                 let (kind, inputs) = step.into_data_inst_kind_and_inputs(ptr);
-                let step_data_inst = func_at_data_inst.reborrow().nodes.define(
+                let step_data_inst = func.nodes.define(
                     cx,
                     DataInstDef {
                         attrs: Default::default(),
                         kind,
                         inputs,
                         child_regions: [].into_iter().collect(),
-                        outputs: [NodeOutputDecl {
-                            attrs: Default::default(),
-                            ty: self.lowerer.qptr_type(),
-                        }]
-                        .into_iter()
-                        .collect(),
+                        outputs: [].into_iter().collect(),
                     }
                     .into(),
                 );
+                let step_output_var = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: self.lowerer.qptr_type(),
+                        def_parent: Either::Right(step_data_inst),
+                        def_idx: 0,
+                    },
+                );
+                func.nodes[step_data_inst].outputs.push(step_output_var);
 
                 // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                 // due to the need to borrow `regions` and `nodes`
@@ -569,21 +576,20 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 // types for "where a list is in a parent entity" could be used
                 // to make this more ergonomic, although the potential need for
                 // an actual list entity of its own, should be considered.
-                let func = func_at_data_inst.reborrow().at(());
                 func.regions[self.parent_region.unwrap()].children.insert_before(
                     step_data_inst,
                     data_inst,
                     func.nodes,
                 );
 
-                ptr = Value::Var(VarKind::NodeOutput { node: step_data_inst, output_idx: 0 });
+                ptr = Value::Var(step_output_var);
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
         } else if spv_inst.opcode == wk.OpBitcast {
             let input = data_inst_def.inputs[0];
             // Pointer-to-pointer casts are noops on `qptr`.
             if self.lowerer.as_spv_ptr_type(func.at(input).type_of(cx)).is_some()
-                && self.lowerer.as_spv_ptr_type(outputs[0].ty).is_some()
+                && self.lowerer.as_spv_ptr_type(func.at(outputs[0]).decl().ty).is_some()
             {
                 // HACK(eddyb) noop cases should not use any `DataInst`s at all,
                 // but that would require the ability to replace all uses of a `Value`.
@@ -651,8 +657,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             }
         }
         // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-        if let Some(output) = data_inst_def.outputs.iter().at_most_one().ok().unwrap()
-            && let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output.ty)
+        if let Some(&output_var) = data_inst_def.outputs.iter().at_most_one().ok().unwrap()
+            && let Some((addr_space, pointee)) =
+                self.lowerer.as_spv_ptr_type(func.at(output_var).decl().ty)
         {
             old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
                 QPtrAttr::FromSpvPtrOutput {
