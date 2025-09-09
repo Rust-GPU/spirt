@@ -9,7 +9,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value, VarKind,
+    TypeKind, Value, Var, VarKind,
 };
 use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
@@ -655,7 +655,7 @@ impl MemTypeLayout {
 
 #[derive(Copy, Clone)]
 enum AttrTarget {
-    Var(VarKind),
+    Var(Var),
     Node(Node),
 }
 
@@ -781,14 +781,7 @@ impl<'a> GatherAccesses<'a> {
 
                     for (v, accesses) in accesses_or_err_attrs_to_attach {
                         let attrs = match v {
-                            AttrTarget::Var(VarKind::RegionInput { region, input_idx }) => {
-                                &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
-                                    .attrs
-                            }
-                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx }) => {
-                                &mut func_def_body.at_mut(node).def().outputs[output_idx as usize]
-                                    .attrs
-                            }
+                            AttrTarget::Var(v) => &mut func_def_body.at_mut(v).decl().attrs,
                             AttrTarget::Node(node) => {
                                 assert!(accesses.is_err());
 
@@ -888,27 +881,29 @@ impl<'a> GatherAccesses<'a> {
                         // FIXME(eddyb) may be relevant?
                         _ => unreachable!(),
                     },
-                    Value::Var(VarKind::RegionInput { region, input_idx })
-                        if region == func_def_body.body =>
-                    {
-                        &mut param_accesses[input_idx as usize]
-                    }
-                    Value::Var(ptr @ VarKind::RegionInput { .. }) => {
-                        // FIXME(eddyb) don't throw away `new_accesses`.
-                        accesses_or_err_attrs_to_attach.push((
-                            AttrTarget::Var(ptr),
-                            Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
-                        ));
-                        return;
-                    }
-                    Value::Var(VarKind::NodeOutput { node: ptr_node, output_idx }) => {
-                        let i = output_idx as usize;
-                        let slots = node_to_per_output_accesses.entry(ptr_node).or_default();
-                        if i >= slots.len() {
-                            slots.extend((slots.len()..=i).map(|_| None));
+                    Value::Var(ptr) => match func_def_body.at(ptr).decl().kind() {
+                        VarKind::RegionInput { region, input_idx }
+                            if region == func_def_body.body =>
+                        {
+                            &mut param_accesses[input_idx as usize]
                         }
-                        &mut slots[i]
-                    }
+                        VarKind::RegionInput { .. } => {
+                            // FIXME(eddyb) don't throw away `new_accesses`.
+                            accesses_or_err_attrs_to_attach.push((
+                                AttrTarget::Var(ptr),
+                                Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
+                            ));
+                            return;
+                        }
+                        VarKind::NodeOutput { node: ptr_node, output_idx } => {
+                            let i = output_idx as usize;
+                            let slots = node_to_per_output_accesses.entry(ptr_node).or_default();
+                            if i >= slots.len() {
+                                slots.extend((slots.len()..=i).map(|_| None));
+                            }
+                            &mut slots[i]
+                        }
+                    },
                 };
                 *slot = Some(match slot.take() {
                     Some(old) => old.and_then(|old| {
@@ -922,13 +917,12 @@ impl<'a> GatherAccesses<'a> {
 
             match &node_def.kind {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation { .. } => {
-                    for (i, accesses) in per_output_accesses.iter().enumerate() {
-                        let output =
-                            VarKind::NodeOutput { node, output_idx: i.try_into().unwrap() };
+                    for (&output_var, accesses) in node_def.outputs.iter().zip(&per_output_accesses)
+                    {
                         if let Some(_accesses) = accesses {
                             // FIXME(eddyb) don't throw away `accesses`.
                             accesses_or_err_attrs_to_attach.push((
-                                AttrTarget::Var(output),
+                                AttrTarget::Var(output_var),
                                 Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
                             ));
                         }
@@ -977,22 +971,18 @@ impl<'a> GatherAccesses<'a> {
                     };
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
                     if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                        .is_some_and(|o| is_qptr(o.ty))
+                        .is_some_and(|&o| is_qptr(func_def_body.at(o).decl().ty))
                         && let Some(accesses) = output_accesses
                     {
-                        accesses_or_err_attrs_to_attach.push((
-                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                            accesses,
-                        ));
+                        accesses_or_err_attrs_to_attach
+                            .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
                     }
                 }
 
                 DataInstKind::Mem(MemOp::FuncLocalVar(_)) => {
                     if let Some(accesses) = output_accesses {
-                        accesses_or_err_attrs_to_attach.push((
-                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                            accesses,
-                        ));
+                        accesses_or_err_attrs_to_attach
+                            .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
                     }
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
@@ -1180,7 +1170,9 @@ impl<'a> GatherAccesses<'a> {
                     // HACK(eddyb) `_` will match multiple variants soon.
                     #[allow(clippy::match_wildcard_for_single_variants)]
                     let (op_name, access_type) = match op {
-                        MemOp::Load => ("Load", data_inst_def.outputs[0].ty),
+                        MemOp::Load => {
+                            ("Load", func_def_body.at(data_inst_def.outputs[0]).decl().ty)
+                        }
                         MemOp::Store => {
                             ("Store", func_def_body.at(data_inst_def.inputs[1]).type_of(&cx))
                         }
@@ -1302,10 +1294,8 @@ impl<'a> GatherAccesses<'a> {
                     if has_from_spv_ptr_output_attr {
                         // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                         if let Some(accesses) = output_accesses {
-                            accesses_or_err_attrs_to_attach.push((
-                                AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                                accesses,
-                            ));
+                            accesses_or_err_attrs_to_attach
+                                .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
                         }
                     }
                 }

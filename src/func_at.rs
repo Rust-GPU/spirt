@@ -13,7 +13,7 @@
 
 use crate::{
     Context, EntityDefs, EntityList, EntityListIter, FuncDefBody, Node, NodeDef, Region, RegionDef,
-    Type, Value, Var, VarKind,
+    Type, Value, Var, VarDecl,
 };
 
 /// Immutable traversal (i.e. visiting) helper for intra-function entities.
@@ -24,6 +24,7 @@ use crate::{
 pub struct FuncAt<'a, P: Copy> {
     pub regions: &'a EntityDefs<Region>,
     pub nodes: &'a EntityDefs<Node>,
+    pub vars: &'a EntityDefs<Var>,
 
     pub position: P,
 }
@@ -31,7 +32,7 @@ pub struct FuncAt<'a, P: Copy> {
 impl<'a, P: Copy> FuncAt<'a, P> {
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAt<'a, P2> {
-        FuncAt { regions: self.regions, nodes: self.nodes, position: new_position }
+        FuncAt { regions: self.regions, nodes: self.nodes, vars: self.vars, position: new_position }
     }
 }
 
@@ -76,6 +77,12 @@ impl<'a> FuncAt<'a, Node> {
     }
 }
 
+impl<'a> FuncAt<'a, Var> {
+    pub fn decl(self) -> &'a VarDecl {
+        &self.vars[self.position]
+    }
+}
+
 impl FuncAt<'_, Value> {
     /// Return the [`Type`] of this [`Value`] ([`Context`] used for [`Value::Const`]).
     pub fn type_of(self, cx: &Context) -> Type {
@@ -88,15 +95,10 @@ impl FuncAt<'_, Value> {
 
 impl FuncAt<'_, Var> {
     /// Return the [`Type`] of this [`Var`].
+    //
+    // FIXME(eddyb) is this really necessary? if so, should it have this name?
     pub fn type_of(self) -> Type {
-        match self.position {
-            VarKind::RegionInput { region, input_idx } => {
-                self.at(region).def().inputs[input_idx as usize].ty
-            }
-            VarKind::NodeOutput { node, output_idx } => {
-                self.at(node).def().outputs[output_idx as usize].ty
-            }
-        }
+        self.decl().ty
     }
 }
 
@@ -107,6 +109,7 @@ impl FuncAt<'_, Var> {
 pub struct FuncAtMut<'a, P: Copy> {
     pub regions: &'a mut EntityDefs<Region>,
     pub nodes: &'a mut EntityDefs<Node>,
+    pub vars: &'a mut EntityDefs<Var>,
 
     pub position: P,
 }
@@ -114,20 +117,30 @@ pub struct FuncAtMut<'a, P: Copy> {
 impl<'a, P: Copy> FuncAtMut<'a, P> {
     /// Emulate a "reborrow", which is automatic only for `&mut` types.
     pub fn reborrow(&mut self) -> FuncAtMut<'_, P> {
-        FuncAtMut { regions: self.regions, nodes: self.nodes, position: self.position }
+        FuncAtMut {
+            regions: self.regions,
+            nodes: self.nodes,
+            vars: self.vars,
+            position: self.position,
+        }
     }
 
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAtMut<'a, P2> {
-        FuncAtMut { regions: self.regions, nodes: self.nodes, position: new_position }
+        FuncAtMut {
+            regions: self.regions,
+            nodes: self.nodes,
+            vars: self.vars,
+            position: new_position,
+        }
     }
 
     /// Demote to a `FuncAt`, with the same `position`.
     //
     // FIXME(eddyb) maybe find a better name for this?
     pub fn freeze(self) -> FuncAt<'a, P> {
-        let FuncAtMut { regions, nodes, position } = self;
-        FuncAt { regions, nodes, position }
+        let FuncAtMut { regions, nodes, vars, position } = self;
+        FuncAt { regions, nodes, vars, position }
     }
 }
 
@@ -165,15 +178,26 @@ impl<'a> FuncAtMut<'a, Node> {
     }
 }
 
+impl<'a> FuncAtMut<'a, Var> {
+    pub fn decl(self) -> &'a mut VarDecl {
+        &mut self.vars[self.position]
+    }
+}
+
 impl FuncDefBody {
     /// Start immutably traversing the function at `position`.
     pub fn at<P: Copy>(&self, position: P) -> FuncAt<'_, P> {
-        FuncAt { regions: &self.regions, nodes: &self.nodes, position }
+        FuncAt { regions: &self.regions, nodes: &self.nodes, vars: &self.vars, position }
     }
 
     /// Start mutably traversing the function at `position`.
     pub fn at_mut<P: Copy>(&mut self, position: P) -> FuncAtMut<'_, P> {
-        FuncAtMut { regions: &mut self.regions, nodes: &mut self.nodes, position }
+        FuncAtMut {
+            regions: &mut self.regions,
+            nodes: &mut self.nodes,
+            vars: &mut self.vars,
+            position,
+        }
     }
 
     /// Shorthand for `func_def_body.at(func_def_body.body)`.
