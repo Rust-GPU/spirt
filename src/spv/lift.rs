@@ -1347,12 +1347,9 @@ impl DataInstLifting {
                 unreachable!()
             }
 
-            DataInstKind::Mem(_) | DataInstKind::QPtr(_) | DataInstKind::ThunkBind(_) => {
-                // Disallowed while visiting.
-                unreachable!()
-            }
-
-            DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {
+            DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::Mem(MemOp::Load { offset: None } | MemOp::Store { offset: None }) => {
                 // FIXME(eddyb) deduplicate creating this `OpTypeStruct`.
                 if output_types.len() > 1 {
                     let tuple_ty =
@@ -1374,6 +1371,11 @@ impl DataInstLifting {
             }
             DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
                 lowering
+            }
+
+            DataInstKind::Mem(_) | DataInstKind::QPtr(_) | DataInstKind::ThunkBind(_) => {
+                // Disallowed while visiting.
+                unreachable!()
             }
         };
 
