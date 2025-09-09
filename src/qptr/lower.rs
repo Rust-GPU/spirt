@@ -7,12 +7,12 @@ use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Region, Type,
-    TypeKind, TypeOrConst, Value, VarDecl, spv,
+    TypeKind, TypeOrConst, Value, VarDecl, VarKind, spv,
 };
 use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
 use std::cell::Cell;
-use std::num::NonZeroU32;
+use std::num::{NonZeroI32, NonZeroU32};
 use std::rc::Rc;
 
 // HACK(eddyb) sharing layout code with other modules.
@@ -409,6 +409,20 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) wasteful clone? (needed due to borrowing issues)
         let outputs = data_inst_def.outputs.clone();
 
+        // Map `ptr` to its base & offset, if it points to a `QPtrOp::Offset`.
+        let ptr_to_base_ptr_and_offset = |ptr| {
+            if let Value::Var(ptr) = ptr
+                && let VarKind::NodeOutput { node: ptr_inst, output_idx: 0 } =
+                    func.at(ptr).decl().kind()
+            {
+                let ptr_inst_def = func.at(ptr_inst).def();
+                if let DataInstKind::QPtr(QPtrOp::Offset(ptr_offset)) = ptr_inst_def.kind {
+                    return Some((ptr_inst_def.inputs[0], NonZeroI32::new(ptr_offset)));
+                }
+            }
+            None
+        };
+
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
             assert!(data_inst_def.inputs.len() <= 1);
             let (_, var_data_type) =
@@ -430,14 +444,25 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
             assert_eq!(data_inst_def.inputs.len(), 1);
-            (MemOp::Load.into(), data_inst_def.inputs.clone())
+
+            let ptr = data_inst_def.inputs[0];
+
+            let (ptr, offset) = ptr_to_base_ptr_and_offset(ptr).unwrap_or((ptr, None));
+
+            (MemOp::Load { offset }.into(), [ptr].into_iter().collect())
         } else if spv_inst.opcode == wk.OpStore {
             // FIXME(eddyb) support memory operands somehow.
             if !spv_inst.imms.is_empty() {
                 return Ok(Transformed::Unchanged);
             }
             assert_eq!(data_inst_def.inputs.len(), 2);
-            (MemOp::Store.into(), data_inst_def.inputs.clone())
+
+            let ptr = data_inst_def.inputs[0];
+            let value = data_inst_def.inputs[1];
+
+            let (ptr, offset) = ptr_to_base_ptr_and_offset(ptr).unwrap_or((ptr, None));
+
+            (MemOp::Store { offset }.into(), [ptr, value].into_iter().collect())
         } else if spv_inst.opcode == wk.OpArrayLength {
             let field_idx = match spv_inst.imms[..] {
                 [spv::Imm::Short(_, field_idx)] => field_idx,
@@ -528,14 +553,26 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     self.lowerer.layout_of(base_pointee_type)?
                 };
 
+            let mut ptr = base_ptr;
             let mut steps =
                 self.try_lower_access_chain(access_chain_base_layout, &data_inst_def.inputs[1..])?;
+
+            // Fold a previous `Offset` into an initial offset step, where possible.
+            if let Some(QPtrChainStep { op: QPtrOp::Offset(first_offset), dyn_idx: None }) =
+                steps.first_mut()
+                && let Some((ptr_base_ptr, ptr_offset)) = ptr_to_base_ptr_and_offset(ptr)
+                && let Some(new_first_offset) =
+                    first_offset.checked_add(ptr_offset.map_or(0, |o| o.get()))
+            {
+                ptr = ptr_base_ptr;
+                *first_offset = new_first_offset;
+            }
+
             // HACK(eddyb) noop cases should probably not use any `DataInst`s at all,
             // but that would require the ability to replace all uses of a `Value`.
             let final_step =
                 steps.pop().unwrap_or(QPtrChainStep { op: QPtrOp::Offset(0), dyn_idx: None });
 
-            let mut ptr = base_ptr;
             for step in steps {
                 let func = func_at_data_inst.reborrow().at(());
 
