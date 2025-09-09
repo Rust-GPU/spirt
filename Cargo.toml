@@ -1,5 +1,5 @@
 [workspace]
-members = ["vk-layer"]
+members = ["spirti", "vk-layer"]
 
 [package]
 name = "spirt"

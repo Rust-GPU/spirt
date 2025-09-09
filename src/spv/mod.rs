@@ -302,7 +302,8 @@ impl Type {
         }))
     }
 
-    fn aggregate_component_type_and_leaf_range(
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn aggregate_component_type_and_leaf_range(
         self,
         cx: &Context,
         idx: u32,
