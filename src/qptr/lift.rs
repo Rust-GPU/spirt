@@ -1114,7 +1114,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                                 _ => {
                                     return Err(LiftError(Diag::bug([
-                                        "ToSpvPtrInput: expected type not found in pointee type layout"
+                                        "ToSpvPtrInput: expected type not found \
+                                         in pointee type layout"
                                             .into(),
                                     ])));
                                 }

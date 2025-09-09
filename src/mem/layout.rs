@@ -763,21 +763,8 @@ impl<'a> LayoutCache<'a> {
             } else {
                 TypeLayout::Concrete(concrete)
             }
-        } else if [
-            wk.OpTypeImage,
-            wk.OpTypeSampler,
-            wk.OpTypeSampledImage,
-            wk.OpTypeAccelerationStructureKHR,
-        ]
-        .contains(&spv_inst.opcode)
-        {
-            TypeLayout::Handle(shapes::Handle::Opaque(ty))
         } else {
-            return Err(LayoutError(Diag::bug([format!(
-                "unknown/unsupported SPIR-V type `{}`",
-                spv_inst.opcode.name()
-            )
-            .into()])));
+            TypeLayout::Handle(shapes::Handle::Opaque(ty))
         })
     }
 }
