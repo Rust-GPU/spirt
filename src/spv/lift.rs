@@ -120,8 +120,22 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             return;
         }
         let ty_def = &self.cx[ty];
+
+        // HACK(eddyb) there isn't a great way to handle canonical types, but
+        // perhaps this result should be recorded in `self.globals`?
+        if let Some((_spv_inst, type_and_const_inputs)) =
+            spv::Inst::from_canonical_type(self.cx, &ty_def.kind)
+        {
+            for ty_or_ct in type_and_const_inputs {
+                match ty_or_ct {
+                    TypeOrConst::Type(ty) => self.visit_type_use(ty),
+                    TypeOrConst::Const(ct) => self.visit_const_use(ct),
+                }
+            }
+        }
+
         match ty_def.kind {
-            TypeKind::Scalar(_) | TypeKind::SpvInst { .. } => {}
+            TypeKind::Scalar(_) | TypeKind::Vector(_) | TypeKind::SpvInst { .. } => {}
 
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
@@ -141,6 +155,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 );
             }
         }
+
         self.visit_type_def(ty_def);
         self.globals.insert(global);
     }
@@ -150,6 +165,17 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             return;
         }
         let ct_def = &self.cx[ct];
+
+        // HACK(eddyb) there isn't a great way to handle canonical consts, but
+        // perhaps this result should be recorded in `self.globals`?
+        if let Some((_spv_inst, const_inputs)) =
+            spv::Inst::from_canonical_const(self.cx, &ct_def.kind)
+        {
+            for ct in const_inputs {
+                self.visit_const_use(ct);
+            }
+        }
+
         match ct_def.kind {
             ConstKind::Undef if matches!(self.cx[ct_def.ty].kind, TypeKind::Thunk) => {
                 // HACK(eddyb) unstructured control-flow may use `undef` thunks.
@@ -157,6 +183,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
 
             ConstKind::Undef
             | ConstKind::Scalar(_)
+            | ConstKind::Vector(_)
             | ConstKind::PtrToGlobalVar(_)
             | ConstKind::PtrToFunc(_)
             | ConstKind::SpvInst { .. } => {
@@ -1274,8 +1301,9 @@ impl LazyInst<'_, '_> {
                             }
 
                             ConstKind::Undef
-                            | ConstKind::PtrToFunc(_)
                             | ConstKind::Scalar(_)
+                            | ConstKind::Vector(_)
+                            | ConstKind::PtrToFunc(_)
                             | ConstKind::SpvInst { .. } => (ct_def.attrs, None),
 
                             // Not inserted into `globals` while visiting.
@@ -1353,19 +1381,16 @@ impl LazyInst<'_, '_> {
             Self::Global(global) => match global {
                 Global::Type(ty) => {
                     let ty_def = &cx[ty];
-                    match spv::Inst::from_canonical_type(&ty_def.kind).ok_or(&ty_def.kind) {
-                        Ok(spv_inst) => spv::InstWithIds {
-                            without_ids: spv_inst,
-                            result_type_id: None,
-                            result_id,
-                            ids: [].into_iter().collect(),
-                        },
-
-                        Err(TypeKind::Scalar(_)) => {
+                    match spv::Inst::from_canonical_type(cx, &ty_def.kind)
+                        .as_ref()
+                        .ok_or(&ty_def.kind)
+                    {
+                        Err(TypeKind::Scalar(_) | TypeKind::Vector(_)) => {
                             unreachable!("should've been handled as canonical")
                         }
 
-                        Err(TypeKind::SpvInst { spv_inst, type_and_const_inputs }) => {
+                        Ok((spv_inst, type_and_const_inputs))
+                        | Err(TypeKind::SpvInst { spv_inst, type_and_const_inputs }) => {
                             spv::InstWithIds {
                                 without_ids: spv_inst.clone(),
                                 result_type_id: None,
@@ -1392,15 +1417,32 @@ impl LazyInst<'_, '_> {
                 }
                 Global::Const(ct) => {
                     let ct_def = &cx[ct];
-                    match spv::Inst::from_canonical_const(&ct_def.kind).ok_or(&ct_def.kind) {
-                        Ok(spv_inst) => spv::InstWithIds {
+                    match spv::Inst::from_canonical_const(cx, &ct_def.kind).ok_or(&ct_def.kind) {
+                        // FIXME(eddyb) this duplicates the `ConstKind::SpvInst`
+                        // case, only due to an inability to pattern-match `Rc`.
+                        Ok((spv_inst, const_inputs)) => spv::InstWithIds {
                             without_ids: spv_inst,
                             result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
                             result_id,
-                            ids: [].into_iter().collect(),
+                            ids: const_inputs
+                                .iter()
+                                .map(|&ct| ids.globals[&Global::Const(ct)])
+                                .collect(),
                         },
+                        Err(ConstKind::SpvInst { spv_inst_and_const_inputs }) => {
+                            let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
+                            spv::InstWithIds {
+                                without_ids: spv_inst.clone(),
+                                result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
+                                result_id,
+                                ids: const_inputs
+                                    .iter()
+                                    .map(|&ct| ids.globals[&Global::Const(ct)])
+                                    .collect(),
+                            }
+                        }
 
-                        Err(ConstKind::Undef | ConstKind::Scalar(_)) => {
+                        Err(ConstKind::Undef | ConstKind::Scalar(_) | ConstKind::Vector(_)) => {
                             unreachable!("should've been handled as canonical")
                         }
 
@@ -1443,19 +1485,6 @@ impl LazyInst<'_, '_> {
                             result_id,
                             ids: [ids.funcs[&func].func_id].into_iter().collect(),
                         },
-
-                        Err(ConstKind::SpvInst { spv_inst_and_const_inputs }) => {
-                            let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
-                            spv::InstWithIds {
-                                without_ids: spv_inst.clone(),
-                                result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
-                                result_id,
-                                ids: const_inputs
-                                    .iter()
-                                    .map(|&ct| ids.globals[&Global::Const(ct)])
-                                    .collect(),
-                            }
-                        }
 
                         // Not inserted into `globals` while visiting.
                         Err(ConstKind::SpvStringLiteralForExtInst(_)) => unreachable!(),
