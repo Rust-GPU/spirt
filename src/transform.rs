@@ -632,6 +632,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Scalar(_)
             | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

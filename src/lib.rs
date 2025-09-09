@@ -962,6 +962,12 @@ pub enum NodeKind {
 
     // NOTE(eddyb) all variants below used to be in `DataInstKind`.
     //
+    /// Scalar (`bool`, integer, and floating-point) pure operations.
+    ///
+    /// See also the [`scalar`] module for more documentation and definitions.
+    #[from]
+    Scalar(scalar::Op),
+
     FuncCall(Func),
 
     /// Memory-specific operations (see [`mem::MemOp`]).

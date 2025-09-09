@@ -225,11 +225,14 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     }
 
     fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
-        #[allow(clippy::match_same_arms)]
         match func_at_node.def().kind {
-            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {}
-
-            DataInstKind::FuncCall(_) => {}
+            NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_)
+            | DataInstKind::Scalar(_)
+            | DataInstKind::FuncCall(_)
+            | DataInstKind::ThunkBind(_)
+            | DataInstKind::SpvInst(_) => {}
 
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
@@ -243,9 +246,6 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 unreachable!("`DataInstKind::QPtr` should be legalized away before lifting");
             }
 
-            DataInstKind::ThunkBind(_) => {}
-
-            DataInstKind::SpvInst(_) => {}
             DataInstKind::SpvExtInst { ext_set, .. } => {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
             }
@@ -492,7 +492,8 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 | NodeKind::Loop { .. }
                 | NodeKind::ExitInvocation { .. } => None,
 
-                DataInstKind::FuncCall(_)
+                DataInstKind::Scalar(_)
+                | DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::ThunkBind(_)
@@ -705,7 +706,8 @@ impl<'a> FuncLifting<'a> {
                         SmallVec::new()
                     }
 
-                    DataInstKind::FuncCall(_)
+                    DataInstKind::Scalar(_)
+                    | DataInstKind::FuncCall(_)
                     | DataInstKind::Mem(_)
                     | DataInstKind::QPtr(_)
                     | DataInstKind::SpvInst(_)
@@ -875,7 +877,8 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        DataInstKind::FuncCall(_)
+                        DataInstKind::Scalar(_)
+                        | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::ThunkBind(_)
@@ -951,6 +954,7 @@ impl<'a> FuncLifting<'a> {
                         }
 
                         NodeKind::ExitInvocation { .. }
+                        | DataInstKind::Scalar(_)
                         | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
@@ -1510,29 +1514,43 @@ impl LazyInst<'_, '_> {
                     .collect(),
             },
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
-                let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
-                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
-                        unreachable!()
-                    }
+                let kind = &data_inst_def.kind;
+                let (inst, extra_initial_id_operand) =
+                    match spv::Inst::from_canonical_node_kind(kind).ok_or(kind) {
+                        Ok(spv_inst) => (spv_inst, None),
 
-                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) | DataInstKind::ThunkBind(_) => {
-                        // Disallowed while visiting.
-                        unreachable!()
-                    }
+                        Err(
+                            NodeKind::Select(_)
+                            | NodeKind::Loop { .. }
+                            | NodeKind::ExitInvocation(_),
+                        ) => unreachable!(),
 
-                    &DataInstKind::FuncCall(callee) => {
-                        (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
-                    }
-                    DataInstKind::SpvInst(inst) => (inst.clone(), None),
-                    &DataInstKind::SpvExtInst { ext_set, inst } => (
-                        spv::Inst {
-                            opcode: wk.OpExtInst,
-                            imms: iter::once(spv::Imm::Short(wk.LiteralExtInstInteger, inst))
-                                .collect(),
-                        },
-                        Some(ids.ext_inst_imports[&cx[ext_set]]),
-                    ),
-                };
+                        Err(DataInstKind::Scalar(_)) => {
+                            unreachable!("should've been handled as canonical")
+                        }
+
+                        Err(
+                            DataInstKind::Mem(_)
+                            | DataInstKind::QPtr(_)
+                            | DataInstKind::ThunkBind(_),
+                        ) => {
+                            // Disallowed while visiting.
+                            unreachable!()
+                        }
+
+                        Err(&DataInstKind::FuncCall(callee)) => {
+                            (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
+                        }
+                        Err(DataInstKind::SpvInst(inst)) => (inst.clone(), None),
+                        Err(&DataInstKind::SpvExtInst { ext_set, inst }) => (
+                            spv::Inst {
+                                opcode: wk.OpExtInst,
+                                imms: iter::once(spv::Imm::Short(wk.LiteralExtInstInteger, inst))
+                                    .collect(),
+                            },
+                            Some(ids.ext_inst_imports[&cx[ext_set]]),
+                        ),
+                    };
                 spv::InstWithIds {
                     without_ids: inst,
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.

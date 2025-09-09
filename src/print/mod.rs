@@ -3763,7 +3763,8 @@ impl Print for FuncAt<'_, Node> {
                 inputs.iter().map(|v| v.print(printer)),
             ),
 
-            DataInstKind::FuncCall(_)
+            DataInstKind::Scalar(_)
+            | DataInstKind::FuncCall(_)
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::ThunkBind(_)
@@ -3808,6 +3809,19 @@ impl FuncAt<'_, DataInst> {
         let def_without_type = match kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                 unreachable!()
+            }
+
+            &DataInstKind::Scalar(op) => {
+                let name = op.name();
+                let (namespace_prefix, name) = name.split_at(name.find('.').unwrap() + 1);
+                pretty::Fragment::new([
+                    printer
+                        .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                        .apply(namespace_prefix)
+                        .into(),
+                    printer.declarative_keyword_style().apply(name).into(),
+                    pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+                ])
             }
 
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([

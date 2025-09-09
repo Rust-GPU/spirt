@@ -411,6 +411,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
 
+            DataInstKind::Scalar(_) => return Ok(Transformed::Unchanged),
+
             &DataInstKind::FuncCall(_callee) => {
                 for &v in &data_inst_def.inputs {
                     if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
