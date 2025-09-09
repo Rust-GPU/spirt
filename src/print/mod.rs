@@ -19,6 +19,7 @@
 #![allow(unstable_name_collisions)]
 use itertools::Itertools as _;
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::print::multiversion::Versions;
@@ -30,8 +31,7 @@ use crate::{
     EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
     Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq,
-    Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value,
-    cfg, spv,
+    Region, RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -3858,7 +3858,7 @@ impl Print for FuncAt<'_, Node> {
                 ])
             }
             NodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
+                kind: cf::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
                 inputs,
             } => printer.pretty_spv_inst(
                 kw_style,
@@ -4274,7 +4274,7 @@ impl Print for FuncAt<'_, DataInst> {
     }
 }
 
-impl Print for cfg::ControlInst {
+impl Print for cf::unstructured::ControlInst {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let Self { attrs, kind, inputs, targets, target_inputs } = self;
@@ -4300,12 +4300,12 @@ impl Print for cfg::ControlInst {
         });
 
         let def = match kind {
-            cfg::ControlInstKind::Unreachable => {
+            cf::unstructured::ControlInstKind::Unreachable => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0 && inputs.is_empty());
                 kw("unreachable")
             }
-            cfg::ControlInstKind::Return => {
+            cf::unstructured::ControlInstKind::Return => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0);
                 match inputs[..] {
@@ -4314,10 +4314,9 @@ impl Print for cfg::ControlInst {
                     _ => unreachable!(),
                 }
             }
-            cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(spv::Inst {
-                opcode,
-                imms,
-            })) => {
+            cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
+                spv::Inst { opcode, imms },
+            )) => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0);
                 printer.pretty_spv_inst(
@@ -4328,12 +4327,12 @@ impl Print for cfg::ControlInst {
                 )
             }
 
-            cfg::ControlInstKind::Branch => {
+            cf::unstructured::ControlInstKind::Branch => {
                 assert_eq!((targets.len(), inputs.len()), (1, 0));
                 targets.next().unwrap()
             }
 
-            cfg::ControlInstKind::SelectBranch(kind) => {
+            cf::unstructured::ControlInstKind::SelectBranch(kind) => {
                 assert_eq!(inputs.len(), 1);
                 kind.print_with_scrutinee_and_cases(printer, kw_style, inputs[0], targets)
             }
