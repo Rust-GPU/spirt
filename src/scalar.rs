@@ -37,7 +37,7 @@ impl Type {
 }
 
 /// Bit-width of a supported integer type (only power-of-two multiples of a byte).
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntWidth {
     // HACK(eddyb) this is so compact that only 3 bits of this byte are used
     // to encode integer types from `i8` to `i128`, and so `Type` could all fit

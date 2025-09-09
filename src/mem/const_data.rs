@@ -4,9 +4,9 @@ use crate::scalar;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
-use std::iter;
 use std::num::NonZeroU32;
 use std::ops::Range;
+use std::{iter, mem};
 
 /// Constant data "blob" or "chunk", where each byte can be part of:
 /// - uninitialized areas (e.g. SPIR-V `OpUndef`)
@@ -100,6 +100,19 @@ impl<V: Clone> ConstData<V> {
             syms: BTreeMap::new(),
             max_sym_size: NonZeroU32::new(1).unwrap(),
         }
+    }
+
+    // HACK(eddyb) only used by `qptr::legalize` for fusing `GlobalVar`s.
+    pub fn grow(&mut self, new_size: u32) {
+        assert!(new_size >= self.size());
+        let new_size = new_size as usize;
+
+        let mut init = mem::take(&mut self.init).into_vec();
+        let mut data = mem::take(&mut self.data).into_vec();
+        init.extend((init.len()..new_size.div_ceil(64)).map(|_| 0));
+        data.extend((data.len()..new_size).map(|_| 0));
+        self.init = init.into_boxed_slice();
+        self.data = data.into_boxed_slice();
     }
 
     pub fn size(&self) -> u32 {
