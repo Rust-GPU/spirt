@@ -903,8 +903,21 @@ impl<'a> GatherAccesses<'a> {
                         ConstKind::PtrToGlobalVar(gv) => {
                             this.global_var_accesses.entry(gv).or_default()
                         }
-                        // FIXME(eddyb) may be relevant?
-                        _ => unreachable!(),
+                        // FIXME(eddyb) attach on the `Const` by replacing
+                        // it with a copy that also has an extra attribute,
+                        // or actually support by adding the accesses attribute
+                        // in the same manner (if it makes sense to do so).
+                        _ => {
+                            accesses_or_err_attrs_to_attach.push((
+                                AttrTarget::Node(node),
+                                Err(AnalysisError(Diag::bug([
+                                    "unsupported pointer constant `".into(),
+                                    ct.into(),
+                                    "`".into(),
+                                ]))),
+                            ));
+                            return;
+                        }
                     },
                     Value::Var(ptr) => match func_def_body.at(ptr).decl().kind() {
                         VarKind::RegionInput { region, input_idx }
