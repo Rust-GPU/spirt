@@ -12,8 +12,8 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::{
-    Context, DataInst, DataInstDef, EntityDefs, EntityList, EntityListIter, FuncDefBody, Node,
-    NodeDef, Region, RegionDef, Type, Value,
+    Context, EntityDefs, EntityList, EntityListIter, FuncDefBody, Node, NodeDef, Region, RegionDef,
+    Type, Value,
 };
 
 /// Immutable traversal (i.e. visiting) helper for intra-function entities.
@@ -24,7 +24,6 @@ use crate::{
 pub struct FuncAt<'a, P: Copy> {
     pub regions: &'a EntityDefs<Region>,
     pub nodes: &'a EntityDefs<Node>,
-    pub data_insts: &'a EntityDefs<DataInst>,
 
     pub position: P,
 }
@@ -32,12 +31,7 @@ pub struct FuncAt<'a, P: Copy> {
 impl<'a, P: Copy> FuncAt<'a, P> {
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAt<'a, P2> {
-        FuncAt {
-            regions: self.regions,
-            nodes: self.nodes,
-            data_insts: self.data_insts,
-            position: new_position,
-        }
+        FuncAt { regions: self.regions, nodes: self.nodes, position: new_position }
     }
 }
 
@@ -82,37 +76,6 @@ impl<'a> FuncAt<'a, Node> {
     }
 }
 
-impl<'a> IntoIterator for FuncAt<'a, EntityList<DataInst>> {
-    type IntoIter = FuncAt<'a, EntityListIter<DataInst>>;
-    type Item = FuncAt<'a, DataInst>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.at(self.position.iter())
-    }
-}
-
-impl<'a> Iterator for FuncAt<'a, EntityListIter<DataInst>> {
-    type Item = FuncAt<'a, DataInst>;
-    fn next(&mut self) -> Option<Self::Item> {
-        let (next, rest) = self.position.split_first(self.data_insts)?;
-        self.position = rest;
-        Some(self.at(next))
-    }
-}
-
-impl DoubleEndedIterator for FuncAt<'_, EntityListIter<DataInst>> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let (prev, rest) = self.position.split_last(self.data_insts)?;
-        self.position = rest;
-        Some(self.at(prev))
-    }
-}
-
-impl<'a> FuncAt<'a, DataInst> {
-    pub fn def(self) -> &'a DataInstDef {
-        &self.data_insts[self.position]
-    }
-}
-
 impl FuncAt<'_, Value> {
     /// Return the [`Type`] of this [`Value`] ([`Context`] used for [`Value::Const`]).
     pub fn type_of(self, cx: &Context) -> Type {
@@ -138,7 +101,6 @@ impl FuncAt<'_, Value> {
 pub struct FuncAtMut<'a, P: Copy> {
     pub regions: &'a mut EntityDefs<Region>,
     pub nodes: &'a mut EntityDefs<Node>,
-    pub data_insts: &'a mut EntityDefs<DataInst>,
 
     pub position: P,
 }
@@ -146,30 +108,20 @@ pub struct FuncAtMut<'a, P: Copy> {
 impl<'a, P: Copy> FuncAtMut<'a, P> {
     /// Emulate a "reborrow", which is automatic only for `&mut` types.
     pub fn reborrow(&mut self) -> FuncAtMut<'_, P> {
-        FuncAtMut {
-            regions: self.regions,
-            nodes: self.nodes,
-            data_insts: self.data_insts,
-            position: self.position,
-        }
+        FuncAtMut { regions: self.regions, nodes: self.nodes, position: self.position }
     }
 
     /// Reposition to `new_position`.
     pub fn at<P2: Copy>(self, new_position: P2) -> FuncAtMut<'a, P2> {
-        FuncAtMut {
-            regions: self.regions,
-            nodes: self.nodes,
-            data_insts: self.data_insts,
-            position: new_position,
-        }
+        FuncAtMut { regions: self.regions, nodes: self.nodes, position: new_position }
     }
 
     /// Demote to a `FuncAt`, with the same `position`.
     //
     // FIXME(eddyb) maybe find a better name for this?
     pub fn freeze(self) -> FuncAt<'a, P> {
-        let FuncAtMut { regions, nodes, data_insts, position } = self;
-        FuncAt { regions, nodes, data_insts, position }
+        let FuncAtMut { regions, nodes, position } = self;
+        FuncAt { regions, nodes, position }
     }
 }
 
@@ -207,48 +159,15 @@ impl<'a> FuncAtMut<'a, Node> {
     }
 }
 
-// HACK(eddyb) can't implement `IntoIterator` because `next` borrows `self`.
-impl<'a> FuncAtMut<'a, EntityList<DataInst>> {
-    pub fn into_iter(self) -> FuncAtMut<'a, EntityListIter<DataInst>> {
-        let iter = self.position.iter();
-        self.at(iter)
-    }
-}
-
-// HACK(eddyb) can't implement `Iterator` because `next` borrows `self`.
-impl FuncAtMut<'_, EntityListIter<DataInst>> {
-    pub fn next(&mut self) -> Option<FuncAtMut<'_, DataInst>> {
-        let (next, rest) = self.position.split_first(self.data_insts)?;
-        self.position = rest;
-        Some(self.reborrow().at(next))
-    }
-}
-
-impl<'a> FuncAtMut<'a, DataInst> {
-    pub fn def(self) -> &'a mut DataInstDef {
-        &mut self.data_insts[self.position]
-    }
-}
-
 impl FuncDefBody {
     /// Start immutably traversing the function at `position`.
     pub fn at<P: Copy>(&self, position: P) -> FuncAt<'_, P> {
-        FuncAt {
-            regions: &self.regions,
-            nodes: &self.nodes,
-            data_insts: &self.data_insts,
-            position,
-        }
+        FuncAt { regions: &self.regions, nodes: &self.nodes, position }
     }
 
     /// Start mutably traversing the function at `position`.
     pub fn at_mut<P: Copy>(&mut self, position: P) -> FuncAtMut<'_, P> {
-        FuncAtMut {
-            regions: &mut self.regions,
-            nodes: &mut self.nodes,
-            data_insts: &mut self.data_insts,
-            position,
-        }
+        FuncAtMut { regions: &mut self.regions, nodes: &mut self.nodes, position }
     }
 
     /// Shorthand for `func_def_body.at(func_def_body.body)`.

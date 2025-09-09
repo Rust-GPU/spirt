@@ -544,7 +544,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             let mut ptr = base_ptr;
             for step in steps {
                 let (kind, inputs) = step.into_data_inst_kind_and_inputs(ptr);
-                let step_data_inst = func_at_data_inst.reborrow().data_insts.define(
+                let step_data_inst = func_at_data_inst.reborrow().nodes.define(
                     cx,
                     DataInstDef {
                         attrs: Default::default(),
@@ -561,6 +561,8 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     .into(),
                 );
 
+                // FIXME(eddyb) comment below should be about `nodes` vs `regions`
+                // (once `Block` and the `Node`-vs-`DataInst` split are gone).
                 // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                 // due to the need to borrow `nodes` and `data_insts`
                 // at the same time - perhaps some kind of `FuncAtMut` position
@@ -568,9 +570,10 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 // to make this more ergonomic, although the potential need for
                 // an actual list entity of its own, should be considered.
                 let func = func_at_data_inst.reborrow().at(());
-                match &mut func.nodes[parent_block].kind {
-                    NodeKind::Block { insts } => {
-                        insts.insert_before(step_data_inst, data_inst, func.data_insts);
+                match func.nodes[parent_block].kind {
+                    NodeKind::Block { mut insts } => {
+                        insts.insert_before(step_data_inst, data_inst, func.nodes);
+                        func.nodes[parent_block].kind = NodeKind::Block { insts };
                     }
                     _ => unreachable!(),
                 }
@@ -624,6 +627,11 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let func = func_at_data_inst_frozen.at(());
 
         match data_inst_def.kind {
+            NodeKind::Block { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => unreachable!(),
+
             // Known semantics, no need to preserve SPIR-V pointer information.
             DataInstKind::FuncCall(_) | DataInstKind::Mem(_) | DataInstKind::QPtr(_) => return,
 
