@@ -1209,14 +1209,14 @@ impl<'a> GatherAccesses<'a> {
                         ),
                     );
                 }
-                DataInstKind::Mem(op @ (MemOp::Load | MemOp::Store)) => {
+                DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
                     // HACK(eddyb) `_` will match multiple variants soon.
                     #[allow(clippy::match_wildcard_for_single_variants)]
                     let (op_name, access_type) = match op {
-                        MemOp::Load => {
+                        MemOp::Load { .. } => {
                             ("Load", func_def_body.at(data_inst_def.outputs[0]).decl().ty)
                         }
-                        MemOp::Store => {
+                        MemOp::Store { .. } => {
                             ("Store", func_def_body.at(data_inst_def.inputs[1]).type_of(&cx))
                         }
                         _ => unreachable!(),
@@ -1228,7 +1228,9 @@ impl<'a> GatherAccesses<'a> {
                             .layout_of(access_type)
                             .map_err(|LayoutError(e)| AnalysisError(e))
                             .and_then(|layout| match layout {
-                                TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
+                                TypeLayout::Handle(shapes::Handle::Opaque(ty))
+                                    if offset.is_none() =>
+                                {
                                     Ok(MemAccesses::Handles(shapes::Handle::Opaque(ty)))
                                 }
                                 TypeLayout::Handle(shapes::Handle::Buffer(..)) => {
@@ -1237,6 +1239,11 @@ impl<'a> GatherAccesses<'a> {
                                     )
                                     .into()])))
                                 }
+                                TypeLayout::Handle(_) => Err(AnalysisError(Diag::bug([format!(
+                                    "{op_name} {{ offset: {offset:?} }}: \
+                                     cannot offset in handle memory"
+                                )
+                                .into()]))),
                                 TypeLayout::HandleArray(..) => {
                                     Err(AnalysisError(Diag::bug([format!(
                                         "{op_name}: cannot access whole HandleArray"
@@ -1251,10 +1258,51 @@ impl<'a> GatherAccesses<'a> {
                                     )
                                     .into()])))
                                 }
-                                TypeLayout::Concrete(concrete) => Ok(MemAccesses::Data(DataHapp {
-                                    max_size: Some(concrete.mem_layout.fixed_base.size),
-                                    kind: DataHappKind::Direct(access_type),
-                                })),
+                                TypeLayout::Concrete(concrete) => {
+                                    let happ = DataHapp {
+                                        max_size: Some(concrete.mem_layout.fixed_base.size),
+                                        kind: DataHappKind::Direct(access_type),
+                                    };
+
+                                    // FIXME(eddyb) deduplicate this with
+                                    // `QPtrOp::Offset` above.
+                                    let offset = offset
+                                        .map(|offset| u32::try_from(offset.get()))
+                                        .transpose()
+                                        .ok()
+                                        .ok_or_else(|| {
+                                            AnalysisError(Diag::bug([format!(
+                                                "{op_name} {{ offset: {offset:?} }}: \
+                                                 negative offset"
+                                            )
+                                            .into()]))
+                                        })?;
+
+                                    let Some(offset) = offset else {
+                                        return Ok(MemAccesses::Data(happ));
+                                    };
+
+                                    Ok(MemAccesses::Data(DataHapp {
+                                        max_size: happ
+                                            .max_size
+                                            .map(|max_size| {
+                                                offset.checked_add(max_size).ok_or_else(|| {
+                                                    AnalysisError(Diag::bug([format!(
+                                                        "{op_name} {{ offset: {offset} }}: \
+                                                         size overflow ({offset}+{max_size})"
+                                                    )
+                                                    .into()]))
+                                                })
+                                            })
+                                            .transpose()?,
+                                        // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
+                                        // to represent the one-element case, seems
+                                        // quite wasteful when it's likely consumed.
+                                        kind: DataHappKind::Disjoint(Rc::new(
+                                            [(offset, happ)].into(),
+                                        )),
+                                    }))
+                                }
                             }),
                     );
                 }
