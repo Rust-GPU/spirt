@@ -45,6 +45,10 @@ pub struct LayoutConfig {
     // mode, which disallows reinterpretation on the basis that the precise
     // offsets/sizes may not match between types (but that's its own nightmare).
     pub logical_ptr_size_align: (u32, u32),
+
+    /// Whether `OpConvertPtrToU(p) = 0` and `p = OpConvertUToPtr(0)` are expected
+    /// to correspond to `p = OpConstantNull`, even for logical `OpTypePointer`s.
+    pub logical_ptr_null_is_zero: bool,
 }
 
 impl LayoutConfig {
@@ -56,6 +60,8 @@ impl LayoutConfig {
 
         abstract_bool_size_align: (1, 1),
         logical_ptr_size_align: (1, 1),
+
+        logical_ptr_null_is_zero: false,
     };
     pub const VULKAN_STANDARD_LAYOUT_LE: Self =
         Self { ignore_legacy_align: false, ..Self::VULKAN_SCALAR_LAYOUT_LE };
