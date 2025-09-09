@@ -5,13 +5,15 @@ use crate::mem::{MemOp, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
-    AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Region, Type,
-    TypeKind, TypeOrConst, Value, VarDecl, VarKind, spv,
+    AddrSpace, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
+    DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, Node, NodeDef,
+    NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl, VarKind, spv,
 };
 use itertools::{Either, Itertools as _};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cell::Cell;
+use std::mem;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::rc::Rc;
 
@@ -143,8 +145,14 @@ impl<'a> LowerFromSpvPtrs<'a> {
         // separately - so `LowerFromSpvPtrInstsInFunc` will leave all value defs
         // (including replaced instructions!) with unchanged `OpTypePointer`
         // types, that only `EraseSpvPtrs`, later, replaces with `QPtr`.
-        LowerFromSpvPtrInstsInFunc { lowerer: self, parent_region: None }
-            .in_place_transform_func_decl(func_decl);
+        LowerFromSpvPtrInstsInFunc {
+            lowerer: self,
+            parent_region: None,
+            var_use_counts: Default::default(),
+            remove_inst_if_dead_output_with_parent_region: Default::default(),
+            noop_offsets_to_base_ptr: Default::default(),
+        }
+        .in_place_transform_func_decl(func_decl);
         EraseSpvPtrs { lowerer: self }.in_place_transform_func_decl(func_decl);
     }
 
@@ -241,6 +249,18 @@ struct LowerFromSpvPtrInstsInFunc<'a> {
     lowerer: &'a LowerFromSpvPtrs<'a>,
 
     parent_region: Option<Region>,
+
+    var_use_counts: EntityOrientedDenseMap<Var, NonZeroU32>,
+
+    // HACK(eddyb) this acts as a "queue" for `qptr` outputs of instructions,
+    // which may end up dead because they're unused (either unused originally,
+    // in SPIR-V, or because of offset folding).
+    remove_inst_if_dead_output_with_parent_region: Vec<(Var, Region)>,
+
+    // FIXME(eddyb) this is redundant with a few other things and only here
+    // because it needs to be available from `transform_value`, which doesn't
+    // have access to a `FuncAt` to look up anything.
+    noop_offsets_to_base_ptr: FxHashMap<Var, Value>,
 }
 
 /// One `QPtr`->`QPtr` step used in the lowering of `Op*AccessChain`.
@@ -386,7 +406,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
     }
 
     fn try_lower_data_inst_def(
-        &self,
+        &mut self,
         mut func_at_data_inst: FuncAtMut<'_, DataInst>,
     ) -> Result<Transformed<DataInstDef>, LowerError> {
         let cx = &self.lowerer.cx;
@@ -399,7 +419,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) is this a good convention?
         let func = func_at_data_inst_frozen.at(());
 
-        let mut attrs = data_inst_def.attrs;
+        let attrs = data_inst_def.attrs;
 
         let spv_inst = match &data_inst_def.kind {
             DataInstKind::SpvInst(spv_inst) => spv_inst,
@@ -409,18 +429,26 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) wasteful clone? (needed due to borrowing issues)
         let outputs = data_inst_def.outputs.clone();
 
-        // Map `ptr` to its base & offset, if it points to a `QPtrOp::Offset`.
-        let ptr_to_base_ptr_and_offset = |ptr| {
-            if let Value::Var(ptr) = ptr
-                && let VarKind::NodeOutput { node: ptr_inst, output_idx: 0 } =
-                    func.at(ptr).decl().kind()
-            {
-                let ptr_inst_def = func.at(ptr_inst).def();
-                if let DataInstKind::QPtr(QPtrOp::Offset(ptr_offset)) = ptr_inst_def.kind {
-                    return Some((ptr_inst_def.inputs[0], NonZeroI32::new(ptr_offset)));
-                }
+        // Flatten `QPtrOp::Offset`s behind `ptr` into a base pointer and offset.
+        let flatten_offsets = |mut ptr| {
+            let mut offset = None::<NonZeroI32>;
+            loop {
+                (ptr, offset) = if let Value::Var(ptr) = ptr
+                    && let VarKind::NodeOutput { node: ptr_inst, output_idx: 0 } =
+                        func.at(ptr).decl().kind()
+                    && let NodeDef {
+                        kind: DataInstKind::QPtr(QPtrOp::Offset(ptr_offset)),
+                        inputs,
+                        ..
+                    } = func.at(ptr_inst).def()
+                    && let Some(new_offset) = ptr_offset.checked_add(offset.map_or(0, |o| o.get()))
+                {
+                    (inputs[0], NonZeroI32::new(new_offset))
+                } else {
+                    break;
+                };
             }
-            None
+            (ptr, offset)
         };
 
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
@@ -447,7 +475,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
             let ptr = data_inst_def.inputs[0];
 
-            let (ptr, offset) = ptr_to_base_ptr_and_offset(ptr).unwrap_or((ptr, None));
+            let (ptr, offset) = flatten_offsets(ptr);
 
             (MemOp::Load { offset }.into(), [ptr].into_iter().collect())
         } else if spv_inst.opcode == wk.OpStore {
@@ -460,7 +488,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             let ptr = data_inst_def.inputs[0];
             let value = data_inst_def.inputs[1];
 
-            let (ptr, offset) = ptr_to_base_ptr_and_offset(ptr).unwrap_or((ptr, None));
+            let (ptr, offset) = flatten_offsets(ptr);
 
             (MemOp::Store { offset }.into(), [ptr, value].into_iter().collect())
         } else if spv_inst.opcode == wk.OpArrayLength {
@@ -560,12 +588,14 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             // Fold a previous `Offset` into an initial offset step, where possible.
             if let Some(QPtrChainStep { op: QPtrOp::Offset(first_offset), dyn_idx: None }) =
                 steps.first_mut()
-                && let Some((ptr_base_ptr, ptr_offset)) = ptr_to_base_ptr_and_offset(ptr)
-                && let Some(new_first_offset) =
-                    first_offset.checked_add(ptr_offset.map_or(0, |o| o.get()))
             {
-                ptr = ptr_base_ptr;
-                *first_offset = new_first_offset;
+                let (ptr_base_ptr, ptr_offset) = flatten_offsets(ptr);
+                if let Some(new_first_offset) =
+                    first_offset.checked_add(ptr_offset.map_or(0, |o| o.get()))
+                {
+                    ptr = ptr_base_ptr;
+                    *first_offset = new_first_offset;
+                }
             }
 
             // HACK(eddyb) noop cases should probably not use any `DataInst`s at all,
@@ -611,6 +641,15 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     func.nodes,
                 );
 
+                // HACK(eddyb) account for traversal never seeing this,
+                // while still needing value replacement and/or use tracking.
+                func.at(step_data_inst).inner_in_place_transform_with(self);
+
+                // HACK(eddyb) this tracking is kind of ad-hoc but should
+                // easily cover everything we care about for now.
+                self.remove_inst_if_dead_output_with_parent_region
+                    .push((step_output_var, self.parent_region.unwrap()));
+
                 ptr = Value::Var(step_output_var);
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
@@ -620,15 +659,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             if self.lowerer.as_spv_ptr_type(func.at(input).type_of(cx)).is_some()
                 && self.lowerer.as_spv_ptr_type(func.at(outputs[0]).decl().ty).is_some()
             {
-                // HACK(eddyb) noop cases should not use any `DataInst`s at all,
-                // but that would require the ability to replace all uses of a `Value`.
-                let noop_step = QPtrChainStep { op: QPtrOp::Offset(0), dyn_idx: None };
-
-                // HACK(eddyb) since we're not removing the `DataInst` entirely,
-                // at least get rid of its attributes to clearly mark it as synthetic.
-                attrs = AttrSet::default();
-
-                noop_step.into_data_inst_kind_and_inputs(input)
+                // HACK(eddyb) this will end added to `noop_offsets_to_base_ptr`,
+                // which should replace all uses of this bitcast with its input.
+                (QPtrOp::Offset(0).into(), data_inst_def.inputs.clone())
             } else {
                 return Ok(Transformed::Unchanged);
             }
@@ -710,9 +743,51 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             func_at_data_inst.def().attrs = cx.intern(attrs);
         }
     }
+
+    // FIXME(eddyb) these are only this whacky because an `u32` is being
+    // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
+    fn add_value_uses(&mut self, values: &[Value]) {
+        for &v in values {
+            if let Value::Var(v) = v {
+                let count = self.var_use_counts.entry(v);
+                *count = Some(
+                    NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
+                );
+            }
+        }
+    }
+    fn remove_value_uses(&mut self, values: &[Value]) {
+        for &v in values {
+            if let Value::Var(v) = v {
+                let count = self.var_use_counts.entry(v);
+                *count = NonZeroU32::new(count.unwrap().get() - 1);
+            }
+        }
+    }
 }
 
 impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
+    // NOTE(eddyb) it's important that this only gets invoked on already lowered
+    // `Value`s, so we can rely on e.g. `noop_offsets_to_base_ptr` being filled.
+    fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
+        let mut v = *v;
+
+        let transformed = match v {
+            Value::Var(v) => self
+                .noop_offsets_to_base_ptr
+                .get(&v)
+                .copied()
+                .map_or(Transformed::Unchanged, Transformed::Changed),
+
+            Value::Const(_) => Transformed::Unchanged,
+        };
+
+        transformed.apply_to(&mut v);
+        self.add_value_uses(&[v]);
+
+        transformed
+    }
+
     fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
         let outer_region = self.parent_region.replace(func_at_region.position);
         func_at_region.inner_in_place_transform_with(self);
@@ -720,14 +795,76 @@ impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
     }
 
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
-        func_at_node.reborrow().inner_in_place_transform_with(self);
-
         match self.try_lower_data_inst_def(func_at_node.reborrow()) {
             Ok(Transformed::Changed(new_def)) => {
-                *func_at_node.def() = new_def;
+                // HACK(eddyb) this tracking is kind of ad-hoc but should
+                // easily cover everything we care about for now.
+                if let DataInstKind::QPtr(
+                    op @ (QPtrOp::HandleArrayIndex
+                    | QPtrOp::BufferData
+                    | QPtrOp::BufferDynLen { .. }
+                    | QPtrOp::Offset(_)
+                    | QPtrOp::DynOffset { .. }),
+                ) = &new_def.kind
+                {
+                    self.remove_inst_if_dead_output_with_parent_region.push((
+                        func_at_node.reborrow().def().outputs[0],
+                        self.parent_region.unwrap(),
+                    ));
+
+                    if let QPtrOp::Offset(0) = op {
+                        let mut base_ptr = new_def.inputs[0];
+                        if let Value::Var(base_ptr_var) = base_ptr
+                            && let Some(&base_ptr_base_ptr) =
+                                self.noop_offsets_to_base_ptr.get(&base_ptr_var)
+                        {
+                            base_ptr = base_ptr_base_ptr;
+                        }
+                        self.noop_offsets_to_base_ptr
+                            .insert(func_at_node.reborrow().def().outputs[0], base_ptr);
+                    }
+                }
+
+                *func_at_node.reborrow().def() = new_def;
             }
             result @ (Ok(Transformed::Unchanged) | Err(_)) => {
-                self.add_fallback_attrs_to_data_inst_def(func_at_node, result.err());
+                self.add_fallback_attrs_to_data_inst_def(func_at_node.reborrow(), result.err());
+            }
+        }
+
+        // NOTE(eddyb) this is done last so that `transform_value_use` only sees
+        // the lowered `Value`s, not the original ones.
+        func_at_node.inner_in_place_transform_with(self);
+    }
+
+    fn in_place_transform_func_decl(&mut self, func_decl: &mut FuncDecl) {
+        func_decl.inner_in_place_transform_with(self);
+
+        // Apply all `remove_inst_if_dead_output_with_parent_region` removals, that are truly unused.
+        if let DeclDef::Present(func_def_body) = &mut func_decl.def {
+            let remove_inst_if_dead_output_with_parent_region =
+                mem::take(&mut self.remove_inst_if_dead_output_with_parent_region);
+            // NOTE(eddyb) reverse order is important, as each removal can reduce
+            // use counts of an earlier definition, allowing further removal.
+            for (output_var, parent_region) in
+                remove_inst_if_dead_output_with_parent_region.into_iter().rev()
+            {
+                let is_used = self.var_use_counts.get(output_var).is_some();
+                if !is_used {
+                    let inst = func_def_body.at(output_var).decl().def_parent.right().unwrap();
+
+                    // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
+                    // due to the need to borrow `regions` and `nodes`
+                    // at the same time - perhaps some kind of `FuncAtMut` position
+                    // types for "where a list is in a parent entity" could be used
+                    // to make this more ergonomic, although the potential need for
+                    // an actual list entity of its own, should be considered.
+                    func_def_body.regions[parent_region]
+                        .children
+                        .remove(inst, &mut func_def_body.nodes);
+
+                    self.remove_value_uses(&func_def_body.at(inst).def().inputs);
+                }
             }
         }
     }
