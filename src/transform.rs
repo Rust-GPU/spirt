@@ -458,7 +458,8 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr
+                TypeKind::Scalar(_)
+                | TypeKind::QPtr
                 | TypeKind::Thunk
                 | TypeKind::SpvTypeOperand
                 | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
@@ -495,6 +496,7 @@ impl InnerTransform for ConstDef {
             ty -> transformer.transform_type_use(*ty),
             kind -> match kind {
                 ConstKind::Undef
+                | ConstKind::Scalar(_)
                 | ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged,
 
                 ConstKind::PtrToGlobalVar(gv) => transform!({
