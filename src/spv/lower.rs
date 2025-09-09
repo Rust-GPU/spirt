@@ -1662,8 +1662,9 @@ impl Module {
                                 &cx,
                                 NodeDef {
                                     attrs: AttrSet::default(),
-                                    inputs: SmallVec::new(),
                                     kind: NodeKind::Block { insts: EntityList::empty() },
+                                    inputs: SmallVec::new(),
+                                    child_regions: SmallVec::new(),
                                     outputs: SmallVec::new(),
                                 }
                                 .into(),

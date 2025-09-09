@@ -855,10 +855,13 @@ pub use context::Node;
 pub struct NodeDef {
     pub attrs: AttrSet,
 
+    pub kind: NodeKind,
+
     // FIXME(eddyb) change the inline size of this to fit most nodes.
     pub inputs: SmallVec<[Value; 2]>,
 
-    pub kind: NodeKind,
+    // HACK(eddyb) mostly separate to allow the above `kind`-before-`inputs` order.
+    pub child_regions: SmallVec<[Region; 2]>,
 
     /// Outputs from this [`Node`]:
     /// * accessed using [`Value::NodeOutput`]
@@ -887,18 +890,19 @@ pub enum NodeKind {
         insts: EntityList<DataInst>,
     },
 
-    /// Choose one [`Region`] out of `cases` to execute, based on a single
+    /// Choose one [`Region`] out of `child_regions` to execute, based on a single
     /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: cf::SelectionKind, cases: SmallVec<[Region; 2]> },
+    Select(cf::SelectionKind),
 
-    /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
+    /// Execute a "body" (`child_regions[0]`) repeatedly, until `repeat_condition`
+    /// evaluates to `false`.
     ///
-    /// To represent "loop state", `body` can take inputs, getting values from:
+    /// To represent "loop state", the body can take inputs, getting values from:
     /// * on the first iteration: initial `inputs` (from `NodeDef`)
-    /// * on later iterations: `body`'s own `outputs` (from the last iteration)
+    /// * on later iterations: the body's own `outputs` (from the last iteration)
     ///
     /// As the condition is checked only *after* the body, this type of loop is
     /// sometimes described as "tail-controlled", and is also equivalent to the
@@ -906,10 +910,8 @@ pub enum NodeKind {
     ///
     /// This corresponds to "theta" (`θ`) nodes in (R)VSDG.
     Loop {
-        body: Region,
-
-        // FIXME(eddyb) should this be kept in `body.outputs`? (that would not
-        // have any ambiguity as to whether it can see `body`-computed values)
+        // FIXME(eddyb) move this to body's `outputs`, removing any ambiguity as
+        // to whether it can see body-computed values, and simplifying traversals.
         repeat_condition: Value,
     },
 

@@ -13,7 +13,6 @@ use crate::{
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
-use std::slice;
 
 /// The result of a transformation (which is not in-place).
 #[must_use]
@@ -631,26 +630,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<Node>> {
     }
 }
 
-impl FuncAtMut<'_, Node> {
-    fn child_regions(&mut self) -> &mut [Region] {
-        match &mut self.reborrow().def().kind {
-            NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => &mut [][..],
-
-            NodeKind::Select { cases, .. } => cases,
-            NodeKind::Loop { body, .. } => slice::from_mut(body),
-        }
-    }
-}
-
 impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        // HACK(eddyb) handle all pre-child-regions fields separately to
-        // allow reborrowing `FuncAtMut` (for the child region recursion).
-        let NodeDef { attrs, inputs, kind, outputs: _ } = self.reborrow().def();
+        let NodeDef { attrs, kind, inputs: _, child_regions: _, outputs: _ } =
+            self.reborrow().def();
+
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
         match kind {
             &mut NodeKind::Block { insts } => {
                 let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
@@ -658,33 +643,27 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                     transformer.in_place_transform_data_inst_def(func_at_inst);
                 }
             }
-            NodeKind::Select {
-                kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                cases: _,
-            }
-            | NodeKind::Loop { body: _, repeat_condition: _ }
+            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
         }
 
-        // FIXME(eddyb) represent the list of child regions without having them
-        // in a `Vec` (or `SmallVec`), which requires workarounds like this.
-        for child_region_idx in 0..self.child_regions().len() {
-            let child_region = self.child_regions()[child_region_idx];
+        for v in &mut self.reborrow().def().inputs {
+            transformer.transform_value_use(v).apply_to(v);
+        }
+
+        for child_region_idx in 0..self.reborrow().def().child_regions.len() {
+            let child_region = self.reborrow().def().child_regions[child_region_idx];
             transformer.in_place_transform_region_def(self.reborrow().at(child_region));
         }
 
-        let NodeDef { attrs: _, inputs: _, kind, outputs } = self.reborrow().def();
+        let NodeDef { attrs: _, kind, inputs: _, child_regions: _, outputs } =
+            self.reborrow().def();
 
-        match kind {
-            // Fully handled above, before recursing into any child regions.
-            NodeKind::Block { insts: _ }
-            | NodeKind::Select { kind: _, cases: _ }
-            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
-
-            NodeKind::Loop { body: _, repeat_condition } => {
-                transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
-            }
-        };
+        // HACK(eddyb) semantically, `repeat_condition` is a body region output.
+        if let NodeKind::Loop { repeat_condition } = kind {
+            transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
+        }
 
         for output in outputs {
             output.inner_transform_with(transformer).apply_to(output);

@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::{io, iter, mem, slice};
+use std::{io, iter, mem};
 
 impl spv::Dialect {
     fn capability_insts(&self) -> impl Iterator<Item = spv::InstWithIds> + '_ {
@@ -496,16 +496,10 @@ impl FuncAt<'_, Node> {
         f: &mut impl FnMut(CfgCursor<'_>) -> Result<(), E>,
         parent: &CfgCursor<'_, ControlParent>,
     ) -> Result<(), E> {
-        let child_regions: &[_] = match &self.def().kind {
-            NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => &[],
-            NodeKind::Select { cases, .. } => cases,
-            NodeKind::Loop { body, .. } => slice::from_ref(body),
-        };
-
         let node = self.position;
         let parent = Some(parent);
         f(CfgCursor { point: CfgPoint::NodeEntry(node), parent })?;
-        for &region in child_regions {
+        for &region in &self.def().child_regions {
             self.at(region).rev_post_order_try_for_each_inner(
                 f,
                 Some(&CfgCursor { point: ControlParent::Node(node), parent }),
@@ -580,13 +574,14 @@ impl<'a> FuncLifting<'a> {
                         // The backedge of a SPIR-V structured loop points to
                         // the "loop header", i.e. the `Entry` of the `Loop`,
                         // so that's where `body` `inputs` phis have to go.
-                        NodeKind::Loop { body, .. } => {
-                            let loop_body_def = func_def_body.at(*body).def();
+                        NodeKind::Loop { .. } => {
+                            let body = node_def.child_regions[0];
+                            let loop_body_def = func_def_body.at(body).def();
                             let loop_body_inputs = &loop_body_def.inputs;
 
                             if !loop_body_inputs.is_empty() {
                                 region_inputs_source
-                                    .insert(*body, RegionInputsSource::LoopHeaderPhis(node));
+                                    .insert(body, RegionInputsSource::LoopHeaderPhis(node));
                             }
 
                             loop_body_inputs
@@ -688,13 +683,14 @@ impl<'a> FuncLifting<'a> {
                             unreachable!()
                         }
 
-                        NodeKind::Select { kind, cases } => Terminator {
+                        NodeKind::Select(kind) => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cf::unstructured::ControlInstKind::SelectBranch(
                                 kind.clone(),
                             )),
                             inputs: [node_def.inputs[0]].into_iter().collect(),
-                            targets: cases
+                            targets: node_def
+                                .child_regions
                                 .iter()
                                 .map(|&case| CfgPoint::RegionEntry(case))
                                 .collect(),
@@ -702,12 +698,13 @@ impl<'a> FuncLifting<'a> {
                             merge: Some(Merge::Selection(CfgPoint::NodeExit(node))),
                         },
 
-                        NodeKind::Loop { body, repeat_condition: _ } => {
+                        NodeKind::Loop { repeat_condition: _ } => {
+                            let body = node_def.child_regions[0];
                             Terminator {
                                 attrs: AttrSet::default(),
                                 kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
                                 inputs: [].into_iter().collect(),
-                                targets: [CfgPoint::RegionEntry(*body)].into_iter().collect(),
+                                targets: [CfgPoint::RegionEntry(body)].into_iter().collect(),
                                 target_phi_values: FxIndexMap::default(),
                                 merge: Some(Merge::Loop {
                                     loop_merge: CfgPoint::NodeExit(node),
@@ -718,7 +715,7 @@ impl<'a> FuncLifting<'a> {
                                     // and it should be valid *but* that had to be
                                     // reverted because it's only true in the absence
                                     // of divergence within the loop body itself!
-                                    loop_continue: CfgPoint::RegionExit(*body),
+                                    loop_continue: CfgPoint::RegionExit(body),
                                 }),
                             }
                         }
@@ -764,7 +761,7 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        NodeKind::Loop { body: _, repeat_condition } => {
+                        NodeKind::Loop { repeat_condition } => {
                             let backedge = CfgPoint::NodeEntry(parent_node);
                             let target_phi_values = region_outputs
                                 .map(|outputs| (backedge, outputs))

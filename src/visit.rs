@@ -475,32 +475,31 @@ impl<'a> FuncAt<'a, EntityListIter<Node>> {
 // requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
 impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let NodeDef { attrs, inputs, kind, outputs } = self.def();
+        let NodeDef { attrs, kind, inputs, child_regions, outputs } = self.def();
 
         visitor.visit_attr_set_use(*attrs);
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
         match kind {
             NodeKind::Block { insts } => {
                 for func_at_inst in self.at(*insts) {
                     visitor.visit_data_inst_def(func_at_inst.def());
                 }
             }
-            NodeKind::Select {
-                kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                cases,
-            } => {
-                for &case in cases {
-                    visitor.visit_region_def(self.at(case));
-                }
-            }
-            NodeKind::Loop { body, repeat_condition } => {
-                visitor.visit_region_def(self.at(*body));
-                visitor.visit_value_use(repeat_condition);
-            }
-            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
+            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            | NodeKind::Loop { repeat_condition: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
         }
+        for v in inputs {
+            visitor.visit_value_use(v);
+        }
+        for &region in child_regions {
+            visitor.visit_region_def(self.at(region));
+        }
+
+        // HACK(eddyb) semantically, `repeat_condition` is a body region output.
+        if let NodeKind::Loop { repeat_condition } = kind {
+            visitor.visit_value_use(repeat_condition);
+        }
+
         for output in outputs {
             output.inner_visit_with(visitor);
         }

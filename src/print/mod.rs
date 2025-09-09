@@ -1499,7 +1499,8 @@ impl<'a> Printer<'a> {
                             intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
                         });
 
-                        let NodeDef { attrs, inputs: _, kind, outputs } = func_at_node.def();
+                        let NodeDef { attrs, kind, inputs: _, child_regions: _, outputs } =
+                            func_at_node.def();
 
                         define(Use::AlignmentAnchorForNode(node), Some(*attrs));
 
@@ -3739,7 +3740,7 @@ impl Print for FuncAt<'_, Node> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let node = self.position;
-        let NodeDef { attrs, inputs, kind, outputs } = self.def();
+        let NodeDef { attrs, kind, inputs, child_regions, outputs } = self.def();
 
         let attrs = attrs.print(printer);
 
@@ -3775,17 +3776,18 @@ impl Print for FuncAt<'_, Node> {
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
             }
-            NodeKind::Select { kind, cases } => kind.print_with_scrutinee_and_cases(
+            NodeKind::Select(kind) => kind.print_with_scrutinee_and_cases(
                 printer,
                 kw_style,
                 inputs[0],
-                cases.iter().map(|&case| self.at(case).print(printer)),
+                child_regions.iter().map(|&case| self.at(case).print(printer)),
             ),
-            NodeKind::Loop { body, repeat_condition } => {
+            NodeKind::Loop { repeat_condition } => {
                 assert!(outputs.is_empty());
 
                 let initial_inputs = inputs;
-                let inputs = &self.at(*body).def().inputs;
+                let body = child_regions[0];
+                let inputs = &self.at(body).def().inputs;
                 assert_eq!(initial_inputs.len(), inputs.len());
 
                 // FIXME(eddyb) this avoids customizing how `body` is printed,
@@ -3812,7 +3814,7 @@ impl Print for FuncAt<'_, Node> {
                             (
                                 input,
                                 Value::RegionInput {
-                                    region: *body,
+                                    region: body,
                                     input_idx: input_idx.try_into().unwrap(),
                                 },
                             )
@@ -3853,7 +3855,7 @@ impl Print for FuncAt<'_, Node> {
                     inputs_header,
                     " {".into(),
                     pretty::Node::IndentedBlock(vec![pretty::Fragment::new([
-                        self.at(*body).print(printer),
+                        self.at(body).print(printer),
                         body_suffix,
                     ])])
                     .into(),
