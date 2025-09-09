@@ -653,9 +653,15 @@ impl MemTypeLayout {
     }
 }
 
+#[derive(Copy, Clone)]
+enum AttrTarget {
+    Var(VarKind),
+    Node(Node),
+}
+
 struct FuncGatherAccessesResults {
     param_accesses: SmallVec<[Option<Result<MemAccesses, AnalysisError>>; 2]>,
-    accesses_or_err_attrs_to_attach: Vec<(Value, Result<MemAccesses, AnalysisError>)>,
+    accesses_or_err_attrs_to_attach: Vec<(AttrTarget, Result<MemAccesses, AnalysisError>)>,
 }
 
 #[derive(Clone)]
@@ -775,22 +781,18 @@ impl<'a> GatherAccesses<'a> {
 
                     for (v, accesses) in accesses_or_err_attrs_to_attach {
                         let attrs = match v {
-                            Value::Const(_) => unreachable!(),
-                            Value::Var(VarKind::RegionInput { region, input_idx }) => {
+                            AttrTarget::Var(VarKind::RegionInput { region, input_idx }) => {
                                 &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
                                     .attrs
                             }
-                            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
-                                let node_def = func_def_body.at_mut(node).def();
+                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx }) => {
+                                &mut func_def_body.at_mut(node).def().outputs[output_idx as usize]
+                                    .attrs
+                            }
+                            AttrTarget::Node(node) => {
+                                assert!(accesses.is_err());
 
-                                // HACK(eddyb) `NodeOutput { output_idx: !0, .. }`
-                                // may be used to attach errors to a whole `Node`.
-                                if output_idx == !0 {
-                                    assert!(accesses.is_err());
-                                    &mut node_def.attrs
-                                } else {
-                                    &mut node_def.outputs[output_idx as usize].attrs
-                                }
+                                &mut func_def_body.at_mut(node).def().attrs
                             }
                         };
                         match accesses {
@@ -891,10 +893,12 @@ impl<'a> GatherAccesses<'a> {
                     {
                         &mut param_accesses[input_idx as usize]
                     }
-                    Value::Var(VarKind::RegionInput { .. }) => {
+                    Value::Var(ptr @ VarKind::RegionInput { .. }) => {
                         // FIXME(eddyb) don't throw away `new_accesses`.
-                        accesses_or_err_attrs_to_attach
-                            .push((ptr, Err(AnalysisError(Diag::bug(["unsupported φ".into()])))));
+                        accesses_or_err_attrs_to_attach.push((
+                            AttrTarget::Var(ptr),
+                            Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
+                        ));
                         return;
                     }
                     Value::Var(VarKind::NodeOutput { node: ptr_node, output_idx }) => {
@@ -919,14 +923,12 @@ impl<'a> GatherAccesses<'a> {
             match &node_def.kind {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation { .. } => {
                     for (i, accesses) in per_output_accesses.iter().enumerate() {
-                        let output = Value::Var(VarKind::NodeOutput {
-                            node,
-                            output_idx: i.try_into().unwrap(),
-                        });
+                        let output =
+                            VarKind::NodeOutput { node, output_idx: i.try_into().unwrap() };
                         if let Some(_accesses) = accesses {
                             // FIXME(eddyb) don't throw away `accesses`.
                             accesses_or_err_attrs_to_attach.push((
-                                output,
+                                AttrTarget::Var(output),
                                 Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
                             ));
                         }
@@ -966,7 +968,7 @@ impl<'a> GatherAccesses<'a> {
                         }
                         FuncGatherAccessesState::InProgress => {
                             accesses_or_err_attrs_to_attach.push((
-                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                                AttrTarget::Node(node),
                                 Err(AnalysisError(Diag::bug(
                                     ["unsupported recursive call".into()],
                                 ))),
@@ -979,7 +981,7 @@ impl<'a> GatherAccesses<'a> {
                         && let Some(accesses) = output_accesses
                     {
                         accesses_or_err_attrs_to_attach.push((
-                            Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
                             accesses,
                         ));
                     }
@@ -988,7 +990,7 @@ impl<'a> GatherAccesses<'a> {
                 DataInstKind::Mem(MemOp::FuncLocalVar(_)) => {
                     if let Some(accesses) = output_accesses {
                         accesses_or_err_attrs_to_attach.push((
-                            Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
                             accesses,
                         ));
                     }
@@ -1301,7 +1303,7 @@ impl<'a> GatherAccesses<'a> {
                         // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                         if let Some(accesses) = output_accesses {
                             accesses_or_err_attrs_to_attach.push((
-                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                                AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
                                 accesses,
                             ));
                         }
