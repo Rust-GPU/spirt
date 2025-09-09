@@ -169,7 +169,18 @@ impl AccessMerger<'_> {
         // Decompose the "smaller" and/or "less strict" side (`b`) first.
         match b.kind {
             // `Dead`s are always ignored.
-            DataHappKind::Dead => return MergeResult::ok(a),
+            DataHappKind::Dead
+                if {
+                    // HACK(eddyb) see similar comment below, but also the comment
+                    // above is invalidated by this condition - the issue is that
+                    // only an unused offset of `0` is a true noop, otherwise
+                    // there is a dead `qptr.offset` instruction which still
+                    // needs a field to reference.
+                    b_offset_in_a == 0
+                } =>
+            {
+                return MergeResult::ok(a);
+            }
 
             DataHappKind::Disjoint(b_entries)
                 if {
@@ -392,12 +403,26 @@ impl AccessMerger<'_> {
                     .range((
                         Bound::Unbounded,
                         b.max_size.map_or(Bound::Unbounded, |b_max_size| {
-                            Bound::Excluded(b_offset_in_a.checked_add(b_max_size).unwrap())
+                            // HACK(eddyb) the unconditional `insert` below, at
+                            // `b_offset_in_a`, can overwrite an existing entry
+                            // if the ZST case isn't correctly handled.
+                            if b_max_size == 0 {
+                                Bound::Included(b_offset_in_a)
+                            } else {
+                                Bound::Excluded(b_offset_in_a.checked_add(b_max_size).unwrap())
+                            }
                         }),
                     ))
                     .rev()
-                    .take_while(|(a_sub_offset, a_sub_happ)| {
+                    .take_while(|&(&a_sub_offset, a_sub_happ)| {
                         a_sub_happ.max_size.is_none_or(|a_sub_max_size| {
+                            // HACK(eddyb) the unconditional `insert` below, at
+                            // `b_offset_in_a`, can overwrite an existing entry
+                            // if the ZST case isn't correctly handled.
+                            if b.max_size == Some(0) && a_sub_offset == b_offset_in_a {
+                                return true;
+                            }
+
                             a_sub_offset.checked_add(a_sub_max_size).unwrap() > b_offset_in_a
                         })
                     });
