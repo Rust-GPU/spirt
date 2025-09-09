@@ -1,6 +1,6 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lifting (e.g. to SPIR-V).
 
-use crate::func_at::FuncAtMut;
+use crate::func_at::{FuncAt, FuncAtMut};
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
@@ -74,14 +74,15 @@ impl<'a> LiftToSpvPtrs<'a> {
         }
     }
 
-    fn find_mem_accesses_attr(&self, attrs: AttrSet) -> Result<&MemAccesses, LiftError> {
-        self.cx[attrs]
-            .attrs
-            .iter()
-            .find_map(|attr| match attr {
-                Attr::Mem(MemAttr::Accesses(accesses)) => Some(&accesses.0),
-                _ => None,
-            })
+    fn find_mem_accesses_attr(&self, attrs: AttrSet) -> Option<&MemAccesses> {
+        self.cx[attrs].attrs.iter().find_map(|attr| match attr {
+            Attr::Mem(MemAttr::Accesses(accesses)) => Some(&accesses.0),
+            _ => None,
+        })
+    }
+
+    fn require_mem_accesses_attr(&self, attrs: AttrSet) -> Result<&MemAccesses, LiftError> {
+        self.find_mem_accesses_attr(attrs)
             .ok_or_else(|| LiftError(Diag::bug(["missing `mem.accesses` attribute".into()])))
     }
 
@@ -102,7 +103,7 @@ impl<'a> LiftToSpvPtrs<'a> {
     ) -> Result<(Type, AddrSpace), LiftError> {
         let wk = self.wk;
 
-        let mem_accesses = self.find_mem_accesses_attr(global_var_decl.attrs)?;
+        let mem_accesses = self.require_mem_accesses_attr(global_var_decl.attrs)?;
 
         let shape =
             global_var_decl.shape.ok_or_else(|| LiftError(Diag::bug(["missing shape".into()])))?;
@@ -375,6 +376,31 @@ struct DeferredPtrNoop {
 }
 
 impl LiftToSpvPtrInstsInFunc<'_> {
+    // FIXME(eddyb) maybe all this data should be packaged up together in a
+    // type with fields like those of `DeferredPtrNoop` (or even more).
+    fn type_of_val_as_spv_ptr_with_layout(
+        &self,
+        func_at_value: FuncAt<'_, Value>,
+    ) -> Result<(AddrSpace, TypeLayout), LiftError> {
+        let v = func_at_value.position;
+
+        if let Value::Var(v) = v
+            && let Some(ptr_noop) = self.deferred_ptr_noops.get(&v)
+        {
+            return Ok((
+                ptr_noop.output_pointer_addr_space,
+                ptr_noop.output_pointee_layout.clone(),
+            ));
+        }
+
+        let (addr_space, pointee_type) = self
+            .lifter
+            .as_spv_ptr_type(func_at_value.type_of(&self.lifter.cx))
+            .ok_or_else(|| LiftError(Diag::bug(["pointer input not an `OpTypePointer`".into()])))?;
+
+        Ok((addr_space, self.lifter.layout_of(pointee_type)?))
+    }
+
     fn try_lift_data_inst_def(
         &mut self,
         mut func_at_data_inst: FuncAtMut<'_, DataInst>,
@@ -387,25 +413,31 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         let data_inst_def = func_at_data_inst_frozen.def();
         let func = func_at_data_inst_frozen.at(());
         let type_of_val = |v: Value| func.at(v).type_of(cx);
-        // FIXME(eddyb) maybe all this data should be packaged up together in a
-        // type with fields like those of `DeferredPtrNoop` (or even more).
-        let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::Var(var) = v
-                && let Some(ptr_noop) = self.deferred_ptr_noops.get(&var)
-            {
-                return Ok((
-                    ptr_noop.output_pointer_addr_space,
-                    ptr_noop.output_pointee_layout.clone(),
-                ));
-            }
 
-            let (addr_space, pointee_type) =
-                self.lifter.as_spv_ptr_type(type_of_val(v)).ok_or_else(|| {
-                    LiftError(Diag::bug(["pointer input not an `OpTypePointer`".into()]))
-                })?;
+        // FIXME(eddyb) this should be a method on some sort of "cursor" type.
+        let insert_aux_data_inst =
+            |this: &mut Self, func: FuncAtMut<'_, ()>, mut aux_data_inst_def: DataInstDef| {
+                // HACK(eddyb) account for `deferred_ptr_noops` interactions.
+                this.resolve_deferred_ptr_noop_uses(&mut aux_data_inst_def.inputs);
+                this.add_value_uses(&aux_data_inst_def.inputs);
 
-            Ok((addr_space, self.lifter.layout_of(pointee_type)?))
-        };
+                let aux_data_inst = func.nodes.define(cx, aux_data_inst_def.into());
+
+                // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
+                // due to the need to borrow `regions` and `nodes`
+                // at the same time - perhaps some kind of `FuncAtMut` position
+                // types for "where a list is in a parent entity" could be used
+                // to make this more ergonomic, although the potential need for
+                // an actual list entity of its own, should be considered.
+                func.regions[this.parent_region.unwrap()].children.insert_before(
+                    aux_data_inst,
+                    data_inst,
+                    func.nodes,
+                );
+
+                aux_data_inst
+            };
+
         let replacement_data_inst_def = match &data_inst_def.kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                 return Ok(Transformed::Unchanged);
@@ -425,12 +457,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
-                let mem_accesses = self
+                let output_mem_accesses = self
                     .lifter
-                    .find_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)?;
+                    .require_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)?;
 
                 // FIXME(eddyb) validate against `mem_layout`!
-                let pointee_type = self.lifter.pointee_type_for_accesses(mem_accesses)?;
+                let pointee_type = self.lifter.pointee_type_for_accesses(output_mem_accesses)?;
 
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind = DataInstKind::SpvInst(spv::Inst {
@@ -445,7 +477,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
             DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
                 let (addr_space, layout) =
-                    type_of_val_as_spv_ptr_with_layout(data_inst_def.inputs[0])?;
+                    self.type_of_val_as_spv_ptr_with_layout(func.at(data_inst_def.inputs[0]))?;
                 let handle = match layout {
                     // FIXME(eddyb) standardize variant order in enum/match.
                     TypeLayout::HandleArray(handle, _) => handle,
@@ -466,12 +498,14 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
                 let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
                 output_decl.ty = self.lifter.spv_ptr_type(addr_space, handle_type);
                 data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::BufferData) => {
                 let buf_ptr = data_inst_def.inputs[0];
-                let (addr_space, buf_layout) = type_of_val_as_spv_ptr_with_layout(buf_ptr)?;
+                let (addr_space, buf_layout) =
+                    self.type_of_val_as_spv_ptr_with_layout(func.at(buf_ptr))?;
 
                 let buf_data_layout = match buf_layout {
                     TypeLayout::Handle(shapes::Handle::Buffer(_, buf)) => TypeLayout::Concrete(buf),
@@ -500,7 +534,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
             &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
                 let buf_ptr = data_inst_def.inputs[0];
-                let (_, buf_layout) = type_of_val_as_spv_ptr_with_layout(buf_ptr)?;
+                let (_, buf_layout) = self.type_of_val_as_spv_ptr_with_layout(func.at(buf_ptr))?;
 
                 let buf_data_layout = match buf_layout {
                     TypeLayout::Handle(shapes::Handle::Buffer(_, buf)) => buf,
@@ -539,124 +573,132 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
             }
             &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
-                let base_ptr = data_inst_def.inputs[0];
-                let (addr_space, layout) = type_of_val_as_spv_ptr_with_layout(base_ptr)?;
+                let mut data_inst_def = data_inst_def.clone();
 
-                let maybe_access_chain = self.maybe_adjust_pointer_for_offset_or_access(
-                    base_ptr,
-                    addr_space,
-                    layout.clone(),
-                    offset,
-                    None,
-                )?;
-                let (new_output_ty, data_inst_def) = match maybe_access_chain {
-                    Some((access_chain_output_ptr_type, mut access_chain_data_inst_def)) => {
-                        access_chain_data_inst_def.outputs.push(data_inst_def.outputs[0]);
-                        (access_chain_output_ptr_type, access_chain_data_inst_def)
-                    }
-                    None => {
-                        self.deferred_ptr_noops.insert(
-                            data_inst_def.outputs[0],
-                            DeferredPtrNoop {
-                                output_pointer: base_ptr,
-                                output_pointer_addr_space: addr_space,
-                                output_pointee_layout: layout,
-                                parent_region: self.parent_region.unwrap(),
-                            },
-                        );
+                let output_mem_accesses = self
+                    .lifter
+                    .find_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)
+                    .unwrap_or(&MemAccesses::Data(DataHapp::DEAD));
 
-                        // FIXME(eddyb) avoid the repeated call to `type_of_val`,
-                        // maybe don't even replace the `QPtrOp::Offset` instruction?
-                        let mut data_inst_def = data_inst_def.clone();
-                        data_inst_def.kind = QPtrOp::Offset(0).into();
-                        (type_of_val(base_ptr), data_inst_def)
-                    }
-                };
-
-                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                let mut func = func_at_data_inst.reborrow().at(());
+                let (output_pointer, (output_pointer_addr_space, output_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_accesses(
+                        data_inst_def.inputs[0],
+                        offset,
+                        output_mem_accesses,
+                        func.reborrow(),
+                        insert_aux_data_inst,
+                    )?;
+                // FIXME(eddyb) not being able to reuse the original `DataInst`
+                // is a bit ridiculous, but correctly doing that would complicate
+                // `adjust_pointer_for_offset_and_accesses` in general.
+                self.deferred_ptr_noops.insert(
+                    data_inst_def.outputs[0],
+                    DeferredPtrNoop {
+                        output_pointer,
+                        output_pointer_addr_space,
+                        output_pointee_layout,
+                        parent_region: self.parent_region.unwrap(),
+                    },
+                );
+                // FIXME(eddyb) avoid the repeated call to `type_of_val`,
+                // maybe don't even replace the `QPtrOp::Offset` instruction?
+                data_inst_def.kind = QPtrOp::Offset(0).into();
+                let new_output_ty = func.reborrow().freeze().at(output_pointer).type_of(cx);
+                let output_decl = func.at(data_inst_def.outputs[0]).decl();
                 output_decl.ty = new_output_ty;
-
                 data_inst_def
             }
             DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
-                let base_ptr = data_inst_def.inputs[0];
-                let (addr_space, layout) = type_of_val_as_spv_ptr_with_layout(base_ptr)?;
-                let mut layout = match layout {
-                    TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => {
-                        return Err(LiftError(Diag::bug(["cannot offset Handles".into()])));
-                    }
-                    TypeLayout::Concrete(mem_layout) => mem_layout,
+                let (stride, index_bounds) = (*stride, index_bounds.clone());
+                let data_inst_def = data_inst_def.clone();
+
+                let output_mem_accesses = self
+                    .lifter
+                    .find_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)
+                    .unwrap_or(&MemAccesses::Data(DataHapp::DEAD));
+
+                let strided_mem_accesses = MemAccesses::Data(DataHapp {
+                    // FIXME(eddyb) there might be a better way to estimate the
+                    // relevant extent for the array, maybe assume length >= 1
+                    // so the minimum range is always `0..stride`?
+                    max_size: index_bounds.clone().map(|index_bounds| {
+                        u32::try_from(index_bounds.end)
+                            .ok()
+                            .unwrap_or(0)
+                            .checked_mul(stride.get())
+                            .unwrap_or(0)
+                    }),
+                    kind: DataHappKind::Repeated {
+                        // FIXME(eddyb) allocating `Rc` a bit wasteful here.
+                        element: Rc::new(DataHapp::DEAD),
+
+                        stride,
+                    },
+                });
+
+                let (array_ptr, (array_addr_space, array_layout)) = self
+                    .adjust_pointer_for_offset_and_accesses(
+                        data_inst_def.inputs[0],
+                        0,
+                        &strided_mem_accesses,
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
+
+                let (elem_layout, array_index_multiplier) = match array_layout {
+                    TypeLayout::Concrete(array_layout) => match &array_layout.components {
+                        Components::Elements { stride: layout_stride, elem, fixed_len }
+                            if stride.get().is_multiple_of(layout_stride.get())
+                                && Ok(index_bounds.clone())
+                                    == fixed_len
+                                        .map(|len| i32::try_from(len.get()).map(|len| 0..len))
+                                        .transpose() =>
+                        {
+                            (elem.clone(), stride.get() / layout_stride.get())
+                        }
+                        _ => {
+                            return Err(LiftError(Diag::bug([
+                                "matching array not found in pointee type layout".into(),
+                            ])));
+                        }
+                    },
+                    _ => unreachable!(),
                 };
 
-                let mut access_chain_inputs: SmallVec<_> = [base_ptr].into_iter().collect();
-                loop {
-                    if let Components::Elements { stride: layout_stride, elem, fixed_len } =
-                        &layout.components
-                        && layout_stride == stride
-                        && Ok(index_bounds.clone())
-                            == fixed_len
-                                .map(|len| i32::try_from(len.get()).map(|len| 0..len))
-                                .transpose()
-                    {
-                        access_chain_inputs.push(data_inst_def.inputs[1]);
-                        layout = elem.clone();
-                        break;
+                let array_index = if array_index_multiplier == 1 {
+                    data_inst_def.inputs[1]
+                } else {
+                    // FIXME(eddyb) implement
+                    return Err(LiftError(Diag::bug([
+                        "unimplemented stride factor (index multiplier)".into(),
+                    ])));
+                };
+
+                let accesses_bounded_intra_elem = match output_mem_accesses {
+                    &MemAccesses::Data(DataHapp { max_size: Some(max_size), .. }) => {
+                        max_size <= elem_layout.mem_layout.fixed_base.size
                     }
-
-                    // FIXME(eddyb) deduplicate with `maybe_adjust_pointer_for_offset_or_access`.
-                    let idx = {
-                        // FIXME(eddyb) there might be a better way to
-                        // estimate a relevant offset range for the array,
-                        // maybe assume length >= 1 so the minimum range
-                        // is always `0..stride`?
-                        let min_expected_len = index_bounds
-                            .clone()
-                            .and_then(|index_bounds| u32::try_from(index_bounds.end).ok())
-                            .unwrap_or(0);
-                        let offset_range =
-                            0..min_expected_len.checked_mul(stride.get()).unwrap_or(0);
-                        let mut component_indices =
-                            layout.components.find_components_containing(offset_range);
-                        match (component_indices.next(), component_indices.next()) {
-                            (None, _) => {
-                                return Err(LiftError(Diag::bug([
-                                    "matching array not found in pointee type layout".into(),
-                                ])));
-                            }
-                            // FIXME(eddyb) obsolete this case entirely,
-                            // by removing stores of ZSTs, and replacing
-                            // loads of ZSTs with `OpUndef` constants.
-                            (Some(_), Some(_)) => {
-                                return Err(LiftError(Diag::bug([
-                                    "ambiguity due to ZSTs in pointee type layout".into(),
-                                ])));
-                            }
-                            (Some(idx), None) => idx,
-                        }
-                    };
-
-                    let idx_as_i32 = i32::try_from(idx).ok().ok_or_else(|| {
-                        LiftError(Diag::bug([
-                            format!("{idx} not representable as a positive s32").into()
-                        ]))
-                    })?;
-                    access_chain_inputs
-                        .push(Value::Const(cx.intern(scalar::Const::from_u32(idx_as_i32 as u32))));
-
-                    layout = match &layout.components {
-                        Components::Scalar => unreachable!(),
-                        Components::Elements { elem, .. } => elem.clone(),
-                        Components::Fields { layouts, .. } => layouts[idx].clone(),
-                    };
+                    _ => false,
+                };
+                if !accesses_bounded_intra_elem {
+                    // FIXME(eddyb) should this change the choice of pointer
+                    // representation, or at least leave `QPtrOp::DynIndex`
+                    // behind unchanged?
                 }
-                let mut data_inst_def = data_inst_def.clone();
+
+                let mut data_inst_def = data_inst_def;
                 data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
-                data_inst_def.inputs = access_chain_inputs;
+                data_inst_def.inputs = [array_ptr, array_index].into_iter().collect();
                 let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
-                output_decl.ty = self.lifter.spv_ptr_type(addr_space, layout.original_type);
+                output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
+                output_decl.ty =
+                    self.lifter.spv_ptr_type(array_addr_space, elem_layout.original_type);
                 data_inst_def
             }
             DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
+                let mut data_inst_def = data_inst_def.clone();
+
                 // HACK(eddyb) `_` will match multiple variants soon.
                 #[allow(clippy::match_wildcard_for_single_variants)]
                 let (access_op, access_type) = match op {
@@ -669,64 +711,54 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     _ => unreachable!(),
                 };
 
-                // FIXME(eddyb) written in a more general style for future deduplication.
-                let maybe_ajustment = {
-                    let input_idx = 0;
-                    let ptr = data_inst_def.inputs[input_idx];
-                    let (addr_space, pointee_layout) = type_of_val_as_spv_ptr_with_layout(ptr)?;
-                    self.maybe_adjust_pointer_for_offset_or_access(
-                        ptr,
-                        addr_space,
-                        pointee_layout,
-                        offset.map_or(0, |o| o.get()),
-                        Some(access_type),
-                    )?
-                    .map(|access_chain| (input_idx, access_chain))
-                    .into_iter()
+                // FIXME(eddyb) this is awkward (or at least its needs DRY-ing)
+                // because only an approximation is needed, most checks are
+                // done by `adjust_pointer_for_offset_and_accesses`.
+                let access_mem_accesses = match self.lifter.layout_of(access_type)? {
+                    TypeLayout::HandleArray(..) => {
+                        return Err(LiftError(Diag::bug([
+                            "cannot access whole HandleArray".into()
+                        ])));
+                    }
+                    TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
+                        MemAccesses::Handles(shapes::Handle::Opaque(ty))
+                    }
+                    TypeLayout::Handle(shapes::Handle::Buffer(as_, _)) => {
+                        MemAccesses::Handles(shapes::Handle::Buffer(as_, DataHapp::DEAD))
+                    }
+                    TypeLayout::Concrete(concrete) => MemAccesses::Data(DataHapp {
+                        max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
+                            .then_some(concrete.mem_layout.fixed_base.size),
+                        kind: DataHappKind::Direct(concrete.original_type),
+                    }),
                 };
 
-                let mut new_data_inst_def =
-                    DataInstDef { kind: access_op.into(), ..data_inst_def.clone() };
+                let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_accesses(
+                        data_inst_def.inputs[0],
+                        offset.map_or(0, |o| o.get()),
+                        &access_mem_accesses,
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
 
-                // FIXME(eddyb) written in a more general style for future deduplication.
-                for (input_idx, (access_chain_output_ptr_type, mut access_chain_data_inst_def)) in
-                    maybe_ajustment
-                {
-                    // HACK(eddyb) account for `deferred_ptr_noops` interactions.
-                    self.resolve_deferred_ptr_noop_uses(&mut access_chain_data_inst_def.inputs);
-                    self.add_value_uses(&access_chain_data_inst_def.inputs);
+                // FIXME(eddyb) implement at least same-size bitcasting
+                // (more generally, accesses should be {de,re}composed).
+                match adjusted_pointee_layout {
+                    TypeLayout::Handle(shapes::Handle::Opaque(ty)) if ty == access_type => {}
+                    TypeLayout::Concrete(concrete) if concrete.original_type == access_type => {}
 
-                    let func = func_at_data_inst.reborrow().at(());
-
-                    let access_chain_data_inst =
-                        func.nodes.define(cx, access_chain_data_inst_def.into());
-                    let access_chain_output_var = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: access_chain_output_ptr_type,
-                            def_parent: Either::Right(access_chain_data_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[access_chain_data_inst].outputs.push(access_chain_output_var);
-
-                    // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                    // due to the need to borrow `regions` and `nodes`
-                    // at the same time - perhaps some kind of `FuncAtMut` position
-                    // types for "where a list is in a parent entity" could be used
-                    // to make this more ergonomic, although the potential need for
-                    // an actual list entity of its own, should be considered.
-                    func.regions[self.parent_region.unwrap()].children.insert_before(
-                        access_chain_data_inst,
-                        data_inst,
-                        func.nodes,
-                    );
-
-                    new_data_inst_def.inputs[input_idx] = Value::Var(access_chain_output_var);
+                    _ => {
+                        return Err(LiftError(Diag::bug([
+                            "expected access type not found in pointee type layout".into(),
+                        ])));
+                    }
                 }
 
-                new_data_inst_def
+                data_inst_def.kind = access_op.into();
+                data_inst_def.inputs[0] = adjusted_ptr;
+
+                data_inst_def
             }
 
             &DataInstKind::ThunkBind(_) => {
@@ -741,118 +773,124 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
-                let mut to_spv_ptr_input_adjustments = vec![];
-                let mut from_spv_ptr_output = None;
+                let mut changed_data_inst_def = None;
+
                 for attr in &cx[data_inst_def.attrs].attrs {
+                    let attr = match attr {
+                        Attr::QPtr(attr) => attr,
+                        _ => continue,
+                    };
+
+                    let data_inst_def = changed_data_inst_def
+                        .get_or_insert_with(|| func_at_data_inst.reborrow().def().clone());
+
                     match *attr {
-                        Attr::QPtr(QPtrAttr::ToSpvPtrInput {
-                            input_idx,
-                            pointee: expected_pointee_type,
-                        }) => {
+                        QPtrAttr::ToSpvPtrInput { input_idx, pointee: expected_pointee_type } => {
                             let input_idx = usize::try_from(input_idx).unwrap();
                             let expected_pointee_type = expected_pointee_type.0;
 
                             let input_ptr = data_inst_def.inputs[input_idx];
-                            let (input_ptr_addr_space, input_pointee_layout) =
-                                type_of_val_as_spv_ptr_with_layout(input_ptr)?;
 
-                            if let Some(access_chain) = self
-                                .maybe_adjust_pointer_for_offset_or_access(
+                            // FIXME(eddyb) this is awkward (or at least its needs DRY-ing)
+                            // because only an approximation is needed, most checks are
+                            // done by `adjust_pointer_for_offset_and_accesses`.
+                            let expected_pointee_layout =
+                                self.lifter.layout_of(expected_pointee_type)?;
+                            let expected_mem_accesses = match &expected_pointee_layout {
+                                TypeLayout::HandleArray(..) => {
+                                    return Err(LiftError(Diag::bug([
+                                        "cannot access whole HandleArray".into(),
+                                    ])));
+                                }
+                                &TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
+                                    MemAccesses::Handles(shapes::Handle::Opaque(ty))
+                                }
+                                &TypeLayout::Handle(shapes::Handle::Buffer(as_, _)) => {
+                                    MemAccesses::Handles(shapes::Handle::Buffer(
+                                        as_,
+                                        DataHapp::DEAD,
+                                    ))
+                                }
+                                TypeLayout::Concrete(concrete) => MemAccesses::Data(DataHapp {
+                                    max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
+                                        .then_some(concrete.mem_layout.fixed_base.size),
+                                    kind: DataHappKind::StrictlyTyped(concrete.original_type),
+                                }),
+                            };
+
+                            let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
+                                .adjust_pointer_for_offset_and_accesses(
                                     input_ptr,
-                                    input_ptr_addr_space,
-                                    input_pointee_layout,
                                     0,
-                                    Some(expected_pointee_type),
-                                )?
-                            {
-                                to_spv_ptr_input_adjustments.push((input_idx, access_chain));
+                                    &expected_mem_accesses,
+                                    func_at_data_inst.reborrow().at(()),
+                                    insert_aux_data_inst,
+                                )?;
+                            match (adjusted_pointee_layout, expected_pointee_layout) {
+                                (
+                                    TypeLayout::Handle(shapes::Handle::Opaque(a)),
+                                    TypeLayout::Handle(shapes::Handle::Opaque(b)),
+                                ) if a == b => {}
+                                (TypeLayout::Concrete(a), TypeLayout::Concrete(b))
+                                    if a.original_type == b.original_type => {}
+
+                                _ => {
+                                    return Err(LiftError(Diag::bug([
+                                        "ToSpvPtrInput: expected type not found in pointee type layout"
+                                            .into(),
+                                    ])));
+                                }
                             }
+                            data_inst_def.inputs[input_idx] = adjusted_ptr;
                         }
-                        Attr::QPtr(QPtrAttr::FromSpvPtrOutput { addr_space, pointee }) => {
-                            assert!(from_spv_ptr_output.is_none());
-                            from_spv_ptr_output = Some((addr_space.0, pointee.0));
+                        QPtrAttr::FromSpvPtrOutput { addr_space, pointee } => {
+                            let output_decl =
+                                func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                            output_decl.ty = self.lifter.spv_ptr_type(addr_space.0, pointee.0);
                         }
-                        _ => {}
                     }
                 }
 
-                if to_spv_ptr_input_adjustments.is_empty() && from_spv_ptr_output.is_none() {
-                    return Ok(Transformed::Unchanged);
-                }
-
-                let mut new_data_inst_def = data_inst_def.clone();
-
-                let func = func_at_data_inst.reborrow().at(());
-
-                // FIXME(eddyb) deduplicate with `Load`/`Store`.
-                for (input_idx, (access_chain_output_ptr_type, mut access_chain_data_inst_def)) in
-                    to_spv_ptr_input_adjustments
-                {
-                    // HACK(eddyb) account for `deferred_ptr_noops` interactions.
-                    self.resolve_deferred_ptr_noop_uses(&mut access_chain_data_inst_def.inputs);
-                    self.add_value_uses(&access_chain_data_inst_def.inputs);
-
-                    let access_chain_data_inst =
-                        func.nodes.define(cx, access_chain_data_inst_def.into());
-                    let access_chain_output_var = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: access_chain_output_ptr_type,
-                            def_parent: Either::Right(access_chain_data_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[access_chain_data_inst].outputs.push(access_chain_output_var);
-
-                    // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                    // due to the need to borrow `regions` and `nodes`
-                    // at the same time - perhaps some kind of `FuncAtMut` position
-                    // types for "where a list is in a parent entity" could be used
-                    // to make this more ergonomic, although the potential need for
-                    // an actual list entity of its own, should be considered.
-                    func.regions[self.parent_region.unwrap()].children.insert_before(
-                        access_chain_data_inst,
-                        data_inst,
-                        func.nodes,
-                    );
-
-                    new_data_inst_def.inputs[input_idx] = Value::Var(access_chain_output_var);
-                }
-
-                if let Some((addr_space, pointee_type)) = from_spv_ptr_output {
-                    func.vars[new_data_inst_def.outputs[0]].ty =
-                        self.lifter.spv_ptr_type(addr_space, pointee_type);
-                }
-
-                new_data_inst_def
+                return Ok(
+                    changed_data_inst_def.map_or(Transformed::Unchanged, Transformed::Changed)
+                );
             }
         };
         Ok(Transformed::Changed(replacement_data_inst_def))
     }
 
-    /// If necessary, construct an `OpAccessChain` instruction to offset `ptr`
-    /// (pointing to a type with `pointee_layout`) by `offset`, and (optionally)
-    /// turn it into a pointer to `access_type`.
-    ///
-    /// **Note**: the returned instruction has empty `outputs`, the caller must
-    /// add one, using the type returend alongside the instruction.
+    /// Derive a pointer from `ptr` which simultaneously accounts for `offset`
+    /// and compatibility with `target_accesses`, by introducing new instructions
+    /// (e.g. `OpAccessChain`) if needed (via `insert_aux_data_inst`).
     //
     // FIXME(eddyb) customize errors, to tell apart Offset/Load/Store/ToSpvPtrInput.
-    fn maybe_adjust_pointer_for_offset_or_access(
-        &self,
+    // FIXME(eddyb) the returned `(AddrSpace, TypeLayout)` describes the returned
+    // pointer, i.e. it's a cached copy of `as_spv_ptr_type(type_of(final_ptr))`,
+    // ideally it would be wrapped in some `struct` that disambiguates it.
+    //
+    // FIXME(eddyb) consider undoing all of this work, and relying on a more
+    // flexible pointer representation, instead.
+    fn adjust_pointer_for_offset_and_accesses(
+        &mut self,
         ptr: Value,
-        addr_space: AddrSpace,
-        mut pointee_layout: TypeLayout,
         offset: i32,
-        access_type: Option<Type>,
-    ) -> Result<Option<(Type, DataInstDef)>, LiftError> {
-        let wk = self.lifter.wk;
+        target_accesses: &MemAccesses,
 
-        let mk_access_chain = |access_chain_inputs: SmallVec<_>, final_pointee_type| {
+        // FIXME(eddyb) bundle these into some kind of "cursor" type.
+        mut func: FuncAtMut<'_, ()>,
+        mut insert_aux_data_inst: impl FnMut(&mut Self, FuncAtMut<'_, ()>, DataInstDef) -> DataInst,
+    ) -> Result<(Value, (AddrSpace, TypeLayout)), LiftError> {
+        let wk = self.lifter.wk;
+        let cx = &self.lifter.cx;
+
+        let (addr_space, mut pointee_layout) =
+            self.type_of_val_as_spv_ptr_with_layout(func.reborrow().freeze().at(ptr))?;
+
+        let mut mk_access_chain = |access_chain_inputs: SmallVec<_>, final_pointee_type| {
             if access_chain_inputs.len() > 1 {
-                Some((
-                    self.lifter.spv_ptr_type(addr_space, final_pointee_type),
+                let node = insert_aux_data_inst(
+                    self,
+                    func.reborrow(),
                     DataInstDef {
                         attrs: Default::default(),
                         kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
@@ -860,149 +898,172 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         child_regions: [].into_iter().collect(),
                         outputs: [].into_iter().collect(),
                     },
-                ))
+                );
+
+                let output_var = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: self.lifter.spv_ptr_type(addr_space, final_pointee_type),
+                        def_parent: Either::Right(node),
+                        def_idx: 0,
+                    },
+                );
+                func.nodes[node].outputs.push(output_var);
+
+                Value::Var(output_var)
             } else {
-                None
+                ptr
             }
         };
-
-        let access_layout = access_type.map(|ty| self.lifter.layout_of(ty)).transpose()?;
 
         let mut access_chain_inputs: SmallVec<_> = [ptr].into_iter().collect();
 
         if let TypeLayout::HandleArray(handle, _) = pointee_layout {
-            access_chain_inputs
-                .push(Value::Const(self.lifter.cx.intern(scalar::Const::from_u32(0))));
+            access_chain_inputs.push(Value::Const(cx.intern(scalar::Const::from_u32(0))));
             pointee_layout = TypeLayout::Handle(handle);
         }
-        let (mut pointee_layout, access_layout) = match (pointee_layout, access_layout) {
+        let (mut pointee_layout, target_happ) = match (pointee_layout, target_accesses) {
             (TypeLayout::HandleArray(..), _) => unreachable!(),
 
             // All the illegal cases are here to keep the rest tidier.
-            (_, Some(TypeLayout::Handle(shapes::Handle::Buffer(..)))) => {
+            (_, MemAccesses::Handles(shapes::Handle::Buffer(..))) => {
                 return Err(LiftError(Diag::bug(["cannot access whole Buffer".into()])));
             }
-            (_, Some(TypeLayout::HandleArray(..))) => {
-                return Err(LiftError(Diag::bug(["cannot access whole HandleArray".into()])));
-            }
-            (_, Some(TypeLayout::Concrete(access_layout)))
-                if access_layout.mem_layout.dyn_unit_stride.is_some() =>
-            {
-                return Err(LiftError(Diag::bug(["cannot access unsized type".into()])));
-            }
-            (TypeLayout::Handle(_), Some(_)) if offset != 0 => {
-                return Err(LiftError(Diag::bug(["cannot offset Handles for access".into()])));
-            }
-            (TypeLayout::Handle(_), None) => {
-                // FIXME(eddyb) this disallows even a noop offset on a handle pointer.
+            (TypeLayout::Handle(_), _) if offset != 0 => {
                 return Err(LiftError(Diag::bug(["cannot offset Handles".into()])));
             }
             (TypeLayout::Handle(shapes::Handle::Buffer(..)), _) => {
                 return Err(LiftError(Diag::bug(["cannot offset/access into Buffer".into()])));
             }
-            (TypeLayout::Handle(_), Some(TypeLayout::Concrete(_))) => {
+            (TypeLayout::Handle(_), MemAccesses::Data(_)) => {
                 return Err(LiftError(Diag::bug(["cannot access Handle as memory".into()])));
             }
-            (TypeLayout::Concrete(_), Some(TypeLayout::Handle(_))) => {
+            (TypeLayout::Concrete(_), MemAccesses::Handles(_)) => {
                 return Err(LiftError(Diag::bug(["cannot access memory as Handle".into()])));
             }
 
             (
                 TypeLayout::Handle(shapes::Handle::Opaque(pointee_handle_type)),
-                Some(TypeLayout::Handle(shapes::Handle::Opaque(access_handle_type))),
+                &MemAccesses::Handles(shapes::Handle::Opaque(access_handle_type)),
             ) => {
                 assert_eq!(offset, 0);
 
                 if pointee_handle_type != access_handle_type {
                     return Err(LiftError(Diag::bug([
-                        "(opaque handle) pointer vs access type mismatch".into(),
+                        "(opaque handle) pointer vs access type mismatch (".into(),
+                        pointee_handle_type.into(),
+                        " vs ".into(),
+                        access_handle_type.into(),
+                        ")".into(),
                     ])));
                 }
 
-                return Ok(mk_access_chain(access_chain_inputs, pointee_handle_type));
+                return Ok((
+                    mk_access_chain(access_chain_inputs, pointee_handle_type),
+                    (addr_space, TypeLayout::Handle(shapes::Handle::Opaque(pointee_handle_type))),
+                ));
             }
 
-            (TypeLayout::Concrete(pointee_layout), Some(TypeLayout::Concrete(access_layout))) => {
-                (pointee_layout, Some(access_layout))
+            (TypeLayout::Concrete(pointee_layout), MemAccesses::Data(data_happ)) => {
+                (pointee_layout, data_happ)
             }
-            (TypeLayout::Concrete(pointee_layout), None) => (pointee_layout, None),
         };
 
         let mut offset = u32::try_from(offset)
             .ok()
             .ok_or_else(|| LiftError(Diag::bug(["negative offset".into()])))?;
 
-        // FIXME(eddyb) deduplicate with access chain loop for Offset.
         loop {
-            let done = offset == 0
-                && access_layout.as_ref().is_none_or(|access_layout| {
-                    pointee_layout.original_type == access_layout.original_type
-                });
-            if done {
+            // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
+            let target_extent =
+                Extent { start: 0, end: target_happ.max_size }.saturating_add(offset);
+
+            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
+            let pointee_extent = Extent {
+                start: 0,
+                end: (pointee_layout.mem_layout.dyn_unit_stride.is_none())
+                    .then_some(pointee_layout.mem_layout.fixed_base.size),
+            };
+
+            // FIXME(eddyb) how much of this is actually useful given the
+            // `if offset == 0 { break; }` tied to running out of leaves?
+            let is_compatible = offset == 0 && pointee_extent.includes(&target_extent) && {
+                match target_happ.kind {
+                    DataHappKind::Dead | DataHappKind::Disjoint(_) => true,
+                    DataHappKind::StrictlyTyped(target_ty) => {
+                        pointee_layout.original_type == target_ty
+                    }
+                    DataHappKind::Direct(target_ty) => {
+                        // NOTE(eddyb) in theory, non-atomic accesses understood
+                        // by SPIR-T natively (mostly `mem.{load,store}`) only
+                        // need to cover the extent of the access, as long as
+                        // the types involved are plain bits (scalars/vectors).
+                        //
+                        // FIXME(eddyb) take advantage of this by implementing
+                        // scalar merge/auto-bitcast in `mem::analyze`+`qptr::lift`.
+                        let can_bitcast = |ty: Type| {
+                            matches!(cx[ty].kind, TypeKind::Scalar(_) | TypeKind::Vector(_))
+                        };
+                        pointee_layout.original_type == target_ty
+                            || can_bitcast(pointee_layout.original_type) && can_bitcast(target_ty)
+                    }
+                    DataHappKind::Repeated { stride: target_stride, .. } => {
+                        match pointee_layout.components {
+                            Components::Elements { stride, .. } => {
+                                // FIXME(eddyb) take advantage of this by implementing
+                                // stride factoring in `mem::analyze`+`qptr::lift`.
+                                target_stride.get().is_multiple_of(stride.get())
+                            }
+                            _ => false,
+                        }
+                    }
+                }
+            };
+
+            // Only stop descending into the pointee type when it already fits
+            // `target_happ` exactly (i.e. can only get worse, not better).
+            if is_compatible && pointee_extent == target_extent {
                 break;
             }
 
-            let idx = {
-                let min_component_size = match &access_layout {
-                    Some(access_layout) => access_layout.mem_layout.fixed_base.size,
-                    None => {
-                        // HACK(eddyb) supporting ZSTs would be a pain because
-                        // they can "fit" in weird ways, e.g. given 3 offsets
-                        // A, B, C (before/between/after a pair of fields),
-                        // `B..B` is included in both `A..B` and `B..C`.
-                        let allow_zst = false;
-                        if allow_zst { 0 } else { 1 }
+            let mut component_indices =
+                pointee_layout.components.find_components_containing(target_extent);
+            let idx = match (component_indices.next(), component_indices.next()) {
+                (None, _) => {
+                    // While none of the components fully contain `target_extent`,
+                    // there's a good chance the pointer is already compatible
+                    // with `target_happ` (and the only reason to keep going
+                    // would be to find smaller types that remain compatible).
+                    if is_compatible {
+                        break;
                     }
-                };
 
-                let offset_range = offset..offset.saturating_add(min_component_size);
-                let mut component_indices =
-                    pointee_layout.components.find_components_containing(offset_range.clone());
-
-                let idx = component_indices
-                    .next()
-                    .or_else(|| {
-                        // HACK(eddyb) when dealing with a lone ZST, the search can
-                        // fail because it expects at least one byte, so we retry
-                        // with an empty range instead.
-                        // FIXME(eddyb) this can still fail if there's another
-                        // component that ends where the ZST is, maybe we need
-                        // some way to filter for specifically such a ZST.
-                        if access_layout.is_none() && offset_range.len() == 1 {
-                            component_indices = pointee_layout
-                                .components
-                                .find_components_containing(offset..offset);
-                            component_indices.next()
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        // FIXME(eddyb) this could include the chosen indices,
-                        // and maybe the current type and/or layout.
-                        LiftError(Diag::bug([format!(
-                            "offsets {offset_range:?} not found in pointee type layout, \
-                             after {} access chain indices",
-                            access_chain_inputs.len() - 1
-                        )
-                        .into()]))
-                    })?;
-
-                if component_indices.next().is_some() {
+                    // FIXME(eddyb) this could include the chosen indices,
+                    // and maybe the current type and/or layout.
+                    return Err(LiftError(Diag::bug([format!(
+                        "offsets {:?}..{:?} not found in pointee type layout, \
+                         after {} access chain indices",
+                        target_extent.start,
+                        target_extent.end,
+                        access_chain_inputs.len() - 1
+                    )
+                    .into()])));
+                }
+                (Some(_), Some(_)) => {
                     return Err(LiftError(Diag::bug([
                         "ambiguity due to ZSTs in pointee type layout".into(),
                     ])));
                 }
-
-                idx
+                (Some(idx), None) => idx,
             };
+            drop(component_indices);
 
             let idx_as_i32 = i32::try_from(idx).ok().ok_or_else(|| {
                 LiftError(Diag::bug([format!("{idx} not representable as a positive s32").into()]))
             })?;
-            access_chain_inputs.push(Value::Const(
-                self.lifter.cx.intern(scalar::Const::from_u32(idx_as_i32 as u32)),
-            ));
+            access_chain_inputs
+                .push(Value::Const(cx.intern(scalar::Const::from_u32(idx_as_i32 as u32))));
 
             match &pointee_layout.components {
                 Components::Scalar => unreachable!(),
@@ -1017,7 +1078,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
         }
 
-        Ok(mk_access_chain(access_chain_inputs, pointee_layout.original_type))
+        Ok((
+            mk_access_chain(access_chain_inputs, pointee_layout.original_type),
+            (addr_space, TypeLayout::Concrete(pointee_layout)),
+        ))
     }
 
     /// Apply rewrites implied by `deferred_ptr_noops` to `values`.

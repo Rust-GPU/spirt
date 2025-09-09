@@ -9,10 +9,9 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value, Var, VarKind,
+    TypeKind, Value, Var,
 };
-use itertools::{Either, Itertools as _};
-use rustc_hash::FxHashMap;
+use itertools::Either;
 use smallvec::SmallVec;
 use std::mem;
 use std::num::NonZeroU32;
@@ -556,37 +555,36 @@ impl MemTypeLayout {
         }
 
         {
-            // FIXME(eddyb) should `DataHapp` track a `min_size` as well?
-            // FIXME(eddyb) duplicated below.
-            let min_happ_offset_range =
-                happ_offset..happ_offset.saturating_add(happ.max_size.unwrap_or(0));
+            // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
+            let happ_extent = Extent { start: 0, end: happ.max_size }.saturating_add(happ_offset);
 
             // "Fast reject" based on size alone (expected w/ multiple attempts).
-            if self.mem_layout.dyn_unit_stride.is_none()
-                && (self.mem_layout.fixed_base.size < min_happ_offset_range.end
-                    || happ.max_size.is_none())
-            {
+            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
+            let extent = Extent {
+                start: 0,
+                end: (self.mem_layout.dyn_unit_stride.is_none())
+                    .then_some(self.mem_layout.fixed_base.size),
+            };
+            if !extent.includes(&happ_extent) {
                 return false;
             }
         }
 
         let any_component_supports = |happ_offset: u32, happ: &DataHapp| {
-            // FIXME(eddyb) should `DataHapp` track a `min_size` as well?
-            // FIXME(eddyb) duplicated above.
-            let min_happ_offset_range =
-                happ_offset..happ_offset.saturating_add(happ.max_size.unwrap_or(0));
+            // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
+            let happ_extent = Extent { start: 0, end: happ.max_size }.saturating_add(happ_offset);
 
             // FIXME(eddyb) `find_components_containing` is linear today but
             // could be made logarithmic (via binary search).
-            self.components.find_components_containing(min_happ_offset_range).any(|idx| match &self
-                .components
-            {
-                Components::Scalar => unreachable!(),
-                Components::Elements { stride, elem, .. } => {
-                    elem.supports_happ_at_offset(happ_offset % stride.get(), happ)
-                }
-                Components::Fields { offsets, layouts, .. } => {
-                    layouts[idx].supports_happ_at_offset(happ_offset - offsets[idx], happ)
+            self.components.find_components_containing(happ_extent).any(|idx| {
+                match &self.components {
+                    Components::Scalar => unreachable!(),
+                    Components::Elements { stride, elem, .. } => {
+                        elem.supports_happ_at_offset(happ_offset % stride.get(), happ)
+                    }
+                    Components::Fields { offsets, layouts, .. } => {
+                        layouts[idx].supports_happ_at_offset(happ_offset - offsets[idx], happ)
+                    }
                 }
             })
         };
@@ -682,6 +680,7 @@ impl MemTypeLayout {
 enum AttrTarget {
     Var(Var),
     Node(Node),
+    Func,
 }
 
 struct FuncGatherAccessesResults {
@@ -699,7 +698,7 @@ pub struct GatherAccesses<'a> {
     cx: Rc<Context>,
     layout_cache: LayoutCache<'a>,
 
-    global_var_accesses: FxIndexMap<GlobalVar, Option<Result<MemAccesses, AnalysisError>>>,
+    global_var_accesses: FxIndexMap<GlobalVar, Result<MemAccesses, AnalysisError>>,
     func_states: FxIndexMap<Func, FuncGatherAccessesState>,
 }
 
@@ -726,7 +725,7 @@ impl<'a> GatherAccesses<'a> {
                 ExportKey::SpvEntryPoint { imms: _, interface_global_vars } => {
                     for &gv in interface_global_vars {
                         self.global_var_accesses.entry(gv).or_insert_with(|| {
-                            Some(Ok(match module.global_vars[gv].shape {
+                            Ok(match module.global_vars[gv].shape {
                                 Some(shapes::GlobalVarShape::Handles { handle, .. }) => {
                                     MemAccesses::Handles(match handle {
                                         shapes::Handle::Opaque(ty) => shapes::Handle::Opaque(ty),
@@ -737,7 +736,7 @@ impl<'a> GatherAccesses<'a> {
                                     })
                                 }
                                 _ => MemAccesses::Data(DataHapp::DEAD),
-                            }))
+                            })
                         });
                     }
                 }
@@ -746,23 +745,21 @@ impl<'a> GatherAccesses<'a> {
 
         // Analysis over, write all attributes back to the module.
         for (gv, accesses) in self.global_var_accesses {
-            if let Some(accesses) = accesses {
-                let global_var_def = &mut module.global_vars[gv];
-                match accesses {
-                    Ok(accesses) => {
-                        // FIXME(eddyb) deduplicate attribute manipulation.
-                        global_var_def.attrs = self.cx.intern(AttrSetDef {
-                            attrs: self.cx[global_var_def.attrs]
-                                .attrs
-                                .iter()
-                                .cloned()
-                                .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(accesses)))])
-                                .collect(),
-                        });
-                    }
-                    Err(AnalysisError(e)) => {
-                        global_var_def.attrs.push_diag(&self.cx, e);
-                    }
+            let global_var_def = &mut module.global_vars[gv];
+            match accesses {
+                Ok(accesses) => {
+                    // FIXME(eddyb) deduplicate attribute manipulation.
+                    global_var_def.attrs = self.cx.intern(AttrSetDef {
+                        attrs: self.cx[global_var_def.attrs]
+                            .attrs
+                            .iter()
+                            .cloned()
+                            .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(accesses)))])
+                            .collect(),
+                    });
+                }
+                Err(AnalysisError(e)) => {
+                    global_var_def.attrs.push_diag(&self.cx, e);
                 }
             }
         }
@@ -799,7 +796,8 @@ impl<'a> GatherAccesses<'a> {
                         }
                     }
 
-                    let func_def_body = match &mut module.funcs[func].def {
+                    let func_decl = &mut module.funcs[func];
+                    let func_def_body = match &mut func_decl.def {
                         DeclDef::Present(func_def_body) => func_def_body,
                         DeclDef::Imported(_) => continue,
                     };
@@ -811,6 +809,11 @@ impl<'a> GatherAccesses<'a> {
                                 assert!(accesses.is_err());
 
                                 &mut func_def_body.at_mut(node).def().attrs
+                            }
+                            AttrTarget::Func => {
+                                assert!(accesses.is_err());
+
+                                &mut func_decl.attrs
                             }
                         };
                         match accesses {
@@ -861,20 +864,40 @@ impl<'a> GatherAccesses<'a> {
         let is_qptr = |ty: Type| matches!(cx[ty].kind, TypeKind::QPtr);
 
         let func_decl = &module.funcs[func];
-        let mut param_accesses: SmallVec<[_; 2]> =
-            (0..func_decl.params.len()).map(|_| None).collect();
         let mut accesses_or_err_attrs_to_attach = vec![];
 
-        let func_def_body = match &module.funcs[func].def {
+        // FIXME(eddyb) should such a "small vec/int map" be a proper type?
+        fn small_vec_from_position_value_pairs<T, const N: usize>(
+            entries: impl IntoIterator<Item = (usize, T)>,
+        ) -> SmallVec<[Option<T>; N]>
+        where
+            [Option<T>; N]: smallvec::Array<Item = Option<T>>,
+        {
+            let mut slots = SmallVec::new();
+            for (i, x) in entries {
+                if i >= slots.len() {
+                    slots.extend((slots.len()..=i).map(|_| None));
+                }
+                slots[i] = Some(x);
+            }
+            slots
+        }
+
+        let func_def_body = match &func_decl.def {
             DeclDef::Present(func_def_body) => func_def_body,
             DeclDef::Imported(_) => {
-                for (param, param_accesses) in func_decl.params.iter().zip(&mut param_accesses) {
-                    if is_qptr(param.ty) {
-                        *param_accesses = Some(Err(AnalysisError(Diag::bug([
-                            "pointer param of imported func".into(),
-                        ]))));
-                    }
-                }
+                let param_accesses = small_vec_from_position_value_pairs(
+                    func_decl.params.iter().enumerate().filter(|(_, param)| is_qptr(param.ty)).map(
+                        |(i, _)| {
+                            (
+                                i,
+                                Err(AnalysisError(Diag::bug([
+                                    "pointer param of imported func".into()
+                                ]))),
+                            )
+                        },
+                    ),
+                );
                 return FuncGatherAccessesResults {
                     param_accesses,
                     accesses_or_err_attrs_to_attach,
@@ -882,8 +905,11 @@ impl<'a> GatherAccesses<'a> {
             }
         };
 
-        let mut node_to_per_output_accesses: FxHashMap<_, SmallVec<[Option<_>; 2]>> =
-            FxHashMap::default();
+        // HACK(eddyb) this could be `FxHashMap`, except it's iterated at the end
+        // to generate errors for outputs of nodes that somehow weren't visited,
+        // or inputs of regions (i.e. loop bodies, which don't support pointers),
+        // and while *technically* not a hazard, it's better to be deterministic.
+        let mut var_accesses = FxIndexMap::default();
 
         // HACK(eddyb) reversing a post-order traversal to get RPO, which for
         // structured control-flow means outside-in/top-down (just like pre-order),
@@ -893,10 +919,27 @@ impl<'a> GatherAccesses<'a> {
             before: |_| {},
             after: |node| post_order_nodes.push(node),
         });
-        for node in post_order_nodes.into_iter().rev() {
-            let per_output_accesses = node_to_per_output_accesses.remove(&node).unwrap_or_default();
-
+        for &node in post_order_nodes.iter().rev() {
             let node_def = func_def_body.at(node).def();
+
+            // FIXME(eddyb) consider avoiding this collection step.
+            let per_output_accesses = small_vec_from_position_value_pairs::<_, 1>(
+                node_def
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &v)| Some((i, var_accesses.swap_remove(&v)?))),
+            );
+
+            // Always attach attributes to `qptr`-typed outputs,
+            // on top of propagating them from uses to definitions.
+            for (&output_var, accesses) in node_def.outputs.iter().zip(&per_output_accesses) {
+                if let Some(accesses) = accesses {
+                    accesses_or_err_attrs_to_attach
+                        .push((AttrTarget::Var(output_var), Clone::clone(accesses)));
+                }
+            }
+
             let offset_accesses = |accesses, offset: u32| {
                 let happ = match accesses {
                     MemAccesses::Handles(_) => {
@@ -933,18 +976,29 @@ impl<'a> GatherAccesses<'a> {
                     kind: DataHappKind::Disjoint(Rc::new([(offset, happ)].into())),
                 }))
             };
-            let mut generate_accesses = |this: &mut Self, ptr: Value, mut new_accesses| {
-                let slot = match ptr {
+            let mut generate_accesses = |this: &mut Self, ptr: Value, new_accesses| {
+                // HACK(eddyb) in order to handle the different `Entry` types
+                // (inevitable due to different key types for different maps),
+                // the `.or_insert_with(|| new_accesses.take().unwrap())` pattern
+                // is used to distinguish "newly inserted" vs "needs merge".
+                let mut new_accesses = Some(new_accesses);
+
+                let accesses = match ptr {
                     Value::Const(ct) => match cx[ct].kind {
+                        // TODO(eddyb) implement `offset: Some(_)` by analogy
+                        // to `qptr.offset` on the `offset: None` case.
                         ConstKind::PtrToGlobalVar { global_var, offset } => {
                             if let Some(offset) = offset
-                                && let Ok(accesses) = new_accesses
+                                && let Some(Ok(accesses)) = new_accesses
                             {
-                                new_accesses = offset_accesses(accesses, offset.get());
+                                new_accesses = Some(offset_accesses(accesses, offset.get()));
                             }
 
-                            this.global_var_accesses.entry(global_var).or_default()
+                            this.global_var_accesses
+                                .entry(global_var)
+                                .or_insert_with(|| new_accesses.take().unwrap())
                         }
+
                         // FIXME(eddyb) attach on the `Const` by replacing
                         // it with a copy that also has an extra attribute,
                         // or actually support by adding the accesses attribute
@@ -961,53 +1015,35 @@ impl<'a> GatherAccesses<'a> {
                             return;
                         }
                     },
-                    Value::Var(ptr) => match func_def_body.at(ptr).decl().kind() {
-                        VarKind::RegionInput { region, input_idx }
-                            if region == func_def_body.body =>
-                        {
-                            &mut param_accesses[input_idx as usize]
-                        }
-                        VarKind::RegionInput { .. } => {
-                            // FIXME(eddyb) don't throw away `new_accesses`.
-                            accesses_or_err_attrs_to_attach.push((
-                                AttrTarget::Var(ptr),
-                                Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
-                            ));
-                            return;
-                        }
-                        VarKind::NodeOutput { node: ptr_node, output_idx } => {
-                            let i = output_idx as usize;
-                            let slots = node_to_per_output_accesses.entry(ptr_node).or_default();
-                            if i >= slots.len() {
-                                slots.extend((slots.len()..=i).map(|_| None));
-                            }
-                            &mut slots[i]
-                        }
-                    },
+                    Value::Var(ptr) => {
+                        var_accesses.entry(ptr).or_insert_with(|| new_accesses.take().unwrap())
+                    }
                 };
-                *slot = Some(match slot.take() {
-                    Some(old) => old.and_then(|old| {
+
+                // HACK(eddyb) also see the comment on `new_accesses`.
+                if let Some(new_accesses) = new_accesses {
+                    // HACK(eddyb) using a placeholder to get by-value access.
+                    let old_accesses = mem::replace(accesses, Err(AnalysisError(Diag::bug([]))));
+                    *accesses = old_accesses.and_then(|old_accesses| {
                         AccessMerger { layout_cache: &this.layout_cache }
-                            .merge(old, new_accesses?)
+                            .merge(old_accesses, new_accesses?)
                             .into_result()
-                    }),
-                    None => new_accesses,
-                });
+                    });
+                }
             };
 
             match &node_def.kind {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation { .. } => {
-                    for (&output_var, accesses) in node_def.outputs.iter().zip(&per_output_accesses)
+                    for (&output_var, accesses) in node_def.outputs.iter().zip(per_output_accesses)
                     {
-                        if let Some(_accesses) = accesses {
-                            // FIXME(eddyb) don't throw away `accesses`.
+                        // HACK(eddyb) `accesses` was already attached earlier.
+                        if accesses.is_some() {
                             accesses_or_err_attrs_to_attach.push((
                                 AttrTarget::Var(output_var),
-                                Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
+                                Err(AnalysisError(Diag::bug(["unsupported dynamic qptr".into()]))),
                             ));
                         }
                     }
-
                     continue;
                 }
 
@@ -1034,41 +1070,29 @@ impl<'a> GatherAccesses<'a> {
 
                 DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
 
-                &DataInstKind::FuncCall(callee) => {
-                    match self.gather_accesses_in_func(module, callee) {
-                        FuncGatherAccessesState::Complete(callee_results) => {
-                            for (&arg, param_accesses) in
-                                data_inst_def.inputs.iter().zip(&callee_results.param_accesses)
-                            {
-                                if let Some(param_accesses) = param_accesses {
-                                    generate_accesses(self, arg, param_accesses.clone());
-                                }
+                &DataInstKind::FuncCall(callee) => match self
+                    .gather_accesses_in_func(module, callee)
+                {
+                    FuncGatherAccessesState::Complete(callee_results) => {
+                        for (&arg, param_accesses) in
+                            data_inst_def.inputs.iter().zip(&callee_results.param_accesses)
+                        {
+                            if let Some(param_accesses) = param_accesses {
+                                generate_accesses(self, arg, param_accesses.clone());
                             }
                         }
-                        FuncGatherAccessesState::InProgress => {
-                            accesses_or_err_attrs_to_attach.push((
-                                AttrTarget::Node(node),
-                                Err(AnalysisError(Diag::bug(
-                                    ["unsupported recursive call".into()],
-                                ))),
-                            ));
-                        }
-                    };
-                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                    if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                        .is_some_and(|&o| is_qptr(func_def_body.at(o).decl().ty))
-                        && let Some(accesses) = output_accesses
-                    {
-                        accesses_or_err_attrs_to_attach
-                            .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
                     }
-                }
+                    FuncGatherAccessesState::InProgress => {
+                        accesses_or_err_attrs_to_attach.push((
+                            AttrTarget::Node(node),
+                            Err(AnalysisError(Diag::bug(["unsupported recursive call".into()]))),
+                        ));
+                    }
+                },
 
-                DataInstKind::Mem(MemOp::FuncLocalVar(_)) => {
-                    if let Some(accesses) = output_accesses {
-                        accesses_or_err_attrs_to_attach
-                            .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
-                    }
+                DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
+                    // FIXME(eddyb) merge/intersect `mem.accesses` from uses,
+                    // with the inherent size/align (given by `_mem_layout`)?
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
                     generate_accesses(
@@ -1335,89 +1359,132 @@ impl<'a> GatherAccesses<'a> {
                 }
 
                 DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
-                    let mut has_from_spv_ptr_output_attr = false;
                     for attr in &cx[data_inst_def.attrs].attrs {
-                        match *attr {
-                            Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) => {
-                                let ty = pointee.0;
-                                generate_accesses(
-                                    self,
-                                    data_inst_def.inputs[input_idx as usize],
-                                    self.layout_cache
-                                        .layout_of(ty)
-                                        .map_err(|LayoutError(e)| AnalysisError(e))
-                                        .and_then(|layout| match layout {
-                                            TypeLayout::Handle(handle) => {
-                                                let handle = match handle {
-                                                    shapes::Handle::Opaque(ty) => {
-                                                        shapes::Handle::Opaque(ty)
-                                                    }
-                                                    // NOTE(eddyb) this error is important,
-                                                    // as the `Block` annotation on the
-                                                    // buffer type means the type is *not*
-                                                    // usable anywhere inside buffer data,
-                                                    // since it would conflict with our
-                                                    // own `Block`-annotated wrapper.
-                                                    shapes::Handle::Buffer(..) => {
-                                                        return Err(AnalysisError(Diag::bug([
-                                                            "ToSpvPtrInput: \
-                                                             whole Buffer ambiguous \
-                                                             (handle vs buffer data)"
-                                                                .into(),
-                                                        ])));
-                                                    }
-                                                };
-                                                Ok(MemAccesses::Handles(handle))
-                                            }
-                                            // NOTE(eddyb) because we can't represent
-                                            // the original type, in the same way we
-                                            // use `DataHappKind::StrictlyTyped`
-                                            // for non-handles, we can't guarantee
-                                            // a generated type that matches the
-                                            // desired `pointee` type.
-                                            TypeLayout::HandleArray(..) => {
-                                                Err(AnalysisError(Diag::bug([
-                                                    "ToSpvPtrInput: whole handle array \
-                                                     unrepresentable"
-                                                        .into(),
-                                                ])))
-                                            }
-                                            TypeLayout::Concrete(concrete) => {
-                                                Ok(MemAccesses::Data(DataHapp {
-                                                    max_size: if concrete
-                                                        .mem_layout
-                                                        .dyn_unit_stride
-                                                        .is_some()
-                                                    {
-                                                        None
-                                                    } else {
-                                                        Some(concrete.mem_layout.fixed_base.size)
-                                                    },
-                                                    kind: DataHappKind::StrictlyTyped(ty),
-                                                }))
-                                            }
-                                        }),
-                                );
-                            }
-                            Attr::QPtr(QPtrAttr::FromSpvPtrOutput {
-                                addr_space: _,
-                                pointee: _,
-                            }) => {
-                                has_from_spv_ptr_output_attr = true;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if has_from_spv_ptr_output_attr {
-                        // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
-                        if let Some(accesses) = output_accesses {
-                            accesses_or_err_attrs_to_attach
-                                .push((AttrTarget::Var(data_inst_def.outputs[0]), accesses));
+                        if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) = *attr {
+                            let ty = pointee.0;
+                            generate_accesses(
+                                self,
+                                data_inst_def.inputs[input_idx as usize],
+                                self.layout_cache
+                                    .layout_of(ty)
+                                    .map_err(|LayoutError(e)| AnalysisError(e))
+                                    .and_then(|layout| match layout {
+                                        TypeLayout::Handle(handle) => {
+                                            let handle = match handle {
+                                                shapes::Handle::Opaque(ty) => {
+                                                    shapes::Handle::Opaque(ty)
+                                                }
+                                                // NOTE(eddyb) this error is important,
+                                                // as the `Block` annotation on the
+                                                // buffer type means the type is *not*
+                                                // usable anywhere inside buffer data,
+                                                // since it would conflict with our
+                                                // own `Block`-annotated wrapper.
+                                                shapes::Handle::Buffer(..) => {
+                                                    return Err(AnalysisError(Diag::bug([
+                                                        "ToSpvPtrInput: \
+                                                         whole Buffer ambiguous \
+                                                         (handle vs buffer data)"
+                                                            .into(),
+                                                    ])));
+                                                }
+                                            };
+                                            Ok(MemAccesses::Handles(handle))
+                                        }
+                                        // NOTE(eddyb) because we can't represent
+                                        // the original type, in the same way we
+                                        // use `DataHappKind::StrictlyTyped`
+                                        // for non-handles, we can't guarantee
+                                        // a generated type that matches the
+                                        // desired `pointee` type.
+                                        TypeLayout::HandleArray(..) => {
+                                            Err(AnalysisError(Diag::bug([
+                                                "ToSpvPtrInput: whole handle array unrepresentable"
+                                                    .into(),
+                                            ])))
+                                        }
+                                        TypeLayout::Concrete(concrete) => {
+                                            Ok(MemAccesses::Data(DataHapp {
+                                                max_size: (concrete
+                                                    .mem_layout
+                                                    .dyn_unit_stride
+                                                    .is_none())
+                                                .then_some(concrete.mem_layout.fixed_base.size),
+                                                kind: DataHappKind::StrictlyTyped(ty),
+                                            }))
+                                        }
+                                    }),
+                            );
                         }
                     }
                 }
             }
+        }
+
+        let param_accesses = small_vec_from_position_value_pairs(
+            func_def_body
+                .at_body()
+                .def()
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| Some((i, var_accesses.swap_remove(&v)?))),
+        );
+
+        if !var_accesses.is_empty() {
+            // HACK(eddyb) this extra traversal only exists in case the reason
+            // for leftover `var_accesses` entries is just the visit order,
+            // however unlikely that is (compared to the even worse case).
+            for &node in &post_order_nodes {
+                let node_def = func_def_body.at(node).def();
+                for &output_var in &node_def.outputs {
+                    if let Some(accesses) = var_accesses.swap_remove(&output_var) {
+                        let diag = match accesses {
+                            Ok(accesses) => Diag::bug([
+                                "extra mem.accesses contributions ignored (visited too late): "
+                                    .into(),
+                                accesses.into(),
+                            ]),
+                            Err(AnalysisError(mut diag)) => {
+                                diag.message.insert(
+                                    0,
+                                    "extra mem.accesses-related errors (visited too late): ".into(),
+                                );
+                                diag
+                            }
+                        };
+                        accesses_or_err_attrs_to_attach
+                            .push((AttrTarget::Var(output_var), Err(AnalysisError(diag))));
+                    }
+                }
+                for &region in &node_def.child_regions {
+                    for &input_var in &func_def_body.at(region).def().inputs {
+                        if let Some(accesses) = var_accesses.swap_remove(&input_var) {
+                            accesses_or_err_attrs_to_attach.extend([
+                                (AttrTarget::Var(input_var), accesses),
+                                (
+                                    AttrTarget::Var(input_var),
+                                    Err(AnalysisError(Diag::bug([
+                                        "unsupported dynamic qptr".into()
+                                    ]))),
+                                ),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // FIXME(eddyb) this should ideally be detected by a SPIR-T verifier.
+        if !var_accesses.is_empty() {
+            accesses_or_err_attrs_to_attach.push((
+                AttrTarget::Func,
+                Err(AnalysisError(Diag::bug([format!(
+                    "{} `qptr` values are used, but their definitions were never visited",
+                    var_accesses.len()
+                )
+                .into()]))),
+            ));
         }
 
         FuncGatherAccessesResults { param_accesses, accesses_or_err_attrs_to_attach }
