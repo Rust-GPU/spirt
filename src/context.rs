@@ -957,4 +957,5 @@ entities! {
     Func => chunk_size(0x1_0000) crate::FuncDecl,
     Region => chunk_size(0x1000) crate::RegionDef,
     Node => chunk_size(0x1000) EntityListNode<Node, crate::NodeDef>,
+    Var => chunk_size(0x1000) crate::VarDecl,
 }
