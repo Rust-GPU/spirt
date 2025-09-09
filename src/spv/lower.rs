@@ -817,7 +817,6 @@ impl Module {
                         DeclDef::Present(FuncDefBody {
                             regions,
                             nodes: Default::default(),
-                            data_insts: Default::default(),
                             body,
                             unstructured_cfg: Some(cf::unstructured::ControlFlowGraph::default()),
                         })
@@ -1052,7 +1051,7 @@ impl Module {
                             } else {
                                 // HACK(eddyb) can't get a `DataInst` without
                                 // defining it (as a dummy) first.
-                                let inst = func_def_body.data_insts.define(
+                                let inst = func_def_body.nodes.define(
                                     &cx,
                                     DataInstDef {
                                         attrs: AttrSet::default(),
@@ -1649,13 +1648,13 @@ impl Module {
                             LocalIdDef::Value(Value::DataInstOutput { inst, .. }) => {
                                 // A dummy was defined earlier, to be able to
                                 // have an entry in `local_id_defs`.
-                                func_def_body.data_insts[inst] = data_inst_def.into();
+                                func_def_body.nodes[inst] = data_inst_def.into();
 
                                 inst
                             }
                             _ => unreachable!(),
                         },
-                        None => func_def_body.data_insts.define(&cx, data_inst_def.into()),
+                        None => func_def_body.nodes.define(&cx, data_inst_def.into()),
                     };
 
                     let current_block_node = current_block_region_def
@@ -1682,9 +1681,11 @@ impl Module {
                                 .insert_last(block_node, &mut func_def_body.nodes);
                             block_node
                         });
-                    match &mut func_def_body.nodes[current_block_node].kind {
-                        NodeKind::Block { insts } => {
-                            insts.insert_last(inst, &mut func_def_body.data_insts);
+                    match func_def_body.nodes[current_block_node].kind {
+                        NodeKind::Block { mut insts } => {
+                            insts.insert_last(inst, &mut func_def_body.nodes);
+                            func_def_body.nodes[current_block_node].kind =
+                                NodeKind::Block { insts };
                         }
                         _ => unreachable!(),
                     }

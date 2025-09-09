@@ -3780,7 +3780,7 @@ impl Print for FuncAt<'_, Node> {
                 pretty::Fragment::new(
                     self.at(*insts)
                         .into_iter()
-                        .map(|func_at_inst| func_at_inst.print(printer))
+                        .map(|func_at_inst| func_at_inst.print_data_inst(printer))
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
             }
@@ -3882,6 +3882,12 @@ impl Print for FuncAt<'_, Node> {
                 imms,
                 inputs.iter().map(|v| v.print(printer)),
             ),
+
+            DataInstKind::FuncCall(_)
+            | DataInstKind::Mem(_)
+            | DataInstKind::QPtr(_)
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => unreachable!(),
         };
         let def_without_name = pretty::Fragment::new([
             Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
@@ -3915,9 +3921,8 @@ impl Print for NodeOutputDecl {
     }
 }
 
-impl Print for FuncAt<'_, DataInst> {
-    type Output = pretty::Fragment;
-    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+impl FuncAt<'_, DataInst> {
+    fn print_data_inst(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.def();
 
         assert_eq!(child_regions.len(), 0);
@@ -3938,6 +3943,11 @@ impl Print for FuncAt<'_, DataInst> {
         let mut output_type_to_print = output_type;
 
         let def_without_type = match kind {
+            NodeKind::Block { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => unreachable!(),
+
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([
                 printer.declarative_keyword_style().apply("call").into(),
                 " ".into(),

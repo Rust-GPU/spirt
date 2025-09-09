@@ -5,7 +5,7 @@ use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstKind,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstKind,
     DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
     ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
@@ -65,8 +65,8 @@ pub trait Visitor<'a>: Sized {
     fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
         func_at_node.inner_visit_with(self);
     }
-    fn visit_data_inst_def(&mut self, data_inst_def: &'a DataInstDef) {
-        data_inst_def.inner_visit_with(self);
+    fn visit_data_inst_def(&mut self, func_at_inst: FuncAt<'a, DataInst>) {
+        func_at_inst.inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -128,7 +128,6 @@ impl_visit! {
         visit_const_def(ConstDef),
         visit_global_var_decl(GlobalVarDecl),
         visit_func_decl(FuncDecl),
-        visit_data_inst_def(DataInstDef),
         visit_value_use(Value),
     }
     forward_to_inner_visit {
@@ -481,12 +480,25 @@ impl<'a> FuncAt<'a, Node> {
         match kind {
             NodeKind::Block { insts } => {
                 for func_at_inst in self.at(*insts) {
-                    visitor.visit_data_inst_def(func_at_inst.def());
+                    visitor.visit_data_inst_def(func_at_inst);
                 }
             }
+
+            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
+
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
             | NodeKind::Loop { repeat_condition: _ }
-            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
+            | DataInstKind::QPtr(
+                QPtrOp::HandleArrayIndex
+                | QPtrOp::BufferData
+                | QPtrOp::BufferDynLen { .. }
+                | QPtrOp::Offset(_)
+                | QPtrOp::DynOffset { .. },
+            )
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => {}
         }
         for v in inputs {
             visitor.visit_value_use(v);
@@ -512,41 +524,6 @@ impl InnerVisit for NodeOutputDecl {
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
-    }
-}
-
-impl InnerVisit for DataInstDef {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, child_regions, outputs } = self;
-
-        visitor.visit_attr_set_use(*attrs);
-        kind.inner_visit_with(visitor);
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        assert_eq!(child_regions.len(), 0);
-        for output in outputs {
-            output.inner_visit_with(visitor);
-        }
-    }
-}
-
-impl InnerVisit for DataInstKind {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        match self {
-            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
-            DataInstKind::Mem(op) => match *op {
-                MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store => {}
-            },
-            DataInstKind::QPtr(op) => match *op {
-                QPtrOp::HandleArrayIndex
-                | QPtrOp::BufferData
-                | QPtrOp::BufferDynLen { .. }
-                | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. } => {}
-            },
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
     }
 }
 

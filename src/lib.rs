@@ -702,7 +702,6 @@ pub struct FuncParam {
 pub struct FuncDefBody {
     pub regions: EntityDefs<Region>,
     pub nodes: EntityDefs<Node>,
-    pub data_insts: EntityDefs<DataInst>,
 
     /// The [`Region`] representing the whole body of the function.
     ///
@@ -852,13 +851,10 @@ pub use context::Node;
 ///
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
-pub struct NodeDef<
-    // HACK(eddyb) generic so `DataInstDef` can reuse it, pre-merger.
-    K = NodeKind,
-> {
+pub struct NodeDef {
     pub attrs: AttrSet,
 
-    pub kind: K,
+    pub kind: NodeKind,
 
     // FIXME(eddyb) change the inline size of this to fit most nodes.
     pub inputs: SmallVec<[Value; 2]>,
@@ -881,7 +877,7 @@ pub struct NodeOutputDecl {
     pub ty: Type,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum NodeKind {
     /// Linear chain of [`DataInst`]s, executing in sequence.
     ///
@@ -924,22 +920,9 @@ pub enum NodeKind {
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
     ExitInvocation(cf::ExitInvocationKind),
-}
 
-/// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
-pub use context::DataInst;
-
-/// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
-//
-// HACK(eddyb) temporarily reusing `NodeDef` pre-merger, with:
-// - `child_regions` always empty
-// - `outputs.len` always <= 1
-pub type DataInstDef = NodeDef<DataInstKind>;
-
-#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
-pub enum DataInstKind {
-    // FIXME(eddyb) try to split this into recursive and non-recursive calls,
-    // to avoid needing special handling for recursion where it's impossible.
+    // NOTE(eddyb) all variants below used to be in `DataInstKind`.
+    //
     FuncCall(Func),
 
     /// Memory-specific operations (see [`mem::MemOp`]).
@@ -957,6 +940,13 @@ pub enum DataInstKind {
         inst: u32,
     },
 }
+
+// HACK(eddyb) temporarily reusing `Node` pre-merger, with:
+// - `child_regions` always empty
+// - `outputs.len` always <= 1
+pub type DataInst = Node;
+pub type DataInstDef = NodeDef;
+pub type DataInstKind = NodeKind;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Value {

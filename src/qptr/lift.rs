@@ -448,6 +448,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             Ok((addr_space, self.lifter.layout_of(pointee_type)?))
         };
         let replacement_data_inst_def = match &data_inst_def.kind {
+            NodeKind::Block { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => unreachable!(),
+
             &DataInstKind::FuncCall(_callee) => {
                 for &v in &data_inst_def.inputs {
                     if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
@@ -781,9 +786,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                     let access_chain_data_inst = func_at_data_inst
                         .reborrow()
-                        .data_insts
+                        .nodes
                         .define(cx, access_chain_data_inst_def.into());
 
+                    // FIXME(eddyb) comment below should be about `nodes` vs `regions`
+                    // (once `Block` and the `Node`-vs-`DataInst` split are gone).
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
@@ -792,9 +799,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // an actual list entity of its own, should be considered.
                     let data_inst = func_at_data_inst.position;
                     let func = func_at_data_inst.reborrow().at(());
-                    match &mut func.nodes[parent_block].kind {
-                        NodeKind::Block { insts } => {
-                            insts.insert_before(access_chain_data_inst, data_inst, func.data_insts);
+                    match func.nodes[parent_block].kind {
+                        NodeKind::Block { mut insts } => {
+                            insts.insert_before(access_chain_data_inst, data_inst, func.nodes);
+                            func.nodes[parent_block].kind = NodeKind::Block { insts };
                         }
                         _ => unreachable!(),
                     }
@@ -856,9 +864,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                     let access_chain_data_inst = func_at_data_inst
                         .reborrow()
-                        .data_insts
+                        .nodes
                         .define(cx, access_chain_data_inst_def.into());
 
+                    // FIXME(eddyb) comment below should be about `nodes` vs `regions`
+                    // (once `Block` and the `Node`-vs-`DataInst` split are gone).
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
@@ -867,9 +877,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // an actual list entity of its own, should be considered.
                     let data_inst = func_at_data_inst.position;
                     let func = func_at_data_inst.reborrow().at(());
-                    match &mut func.nodes[parent_block].kind {
-                        NodeKind::Block { insts } => {
-                            insts.insert_before(access_chain_data_inst, data_inst, func.data_insts);
+                    match func.nodes[parent_block].kind {
+                        NodeKind::Block { mut insts } => {
+                            insts.insert_before(access_chain_data_inst, data_inst, func.nodes);
+                            func.nodes[parent_block].kind = NodeKind::Block { insts };
                         }
                         _ => unreachable!(),
                     }
@@ -1156,15 +1167,19 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             // use counts of an earlier definition, allowing further removal.
             for (inst, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
                 if self.data_inst_use_counts.get(inst).is_none() {
+                    // FIXME(eddyb) comment below should be about `nodes` vs `regions`
+                    // (once `Block` and the `Node`-vs-`DataInst` split are gone).
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `nodes` and `data_insts`
                     // at the same time - perhaps some kind of `FuncAtMut` position
                     // types for "where a list is in a parent entity" could be used
                     // to make this more ergonomic, although the potential need for
                     // an actual list entity of its own, should be considered.
-                    match &mut func_def_body.nodes[ptr_noop.parent_block].kind {
-                        NodeKind::Block { insts } => {
-                            insts.remove(inst, &mut func_def_body.data_insts);
+                    match func_def_body.nodes[ptr_noop.parent_block].kind {
+                        NodeKind::Block { mut insts } => {
+                            insts.remove(inst, &mut func_def_body.nodes);
+                            func_def_body.nodes[ptr_noop.parent_block].kind =
+                                NodeKind::Block { insts };
                         }
                         _ => unreachable!(),
                     }

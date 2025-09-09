@@ -10,7 +10,7 @@ pub mod cfgssa;
 pub mod structurize;
 pub mod unstructured;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum SelectionKind {
     /// Two-case selection based on boolean condition, i.e. `if`-`else`, with
     /// the two cases being "then" and "else" (in that order).
@@ -19,7 +19,7 @@ pub enum SelectionKind {
     SpvInst(spv::Inst),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ExitInvocationKind {
     SpvInst(spv::Inst),
 }
