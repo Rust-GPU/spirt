@@ -99,23 +99,68 @@ pub(crate) enum Components {
     },
 }
 
+// FIXME(eddyb) review this, especially wrt using it in more places.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct Extent<T> {
+    pub(crate) start: T,
+    // FIXME(eddyb) would `Option<RangeTo<T>>` be clearer?
+    pub(crate) end: Option<T>,
+}
+
+// HACK(eddyb) comparison helper for `Option<T>` so that `Some(_) < None`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum InfOr<T> {
+    Fin(T),
+    Inf,
+}
+
+impl<T> From<Range<T>> for Extent<T> {
+    fn from(range: Range<T>) -> Self {
+        Self { start: range.start, end: Some(range.end) }
+    }
+}
+
+impl<T: Ord> Extent<T> {
+    pub(crate) fn includes(&self, other: &Self) -> bool {
+        self.start <= other.start
+            && other.end.as_ref().map_or(InfOr::Inf, InfOr::Fin)
+                <= self.end.as_ref().map_or(InfOr::Inf, InfOr::Fin)
+    }
+}
+
+impl Extent<u32> {
+    pub(crate) fn checked_add(self, delta: u32) -> Option<Self> {
+        Some(Self {
+            start: self.start.checked_add(delta)?,
+            end: self.end.map(|end| end.checked_add(delta).ok_or(())).transpose().ok()?,
+        })
+    }
+
+    // FIXME(eddyb) this pattern was already used in a few places, is it reasonable?
+    pub(crate) fn saturating_add(self, delta: u32) -> Self {
+        Self {
+            start: self.start.saturating_add(delta),
+            end: self.end.map(|end| end.saturating_add(delta)),
+        }
+    }
+}
+
 impl Components {
-    /// Return all components (by index), which completely contain `offset_range`.
+    /// Return all components (by index), which completely contain `extent`.
     ///
-    /// If `offset_range` is zero-sized (`offset_range.start == offset_range.end`),
-    /// this can return multiple components, with at most one ever being non-ZST.
+    /// If `extent` is zero-sized (`Some(extent.start) == extent.end`), this
+    /// can return multiple components, with at most one ever being non-ZST.
     //
     // FIXME(eddyb) be more aggressive in pruning ZSTs so this can be simpler.
     pub(crate) fn find_components_containing(
         &self,
-        // FIXME(eddyb) consider renaming such offset ranges to "extent".
-        offset_range: Range<u32>,
+        extent: Extent<u32>,
     ) -> impl Iterator<Item = usize> + '_ {
-        match self {
+        let candidate_component_indices_with_extent = match self {
             Components::Scalar => Either::Left(None.into_iter()),
             Components::Elements { stride, elem, fixed_len } => {
                 Either::Left(
-                    Some(offset_range.start / stride.get())
+                    Some(extent.start / stride.get())
                         .and_then(|elem_idx| {
                             let elem_idx_vs_len = fixed_len
                                 .map_or(Ordering::Less, |fixed_len| elem_idx.cmp(&fixed_len.get()));
@@ -127,11 +172,11 @@ impl Components {
 
                                 Ordering::Greater => return None,
                             };
-                            let elem_start = elem_idx * stride.get();
-                            Some((elem_idx, elem_start..elem_start.checked_add(elem_size)?))
+                            Some((
+                                usize::try_from(elem_idx).ok()?,
+                                Extent::from(0..elem_size).checked_add(elem_idx * stride.get())?,
+                            ))
                         })
-                        .filter(|(_, elem_range)| offset_range.end <= elem_range.end)
-                        .and_then(|(elem_idx, _)| usize::try_from(elem_idx).ok())
                         .into_iter(),
                 )
             }
@@ -143,27 +188,20 @@ impl Components {
                     .iter()
                     .zip(layouts)
                     .map(|(&field_offset, field)| {
-                        // HACK(eddyb) really need a maybe-open-ended range type.
-                        if field.mem_layout.dyn_unit_stride.is_some() {
-                            Err(field_offset..)
-                        } else {
-                            Ok(field_offset
-                                ..field_offset
-                                    .checked_add(field.mem_layout.fixed_base.size)
-                                    .unwrap())
+                        Extent {
+                            start: 0,
+                            end: (field.mem_layout.dyn_unit_stride.is_none())
+                                .then_some(field.mem_layout.fixed_base.size),
                         }
+                        .checked_add(field_offset)
+                        .unwrap()
                     })
-                    .enumerate()
-                    .filter(move |(_, field_range)| match field_range {
-                        Ok(field_range) => {
-                            field_range.start <= offset_range.start
-                                && offset_range.end <= field_range.end
-                        }
-                        Err(field_range) => field_range.start <= offset_range.start,
-                    })
-                    .map(|(field_idx, _)| field_idx),
+                    .enumerate(),
             ),
-        }
+        };
+        candidate_component_indices_with_extent
+            .filter(move |(_, component_extent)| component_extent.includes(&extent))
+            .map(|(component_idx, _)| component_idx)
     }
 }
 
