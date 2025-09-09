@@ -914,7 +914,8 @@ impl<'a> Structurizer<'a> {
                     // FIXME(eddyb) could it be possible to synthesize attrs
                     // from `ControlInst`s' attrs and/or `OpLoopMerge`'s?
                     attrs: AttrSet::default(),
-                    kind: NodeKind::Loop { initial_inputs, body, repeat_condition },
+                    inputs: initial_inputs,
+                    kind: NodeKind::Loop { body, repeat_condition },
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
@@ -1069,7 +1070,8 @@ impl<'a> Structurizer<'a> {
                         self.cx,
                         NodeDef {
                             attrs,
-                            kind: NodeKind::ExitInvocation { kind, inputs },
+                            inputs,
+                            kind: NodeKind::ExitInvocation(kind),
                             outputs: [].into_iter().collect(),
                         }
                         .into(),
@@ -1379,7 +1381,8 @@ impl<'a> Structurizer<'a> {
                     this.cx,
                     NodeDef {
                         attrs,
-                        kind: NodeKind::Select { kind, scrutinee, cases },
+                        inputs: [scrutinee].into_iter().collect(),
+                        kind: NodeKind::Select { kind, cases },
                         outputs: [].into_iter().collect(),
                     }
                     .into(),
@@ -1653,23 +1656,25 @@ impl<'a> Structurizer<'a> {
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let NodeDef { attrs: _, kind, outputs: output_decls } =
+                let NodeDef { attrs: _, inputs, kind, outputs: output_decls } =
                     &mut *self.func_def_body.nodes[node];
                 let cases = match kind {
-                    NodeKind::Select { kind, scrutinee, cases } => {
+                    NodeKind::Select { kind, cases } => {
                         assert_eq!(cases.len(), per_case_conds.len());
 
                         if let SelectionKind::BoolCond = kind {
+                            let cond = inputs[0];
+
                             let [val_false, val_true] =
                                 [self.const_false, self.const_true].map(Value::Const);
                             if per_case_conds[..] == [val_true, val_false] {
-                                return *scrutinee;
+                                return cond;
                             } else if per_case_conds[..] == [val_false, val_true] {
                                 // FIXME(eddyb) this could also be special-cased,
                                 // at least when called from the topmost level,
                                 // where which side is `false`/`true` doesn't
                                 // matter (or we could even generate `!cond`?).
-                                let _not_cond = *scrutinee;
+                                let _not_cond = cond;
                             }
                         }
 
