@@ -1,5 +1,6 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lowering (e.g. from SPIR-V).
 
+use crate::cf::SelectionKind;
 use crate::func_at::FuncAtMut;
 use crate::mem::{MemOp, const_data, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
@@ -7,8 +8,8 @@ use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, GlobalVarInit,
-    Node, NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl,
-    VarKind, scalar, spv,
+    Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type, TypeKind, TypeOrConst, Value,
+    Var, VarDecl, VarKind, scalar, spv,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -1134,6 +1135,243 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     }));
                 }
             }
+        } else if spv_inst.opcode == wk.OpCopyMemorySized {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
+            assert_eq!(data_inst_def.inputs.len(), 3);
+
+            let dst_ptr = data_inst_def.inputs[0];
+            let src_ptr = data_inst_def.inputs[1];
+            let size = data_inst_def.inputs[2];
+
+            // HACK(eddyb) this isn't just a simple `match` to avoid indentation.
+            if let Value::Var(size) = size {
+                let mut func = func_at_data_inst.reborrow().at(());
+
+                let (count, stride) = func.vars[size]
+                    .def_parent
+                    .right()
+                    .and_then(|size_node| {
+                        let size_node_def = &func.nodes[size_node];
+                        match (&size_node_def.kind, &size_node_def.inputs[..]) {
+                            (
+                                NodeKind::Scalar(scalar::Op::IntBinary(scalar::IntBinOp::Mul)),
+                                &[Value::Const(stride), count] | &[count, Value::Const(stride)],
+                            ) => {
+                                Some((count, NonZeroU32::new(stride.as_scalar(cx)?.int_as_u32()?)?))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or((Value::Var(size), NonZeroU32::new(1).unwrap()));
+                let count_ty = func.reborrow().freeze().at(count).type_of(cx);
+
+                let count_scalar_ty = count_ty
+                    .as_scalar(cx)
+                    .filter(|ty| matches!(ty, scalar::Type::UInt(_)))
+                    .ok_or_else(|| {
+                        LowerError(Diag::bug([
+                            "`OpCopyMemorySized` with non-uint size input type: ".into(),
+                            count_ty.into(),
+                        ]))
+                    })?;
+
+                // Generate a loop like this Rust code (`let`s becoming `Var`s):
+                //
+                // let mut i = 0;
+                // loop {
+                //     let i_next = i + 1;
+                //     let any_left = i < count;
+                //     if any_left {
+                //         let dst_elem = (dst as *mut [u8; STRIDE]).add(i);
+                //         let src_elem = (src as *const [u8; STRIDE]).add(i);
+                //         dst_elem.copy_from(src_elem, 1);
+                //     }
+                //
+                //     if !any_left { break; } // aka do {...} while(any_left)
+                //     i = i_next;
+                // }
+
+                let loop_initial_inputs =
+                    [Value::Const(cx.intern(scalar::Const::from_bits(count_scalar_ty, 0)))];
+                let loop_output_vars = [func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: count_ty,
+                        def_parent: Either::Right(data_inst),
+                        def_idx: 0,
+                    },
+                )];
+
+                // HACK(eddyb) doing this early to interfere less w/ mut borrows.
+                let if_any_left_child_regions = [
+                    func.regions.define(cx, RegionDef::default()),
+                    func.regions.define(cx, RegionDef::default()),
+                ];
+
+                let loop_body = func.regions.define(cx, RegionDef::default());
+                let loop_body_def = &mut func.regions[loop_body];
+
+                let index = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: count_ty,
+                        def_parent: Either::Left(loop_body),
+                        def_idx: loop_body_def.inputs.len().try_into().unwrap(),
+                    },
+                );
+                loop_body_def.inputs.push(index);
+
+                let index_plus_one_inst = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: scalar::Op::IntBinary(scalar::IntBinOp::Add).into(),
+                        inputs: [
+                            Value::Var(index),
+                            Value::Const(cx.intern(
+                                scalar::Const::int_try_from_i128(count_scalar_ty, 1).unwrap(),
+                            )),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                let index_plus_one = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: count_ty,
+                        def_parent: Either::Right(index_plus_one_inst),
+                        def_idx: 0,
+                    },
+                );
+                func.nodes[index_plus_one_inst].outputs.push(index_plus_one);
+                loop_body_def.children.insert_last(index_plus_one_inst, func.nodes);
+
+                loop_body_def.outputs.push(Value::Var(index_plus_one));
+
+                let any_left_inst = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: scalar::Op::IntBinary(scalar::IntBinOp::LtU).into(),
+                        inputs: [Value::Var(index), count].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                let any_left = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: cx.intern(scalar::Type::Bool),
+                        def_parent: Either::Right(any_left_inst),
+                        def_idx: 0,
+                    },
+                );
+                func.nodes[any_left_inst].outputs.push(any_left);
+                loop_body_def.children.insert_last(any_left_inst, func.nodes);
+
+                let if_any_left_node = func.nodes.define(
+                    cx,
+                    NodeDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: NodeKind::Select(SelectionKind::BoolCond),
+                        inputs: [Value::Var(any_left)].into_iter().collect(),
+                        child_regions: if_any_left_child_regions.into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                loop_body_def.children.insert_last(if_any_left_node, func.nodes);
+
+                let if_any_left_then_region_def = &mut func.regions[if_any_left_child_regions[0]];
+
+                let [dst_elem_ptr, src_elem_ptr] = [dst_ptr, src_ptr].map(|ptr| {
+                    let inst = func.nodes.define(
+                        cx,
+                        DataInstDef {
+                            // FIXME(eddyb) filter attributes into debuginfo and
+                            // semantic, and understand the semantic ones.
+                            attrs,
+                            kind: QPtrOp::DynOffset { stride, index_bounds: None }.into(),
+                            inputs: [ptr, Value::Var(index)].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    let output_var = func.vars.define(
+                        cx,
+                        VarDecl {
+                            attrs: Default::default(),
+                            ty: self.lowerer.qptr_type(),
+                            def_parent: Either::Right(inst),
+                            def_idx: 0,
+                        },
+                    );
+                    func.nodes[inst].outputs.push(output_var);
+                    if_any_left_then_region_def.children.insert_last(inst, func.nodes);
+                    Value::Var(output_var)
+                });
+
+                let copy_inst = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: MemOp::Copy { size: stride }.into(),
+                        inputs: [dst_elem_ptr, src_elem_ptr].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                if_any_left_then_region_def.children.insert_last(copy_inst, func.nodes);
+
+                return Ok(Transformed::Changed(NodeDef {
+                    attrs,
+                    kind: NodeKind::Loop { repeat_condition: Value::Var(any_left) },
+                    inputs: loop_initial_inputs.into_iter().collect(),
+                    child_regions: [loop_body].into_iter().collect(),
+                    outputs: loop_output_vars.into_iter().collect(),
+                }));
+            }
+
+            let Value::Const(size) = size else { unreachable!() };
+            let size = size.as_scalar(cx).and_then(|size| size.int_as_u32()).ok_or_else(|| {
+                LowerError(Diag::bug([
+                    "`OpCopyMemorySized` with constant, but non-`u32` size: ".into(),
+                    size.into(),
+                ]))
+            })?;
+
+            // FIXME(eddyb) remove instruction if `size == 0`?
+            let size = NonZeroU32::new(size)
+                .ok_or_else(|| LowerError(Diag::bug(["`OpCopyMemorySized` of 0 bytes".into()])))?;
+
+            // FIXME(eddyb) do something similar for `OpCopyMemory` as well?
+            (MemOp::Copy { size }.into(), [dst_ptr, src_ptr].into_iter().collect())
         } else if spv_inst.opcode == wk.OpCopyMemory {
             if disaggregated_output_or_inputs_during_lowering {
                 return Err(LowerError(Diag::bug([format!(
@@ -1190,7 +1428,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
             // HACK(eddyb) this is speculative, so we just give up if we hit
             // some situation we don't currently support - ideally, there would
-            // be an *untyped* `qptr.copy`, but that is harder to support overall.
+            // be an *untyped* `mem.copy`, but that is harder to support overall.
             // HACK(eddyb) this is a `try {...}`-like use of a closure.
             let try_gather_leaf_offsets_and_types = || {
                 struct UnsupportedLargeArray;
@@ -1213,7 +1451,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         // smaller arrays (which could've e.g. been structs).
                         // FIXME(eddyb) larger arrays should lower to loops that
                         // copy a small number of leaves per iteration, or even
-                        // some general-purpose `qptr.copy`, to avoid generating
+                        // some general-purpose `mem.copy`, to avoid generating
                         // amounts of IR that scale with the array length, which
                         // (unlike struct fields) can be arbitrarily large.
                         spv::AggregateShape::Array { total_leaf_count, .. } => {
