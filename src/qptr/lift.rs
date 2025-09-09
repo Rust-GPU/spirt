@@ -6,10 +6,11 @@ use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
-    DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
-    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, NodeOutputDecl, Region,
-    Type, TypeDef, TypeKind, TypeOrConst, Value, VarKind, spv,
+    DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, Func, FuncDecl, FxIndexMap,
+    GlobalVar, GlobalVarDecl, Module, Node, NodeKind, NodeOutputDecl, Region, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, VarKind, spv,
 };
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::mem;
@@ -69,7 +70,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 parent_region: None,
 
                 deferred_ptr_noops: Default::default(),
-                data_inst_use_counts: Default::default(),
+                var_use_counts: Default::default(),
 
                 func_has_mem_analysis_bug_diags: false,
             }
@@ -396,11 +397,11 @@ struct LiftToSpvPtrInstsInFunc<'a> {
     /// `OpTypeRuntimeArray`s (which cannot be nested in non-`Block` structs).
     ///
     /// The `QPtrOp` itself is only removed after the entire function is lifted,
-    /// (using `data_inst_use_counts` to determine whether they're truly unused).
+    /// (using `var_use_counts` to determine whether they're truly unused).
     deferred_ptr_noops: FxIndexMap<DataInst, DeferredPtrNoop>,
 
-    // FIXME(eddyb) consider removing this and just do a full second traversal.
-    data_inst_use_counts: EntityOrientedDenseMap<DataInst, NonZeroU32>,
+    // TODO(eddyb) switch this back to `EntityOrientedDenseMap` (removing `Option`).
+    var_use_counts: FxHashMap<VarKind, Option<NonZeroU32>>,
 
     // HACK(eddyb) this is used to avoid noise when `mem::analyze` failed.
     func_has_mem_analysis_bug_diags: bool,
@@ -1020,7 +1021,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
     /// Apply rewrites implied by `deferred_ptr_noops` to `values`.
     ///
-    /// This **does not** update `data_inst_use_counts` - in order to do that,
+    /// This **does not** update `var_use_counts` - in order to do that,
     /// you must call `self.remove_value_uses(values)` beforehand, and then also
     /// call `self.after_value_uses(values)` afterwards.
     fn resolve_deferred_ptr_noop_uses(&self, values: &mut [Value]) {
@@ -1042,8 +1043,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
     fn add_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::Var(VarKind::NodeOutput { node: inst, .. }) = v {
-                let count = self.data_inst_use_counts.entry(inst);
+            if let Value::Var(v) = v {
+                let count = self.var_use_counts.entry(v).or_default();
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
                 );
@@ -1052,8 +1053,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     }
     fn remove_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::Var(VarKind::NodeOutput { node: inst, .. }) = v {
-                let count = self.data_inst_use_counts.entry(inst);
+            if let Value::Var(v) = v {
+                let count = self.var_use_counts.entry(v).or_default();
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }
         }
@@ -1151,7 +1152,18 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             // NOTE(eddyb) reverse order is important, as each removal can reduce
             // use counts of an earlier definition, allowing further removal.
             for (inst, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
-                if self.data_inst_use_counts.get(inst).is_none() {
+                let is_used = func_def_body
+                    .at(inst)
+                    .def()
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| VarKind::NodeOutput {
+                        node: inst,
+                        output_idx: i.try_into().unwrap(),
+                    })
+                    .any(|v| self.var_use_counts.get(&v).is_some_and(|count| count.is_some()));
+                if !is_used {
                     // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                     // due to the need to borrow `regions` and `nodes`
                     // at the same time - perhaps some kind of `FuncAtMut` position
