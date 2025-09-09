@@ -14,6 +14,7 @@ use std::ops::Range;
 // (i.e. using inner doc comments).
 pub mod lift;
 pub mod lower;
+pub mod simplify;
 
 /// `QPtr`-specific attributes ([`Attr::QPtr`]).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

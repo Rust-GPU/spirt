@@ -93,6 +93,12 @@ fn main() -> std::io::Result<()> {
             after_pass("qptr::lower_from_spv_ptrs", &module)?;
 
             eprint_duration(|| {
+                spirt::passes::qptr::partition_and_propagate(&mut module, layout_config)
+            });
+            eprintln!("qptr::partition_and_propagate");
+            after_pass("qptr::partition_and_propagate", &module)?;
+
+            eprint_duration(|| {
                 spirt::passes::qptr::analyze_mem_accesses(&mut module, layout_config)
             });
             eprintln!("mem::analyze_accesses");
