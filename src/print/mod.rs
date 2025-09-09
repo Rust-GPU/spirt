@@ -20,8 +20,9 @@
 use itertools::Itertools as _;
 
 use crate::func_at::FuncAt;
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::print::multiversion::Versions;
-use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
@@ -2957,6 +2958,22 @@ impl Print for Attr {
                 );
             }
 
+            Attr::Mem(attr) => {
+                let (name, params_inputs) = match attr {
+                    MemAttr::Accesses(accesses) => {
+                        ("accesses", pretty::join_comma_sep("(", [accesses.0.print(printer)], ")"))
+                    }
+                };
+                pretty::Fragment::new([
+                    printer
+                        .demote_style_for_namespace_prefix(printer.attr_style())
+                        .apply("mem.")
+                        .into(),
+                    printer.attr_style().apply(name).into(),
+                    params_inputs,
+                ])
+            }
+
             Attr::QPtr(attr) => {
                 let (name, params_inputs) = match attr {
                     QPtrAttr::ToSpvPtrInput { input_idx, pointee } => (
@@ -2985,10 +3002,6 @@ impl Print for Attr {
                             ")",
                         ),
                     ),
-
-                    QPtrAttr::Usage(usage) => {
-                        ("usage", pretty::join_comma_sep("(", [usage.0.print(printer)], ")"))
-                    }
                 };
                 pretty::Fragment::new([
                     printer
@@ -3036,54 +3049,52 @@ impl Print for Vec<DiagMsgPart> {
             DiagMsgPart::Attrs(attrs) => attrs.print(printer),
             DiagMsgPart::Type(ty) => ty.print(printer),
             DiagMsgPart::Const(ct) => ct.print(printer),
-            DiagMsgPart::QPtrUsage(usage) => usage.print(printer),
+            DiagMsgPart::MemAccesses(accesses) => accesses.print(printer),
         }))
     }
 }
 
-impl Print for QPtrUsage {
+impl Print for MemAccesses {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         match self {
-            QPtrUsage::Handles(qptr::shapes::Handle::Opaque(ty)) => ty.print(printer),
-            QPtrUsage::Handles(qptr::shapes::Handle::Buffer(_, data_usage)) => {
+            MemAccesses::Handles(crate::mem::shapes::Handle::Opaque(ty)) => ty.print(printer),
+            MemAccesses::Handles(crate::mem::shapes::Handle::Buffer(_, data_happ)) => {
                 pretty::Fragment::new([
                     printer.declarative_keyword_style().apply("buffer_data").into(),
-                    pretty::join_comma_sep("(", [data_usage.print(printer)], ")"),
+                    pretty::join_comma_sep("(", [data_happ.print(printer)], ")"),
                 ])
             }
-            QPtrUsage::Memory(usage) => usage.print(printer),
+            MemAccesses::Data(happ) => happ.print(printer),
         }
     }
 }
 
-impl Print for QPtrMemUsage {
+impl Print for DataHapp {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         // FIXME(eddyb) should this be a helper on `Printer`?
         let num_lit = |x: u32| printer.numeric_literal_style().apply(format!("{x}")).into();
 
         match &self.kind {
-            QPtrMemUsageKind::Unused => "_".into(),
+            DataHappKind::Dead => "_".into(),
             // FIXME(eddyb) should the distinction be noted?
-            &QPtrMemUsageKind::StrictlyTyped(ty) | &QPtrMemUsageKind::DirectAccess(ty) => {
-                ty.print(printer)
-            }
-            QPtrMemUsageKind::OffsetBase(entries) => pretty::join_comma_sep(
+            &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => ty.print(printer),
+            DataHappKind::Disjoint(entries) => pretty::join_comma_sep(
                 "{",
                 entries
                     .iter()
-                    .map(|(&offset, sub_usage)| {
+                    .map(|(&offset, sub_happ)| {
                         pretty::Fragment::new([
                             num_lit(offset),
                             "..".into(),
-                            sub_usage
+                            sub_happ
                                 .max_size
                                 .and_then(|max_size| offset.checked_add(max_size))
                                 .map(num_lit)
                                 .unwrap_or_default(),
                             " => ".into(),
-                            sub_usage.print(printer),
+                            sub_happ.print(printer),
                         ])
                     })
                     .map(|entry| {
@@ -3091,7 +3102,7 @@ impl Print for QPtrMemUsage {
                     }),
                 "}",
             ),
-            QPtrMemUsageKind::DynOffsetBase { element, stride } => pretty::Fragment::new([
+            DataHappKind::Repeated { element, stride } => pretty::Fragment::new([
                 "(".into(),
                 num_lit(0),
                 "..".into(),
@@ -3384,51 +3395,54 @@ impl Print for GlobalVarDecl {
         // ideally the `GlobalVarDecl` would hold that type itself.
         let type_ascription_suffix = match &printer.cx[*type_of_ptr_to].kind {
             TypeKind::QPtr if shape.is_some() => match shape.unwrap() {
-                qptr::shapes::GlobalVarShape::Handles { handle, fixed_count } => {
+                crate::mem::shapes::GlobalVarShape::Handles { handle, fixed_count } => {
                     let handle = match handle {
-                        qptr::shapes::Handle::Opaque(ty) => ty.print(printer),
-                        qptr::shapes::Handle::Buffer(addr_space, buf) => pretty::Fragment::new([
-                            printer.declarative_keyword_style().apply("buffer").into(),
-                            pretty::join_comma_sep(
-                                "(",
-                                [
-                                    addr_space.print(printer),
-                                    pretty::Fragment::new([
-                                        printer.pretty_named_argument_prefix("size"),
-                                        pretty::Fragment::new(
-                                            Some(buf.fixed_base.size)
-                                                .filter(|&base_size| {
-                                                    base_size > 0 || buf.dyn_unit_stride.is_none()
-                                                })
-                                                .map(|base_size| {
-                                                    printer
-                                                        .numeric_literal_style()
-                                                        .apply(base_size.to_string())
-                                                        .into()
-                                                })
-                                                .into_iter()
-                                                .chain(buf.dyn_unit_stride.map(|stride| {
-                                                    pretty::Fragment::new([
-                                                        "N × ".into(),
+                        crate::mem::shapes::Handle::Opaque(ty) => ty.print(printer),
+                        crate::mem::shapes::Handle::Buffer(addr_space, buf) => {
+                            pretty::Fragment::new([
+                                printer.declarative_keyword_style().apply("buffer").into(),
+                                pretty::join_comma_sep(
+                                    "(",
+                                    [
+                                        addr_space.print(printer),
+                                        pretty::Fragment::new([
+                                            printer.pretty_named_argument_prefix("size"),
+                                            pretty::Fragment::new(
+                                                Some(buf.fixed_base.size)
+                                                    .filter(|&base_size| {
+                                                        base_size > 0
+                                                            || buf.dyn_unit_stride.is_none()
+                                                    })
+                                                    .map(|base_size| {
                                                         printer
                                                             .numeric_literal_style()
-                                                            .apply(stride.to_string()),
-                                                    ])
-                                                }))
-                                                .intersperse_with(|| " + ".into()),
-                                        ),
-                                    ]),
-                                    pretty::Fragment::new([
-                                        printer.pretty_named_argument_prefix("align"),
-                                        printer
-                                            .numeric_literal_style()
-                                            .apply(buf.fixed_base.align.to_string())
-                                            .into(),
-                                    ]),
-                                ],
-                                ")",
-                            ),
-                        ]),
+                                                            .apply(base_size.to_string())
+                                                            .into()
+                                                    })
+                                                    .into_iter()
+                                                    .chain(buf.dyn_unit_stride.map(|stride| {
+                                                        pretty::Fragment::new([
+                                                            "N × ".into(),
+                                                            printer
+                                                                .numeric_literal_style()
+                                                                .apply(stride.to_string()),
+                                                        ])
+                                                    }))
+                                                    .intersperse_with(|| " + ".into()),
+                                            ),
+                                        ]),
+                                        pretty::Fragment::new([
+                                            printer.pretty_named_argument_prefix("align"),
+                                            printer
+                                                .numeric_literal_style()
+                                                .apply(buf.fixed_base.align.to_string())
+                                                .into(),
+                                        ]),
+                                    ],
+                                    ")",
+                                ),
+                            ])
+                        }
                     };
 
                     let handles = if fixed_count.map_or(0, |c| c.get()) == 1 {
@@ -3450,31 +3464,33 @@ impl Print for GlobalVarDecl {
                     };
                     pretty::join_space(":", [handles])
                 }
-                qptr::shapes::GlobalVarShape::UntypedData(mem_layout) => pretty::Fragment::new([
-                    " ".into(),
-                    printer.declarative_keyword_style().apply("layout").into(),
-                    pretty::join_comma_sep(
-                        "(",
-                        [
-                            pretty::Fragment::new([
-                                printer.pretty_named_argument_prefix("size"),
-                                printer
-                                    .numeric_literal_style()
-                                    .apply(mem_layout.size.to_string())
-                                    .into(),
-                            ]),
-                            pretty::Fragment::new([
-                                printer.pretty_named_argument_prefix("align"),
-                                printer
-                                    .numeric_literal_style()
-                                    .apply(mem_layout.align.to_string())
-                                    .into(),
-                            ]),
-                        ],
-                        ")",
-                    ),
-                ]),
-                qptr::shapes::GlobalVarShape::TypedInterface(ty) => {
+                crate::mem::shapes::GlobalVarShape::UntypedData(mem_layout) => {
+                    pretty::Fragment::new([
+                        " ".into(),
+                        printer.declarative_keyword_style().apply("layout").into(),
+                        pretty::join_comma_sep(
+                            "(",
+                            [
+                                pretty::Fragment::new([
+                                    printer.pretty_named_argument_prefix("size"),
+                                    printer
+                                        .numeric_literal_style()
+                                        .apply(mem_layout.size.to_string())
+                                        .into(),
+                                ]),
+                                pretty::Fragment::new([
+                                    printer.pretty_named_argument_prefix("align"),
+                                    printer
+                                        .numeric_literal_style()
+                                        .apply(mem_layout.align.to_string())
+                                        .into(),
+                                ]),
+                            ],
+                            ")",
+                        ),
+                    ])
+                }
+                crate::mem::shapes::GlobalVarShape::TypedInterface(ty) => {
                     printer.pretty_type_ascription_suffix(ty)
                 }
             },
@@ -3903,15 +3919,10 @@ impl Print for FuncAt<'_, DataInst> {
                 pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
             ]),
 
-            DataInstKind::QPtr(op) => {
-                let (qptr_input, extra_inputs) = match op {
-                    // HACK(eddyb) `FuncLocalVar` should probably not even be in `QPtrOp`.
-                    QPtrOp::FuncLocalVar(_) => (None, &inputs[..]),
-                    _ => (Some(inputs[0]), &inputs[1..]),
-                };
-                let (name, extra_inputs): (_, SmallVec<[_; 1]>) = match op {
-                    QPtrOp::FuncLocalVar(mem_layout) => {
-                        assert!(extra_inputs.len() <= 1);
+            DataInstKind::Mem(op) => {
+                let (name, inputs): (_, SmallVec<[_; 1]>) = match op {
+                    MemOp::FuncLocalVar(mem_layout) => {
+                        assert!(inputs.len() <= 1);
                         (
                             "func_local_var",
                             [
@@ -3931,7 +3942,7 @@ impl Print for FuncAt<'_, DataInst> {
                                 ]),
                             ]
                             .into_iter()
-                            .chain(extra_inputs.first().map(|&init| {
+                            .chain(inputs.first().map(|&init| {
                                 pretty::Fragment::new([
                                     printer.pretty_named_argument_prefix("initializer"),
                                     init.print(printer),
@@ -3941,6 +3952,35 @@ impl Print for FuncAt<'_, DataInst> {
                         )
                     }
 
+                    MemOp::Load => {
+                        assert_eq!(inputs.len(), 1);
+                        ("load", [inputs[0].print(printer)].into_iter().collect())
+                    }
+                    MemOp::Store => {
+                        assert_eq!(inputs.len(), 2);
+                        (
+                            "store",
+                            [inputs[0].print(printer), inputs[1].print(printer)]
+                                .into_iter()
+                                .collect(),
+                        )
+                    }
+                };
+
+                pretty::Fragment::new([
+                    printer
+                        .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                        .apply("mem.")
+                        .into(),
+                    printer.declarative_keyword_style().apply(name).into(),
+                    pretty::join_comma_sep("(", inputs, ")"),
+                ])
+            }
+
+            DataInstKind::QPtr(op) => {
+                let qptr_input = inputs[0].print(printer);
+                let extra_inputs = &inputs[1..];
+                let (name, extra_inputs): (_, SmallVec<[_; 1]>) = match op {
                     QPtrOp::HandleArrayIndex => {
                         assert_eq!(extra_inputs.len(), 1);
                         (
@@ -4002,15 +4042,6 @@ impl Print for FuncAt<'_, DataInst> {
                             .collect(),
                         )
                     }
-
-                    QPtrOp::Load => {
-                        assert_eq!(extra_inputs.len(), 0);
-                        ("load", [].into_iter().collect())
-                    }
-                    QPtrOp::Store => {
-                        assert_eq!(extra_inputs.len(), 1);
-                        ("store", [extra_inputs[0].print(printer)].into_iter().collect())
-                    }
                 };
 
                 pretty::Fragment::new([
@@ -4019,11 +4050,7 @@ impl Print for FuncAt<'_, DataInst> {
                         .apply("qptr.")
                         .into(),
                     printer.declarative_keyword_style().apply(name).into(),
-                    pretty::join_comma_sep(
-                        "(",
-                        qptr_input.map(|v| v.print(printer)).into_iter().chain(extra_inputs),
-                        ")",
-                    ),
+                    pretty::join_comma_sep("(", [qptr_input].into_iter().chain(extra_inputs), ")"),
                 ])
             }
 
