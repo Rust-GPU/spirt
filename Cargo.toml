@@ -24,6 +24,7 @@ exclude = [".github", "release.toml", "tests/data"]
 
 [dependencies]
 arrayvec = "0.7.1"
+bitflags = "2.9.0"
 bytemuck = "1.12.3"
 derive_more = "0.99.17"
 elsa = { version = "1.6.0", features = ["indexmap"] }
