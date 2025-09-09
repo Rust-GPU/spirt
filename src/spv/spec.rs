@@ -134,6 +134,9 @@ def_well_known! {
         OpSpecConstantComposite,
         OpConstantFunctionPointerINTEL,
 
+        // FIXME(eddyb) this is only exposed here for `qptr`.
+        OpSpecConstantOp,
+
         OpVariable,
 
         OpFunction,

@@ -29,9 +29,10 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DbgSrcLoc, DeclDef, Diag, DiagLevel, DiagMsgPart,
     EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
-    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region,
-    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv, vector,
+    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit, Import,
+    InternedStr, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq,
+    Region, RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv,
+    vector,
 };
 use arrayvec::ArrayVec;
 use itertools::Either;
@@ -1522,13 +1523,17 @@ impl Printer<'_> {
     fn error_style(&self) -> pretty::Styles {
         pretty::Styles::color(pretty::palettes::simple::MAGENTA)
     }
+    // HACK(eddyb) only used in hex dumps of `ConstData` initializer currently.
+    fn non_deemphasized_comment_style(&self) -> pretty::Styles {
+        pretty::Styles::color(pretty::palettes::simple::DARK_GRAY)
+    }
     fn comment_style(&self) -> pretty::Styles {
         pretty::Styles {
             color_opacity: Some(0.3),
             size: Some(-4),
             // FIXME(eddyb) this looks wrong for some reason?
             // subscript: true,
-            ..pretty::Styles::color(pretty::palettes::simple::DARK_GRAY)
+            ..self.non_deemphasized_comment_style()
         }
     }
     fn named_argument_label_style(&self) -> pretty::Styles {
@@ -3393,7 +3398,7 @@ impl Print for GlobalVarDecl {
             DeclDef::Present(GlobalVarDefBody { initializer }) => {
                 // FIXME(eddyb) `global_varX in AS: T = Y` feels a bit wonky for
                 // the initializer, but it's cleaner than obvious alternatives.
-                initializer.map(|initializer| initializer.print(printer))
+                initializer.as_ref().map(|initializer| initializer.print(printer))
             }
         };
         let body = maybe_rhs.map(|rhs| pretty::Fragment::new(["= ".into(), rhs]));
@@ -3412,6 +3417,158 @@ impl Print for AddrSpace {
             AddrSpace::SpvStorageClass(sc) => {
                 let wk = &spv::spec::Spec::get().well_known;
                 printer.pretty_spv_imm(wk.StorageClass, sc)
+            }
+        }
+    }
+}
+
+impl Print for GlobalVarInit {
+    type Output = pretty::Fragment;
+    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        match self {
+            GlobalVarInit::Direct(ct) => ct.print(printer),
+            // FIXME(eddyb) should this be recursive?
+            GlobalVarInit::SpvAggregate { ty, leaves } => pretty::Fragment::new([
+                pretty::join_comma_sep("(", leaves.iter().map(|v| v.print(printer)), ")"),
+                printer.pretty_type_ascription_suffix(*ty),
+            ]),
+            GlobalVarInit::Data(data) => {
+                let mut next_offset = 0;
+                let mut parts_with_offsets = data
+                    .read(0..data.size())
+                    .map(|part| {
+                        let offset = next_offset;
+                        next_offset += part.size().get();
+                        (offset, part)
+                    })
+                    .filter_map(|(offset, part)| {
+                        use crate::mem::const_data::Part;
+                        let part = match part {
+                            // Hiding the `undef` parts as it's arguably the default.
+                            Part::Uninit { .. } => return None,
+
+                            // FIXME(eddyb) come up with a better printing strategy?
+                            // (integrate at least `Uninit`, maybe `Symbolic` like MIR?)
+                            Part::Bytes(bytes) => {
+                                const CHUNK_SIZE: u32 = 16;
+                                let first_chunk = {
+                                    let start_in_chunk = offset % CHUNK_SIZE;
+                                    (start_in_chunk > 0).then(|| {
+                                        let len_in_chunk = (CHUNK_SIZE - start_in_chunk) as usize;
+                                        &bytes[..len_in_chunk.min(bytes.len())]
+                                    })
+                                };
+                                let after_first_chunk =
+                                    &bytes[first_chunk.map_or(0, |chunk| chunk.len())..];
+
+                                let is_single_line = offset / CHUNK_SIZE
+                                    == (offset + part.size().get() - 1) / CHUNK_SIZE;
+                                let chunks =
+                                    first_chunk
+                                        .map(|chunk| (CHUNK_SIZE - chunk.len() as u32, chunk, 0))
+                                        .into_iter()
+                                        .chain(after_first_chunk.chunks(16).map(|chunk| {
+                                            (0, chunk, CHUNK_SIZE - chunk.len() as u32)
+                                        }));
+
+                                let lines = chunks.map(|(pre_gap, chunk, post_gap)| {
+                                    let bytes = ((0..pre_gap).map(|_| None))
+                                        .chain(chunk.iter().copied().map(Some))
+                                        .chain((0..post_gap).map(|_| None));
+
+                                    // FIXME(eddyb) consider address line prefixes,
+                                    // using inline comments (e.g. `/* 01f0 */`).
+                                    let mut hex = String::new();
+                                    let mut ascii =
+                                        if is_single_line { " /* " } else { " // " }.to_string();
+                                    for byte_or_gap in bytes.clone() {
+                                        if byte_or_gap.is_none() && is_single_line {
+                                            continue;
+                                        }
+                                        if !hex.is_empty() {
+                                            hex += " ";
+                                        }
+                                        match byte_or_gap {
+                                            Some(byte) => {
+                                                write!(hex, "{byte:02x}").unwrap();
+                                                ascii.push(
+                                                    (byte < 128)
+                                                        .then_some(byte as char)
+                                                        .filter(|c| c.is_ascii_graphic())
+                                                        .unwrap_or('.'),
+                                                );
+                                            }
+                                            None => {
+                                                hex += "  ";
+                                                ascii += " ";
+                                            }
+                                        }
+                                    }
+                                    if is_single_line {
+                                        ascii += " */";
+                                    }
+
+                                    pretty::Fragment::new(
+                                        (!is_single_line)
+                                            .then_some(pretty::Node::ForceLineSeparation)
+                                            .into_iter()
+                                            .chain([
+                                                printer.numeric_literal_style().apply(hex),
+                                                printer
+                                                    .non_deemphasized_comment_style()
+                                                    .apply(ascii),
+                                            ]),
+                                    )
+                                });
+
+                                pretty::Fragment::new([
+                                    printer.declarative_keyword_style().apply("data"),
+                                    "(".into(),
+                                    pretty::Node::InlineOrIndentedBlock(vec![
+                                        pretty::Fragment::new(lines),
+                                    ]),
+                                    ")".into(),
+                                ])
+                            }
+
+                            Part::Symbolic { size, maybe_partial_slice, value } => {
+                                assert_eq!(maybe_partial_slice, 0..size.get());
+
+                                value.print(printer)
+                            }
+                        };
+                        Some((offset, part))
+                    });
+
+                match (parts_with_offsets.next(), parts_with_offsets.next()) {
+                    (Some((0, whole_part)), None) => whole_part,
+                    (first, second) => {
+                        let parts_with_offsets =
+                            [first, second].into_iter().flatten().chain(parts_with_offsets);
+
+                        pretty::join_comma_sep(
+                            "{",
+                            parts_with_offsets
+                                .map(|(offset, part)| {
+                                    pretty::Fragment::new([
+                                        printer
+                                            .numeric_literal_style()
+                                            .apply(format!("{offset}"))
+                                            .into(),
+                                        " => ".into(),
+                                        part,
+                                    ])
+                                })
+                                .map(|entry| {
+                                    pretty::Fragment::new([
+                                        pretty::Node::ForceLineSeparation.into(),
+                                        entry,
+                                    ])
+                                }),
+                            "}",
+                        )
+                    }
+                }
             }
         }
     }

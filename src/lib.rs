@@ -786,10 +786,31 @@ pub enum AddrSpace {
 }
 
 /// The body of a [`GlobalVar`] definition.
+//
+// FIXME(eddyb) make "interface variables" go through imports, not definitions.
 #[derive(Clone)]
 pub struct GlobalVarDefBody {
-    /// If `Some`, the global variable will start out with the specified value.
-    pub initializer: Option<Const>,
+    pub initializer: Option<GlobalVarInit>,
+}
+
+/// Initial contents for a [`GlobalVar`] definition.
+//
+// FIXME(eddyb) add special cases for for undef/zeroed/etc.
+// FIXME(eddyb) consider renaming this to `ConstData` or `ConstBlob`?
+#[derive(Clone)]
+pub enum GlobalVarInit {
+    /// Single valid (constant) value (see [`Value`] docs for valid types).
+    //
+    // FIXME(eddyb) does this need to be its own case at all?
+    Direct(Const),
+
+    /// SPIR-V "aggregate" (`OpTypeStruct`/`OpTypeArray`), represented as its
+    /// non-aggregate leaves (i.e. it's disaggregated, as per [`Value`] docs).
+    SpvAggregate { ty: Type, leaves: SmallVec<[Const; 4]> },
+
+    /// Explicitly laid out constant data, using [`mem::const_data::ConstData`]
+    /// to efficiently mix concrete bytes with symbolic ([`Const`]) values.
+    Data(mem::const_data::ConstData<Const>),
 }
 
 /// Entity handle for a [`FuncDecl`](crate::FuncDecl) (a function).

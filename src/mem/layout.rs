@@ -17,6 +17,8 @@ use std::rc::Rc;
 //
 // FIXME(eddyb) use proper newtypes (and log2 for align!).
 pub struct LayoutConfig {
+    pub is_big_endian: bool,
+
     pub ignore_legacy_align: bool,
     pub min_aggregate_legacy_align: u32,
 
@@ -46,19 +48,21 @@ pub struct LayoutConfig {
 }
 
 impl LayoutConfig {
-    pub const VULKAN_SCALAR_LAYOUT: Self = Self {
+    pub const VULKAN_SCALAR_LAYOUT_LE: Self = Self {
+        is_big_endian: false,
+
         ignore_legacy_align: true,
         min_aggregate_legacy_align: 1,
 
         abstract_bool_size_align: (1, 1),
         logical_ptr_size_align: (1, 1),
     };
-    pub const VULKAN_STANDARD_LAYOUT: Self =
-        Self { ignore_legacy_align: false, ..Self::VULKAN_SCALAR_LAYOUT };
+    pub const VULKAN_STANDARD_LAYOUT_LE: Self =
+        Self { ignore_legacy_align: false, ..Self::VULKAN_SCALAR_LAYOUT_LE };
     // FIXME(eddyb) is this even useful? (all the storage classes that have any
     // kind of alignment requirements, require explicit offsets)
-    pub const VULKAN_EXTENDED_ALIGN_UBO_LAYOUT: Self =
-        Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT };
+    pub const VULKAN_EXTENDED_ALIGN_UBO_LAYOUT_LE: Self =
+        Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT_LE };
 }
 
 pub(crate) struct LayoutError(pub(crate) Diag);
@@ -284,7 +288,7 @@ pub(crate) struct LayoutCache<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
 
-    config: &'a LayoutConfig,
+    pub(crate) config: &'a LayoutConfig,
 
     cache: RefCell<FxIndexMap<Type, TypeLayout>>,
 }
