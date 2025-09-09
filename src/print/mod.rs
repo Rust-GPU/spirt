@@ -1803,7 +1803,7 @@ impl Printer<'_> {
     fn sanitize_spv_operand_name<'b>(&self, name: &'b str) -> Option<Cow<'b, str>> {
         Some(name).and_then(|name| {
             // HACK(eddyb) some operand names are useless.
-            if name == "Type"
+            if matches!(name, "Opcode" | "Operand" | "Type")
                 || name
                     .strip_prefix("Operand ")
                     .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()))
