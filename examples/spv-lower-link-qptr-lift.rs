@@ -83,6 +83,7 @@ fn main() -> std::io::Result<()> {
             let layout_config = &spirt::mem::LayoutConfig {
                 abstract_bool_size_align: (1, 1),
                 logical_ptr_size_align: (4, 4),
+                logical_ptr_null_is_zero: true,
                 ..spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE
             };
 
@@ -97,6 +98,15 @@ fn main() -> std::io::Result<()> {
             });
             eprintln!("qptr::partition_and_propagate");
             after_pass("qptr::partition_and_propagate", &module)?;
+
+            let all_uses = spirt::visit::AllUses::from_module(&module);
+            eprint_duration(|| {
+                // FIXME(eddyb) add `spirt::passes::qptr` wrappers.
+                spirt::qptr::legalize::LegalizePtrs::new(cx.clone(), layout_config)
+                    .legalize_module(&mut module, &all_uses);
+            });
+            eprintln!("qptr::legalize");
+            after_pass("qptr::legalize", &module)?;
 
             eprint_duration(|| {
                 spirt::passes::qptr::analyze_mem_accesses(&mut module, layout_config)

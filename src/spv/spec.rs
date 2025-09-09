@@ -166,9 +166,11 @@ def_well_known! {
         OpInBoundsAccessChain,
         OpPtrAccessChain,
         OpInBoundsPtrAccessChain,
-        OpBitcast,
 
         OpConvertPtrToU,
+        OpConvertUToPtr,
+        OpBitcast,
+
         OpPtrEqual,
         OpPtrNotEqual,
 
@@ -196,17 +198,33 @@ def_well_known! {
         LiteralSpecConstantOpInteger,
     ],
     // FIXME(eddyb) find a way to namespace these to avoid conflicts.
+    capability: u32 = [
+        WorkgroupMemoryExplicitLayoutKHR,
+    ],
     addressing_model: u32 = [
         Logical,
     ],
+    memory_model: u32 = [
+        Simple,
+        GLSL450,
+        OpenCL,
+        Vulkan,
+    ],
     storage_class: u32 = [
         Function,
+        Private,
+        Workgroup,
 
         UniformConstant,
         Input,
         Output,
 
+        StorageBuffer,
+        Uniform,
+
         Image,
+
+        PhysicalStorageBuffer,
 
         IncomingRayPayloadKHR,
         IncomingCallableDataKHR,
@@ -224,6 +242,9 @@ def_well_known! {
         Block,
         RowMajor,
         Offset,
+
+        Restrict,
+        Aliased,
     ],
     linkage_type: u32 = [
         Import,
@@ -1023,11 +1044,19 @@ impl Spec {
             storage: instructions,
         };
 
+        let capabilities = match &operand_kinds[operand_kinds.lookup("Capability").unwrap()] {
+            OperandKindDef::ValueEnum { variants } => variants,
+            _ => unreachable!(),
+        };
         let addressing_models =
             match &operand_kinds[operand_kinds.lookup("AddressingModel").unwrap()] {
                 OperandKindDef::ValueEnum { variants } => variants,
                 _ => unreachable!(),
             };
+        let memory_models = match &operand_kinds[operand_kinds.lookup("MemoryModel").unwrap()] {
+            OperandKindDef::ValueEnum { variants } => variants,
+            _ => unreachable!(),
+        };
         let storage_classes = match &operand_kinds[operand_kinds.lookup("StorageClass").unwrap()] {
             OperandKindDef::ValueEnum { variants } => variants,
             _ => unreachable!(),
@@ -1046,7 +1075,9 @@ impl Spec {
         let well_known = WellKnown::lookup_with(PerWellKnownGroup {
             opcode: |name| instructions.lookup(name).unwrap(),
             operand_kind: |name| operand_kinds.lookup(name).unwrap(),
+            capability: |name| capabilities.lookup(name).unwrap().into(),
             addressing_model: |name| addressing_models.lookup(name).unwrap().into(),
+            memory_model: |name| memory_models.lookup(name).unwrap().into(),
             storage_class: |name| storage_classes.lookup(name).unwrap().into(),
             decoration: |name| decorations.lookup(name).unwrap().into(),
             linkage_type: |name| linkage_types.lookup(name).unwrap().into(),
