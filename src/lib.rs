@@ -468,6 +468,12 @@ impl Diag {
     pub fn warn(message: impl IntoIterator<Item = DiagMsgPart>) -> Self {
         Self::new(DiagLevel::Warning, message)
     }
+
+    // HACK(eddyb) this only really exists to allow filtering `Diag::bug`s by
+    // the module that produced them, even if in a relatively cursed way.
+    pub(crate) fn bug_src_path_prefix() -> Option<&'static str> {
+        std::panic::Location::caller().file().strip_suffix("lib.rs")
+    }
 }
 
 /// The "severity" level of a [`Diag`]nostic.

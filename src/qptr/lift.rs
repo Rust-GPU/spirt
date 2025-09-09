@@ -282,7 +282,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 deferred_ptr_noops: Default::default(),
                 var_use_counts: Default::default(),
 
-                func_has_mem_analysis_bug_diags: false,
+                func_has_mem_or_qptr_bug_diags: false,
             }
             .in_place_transform_func_decl(&mut module.funcs[func]);
         }
@@ -669,8 +669,8 @@ struct LiftToSpvPtrInstsInFunc<'a> {
 
     var_use_counts: EntityOrientedDenseMap<Var, NonZeroU32>,
 
-    // HACK(eddyb) this is used to avoid noise when `mem::analyze` failed.
-    func_has_mem_analysis_bug_diags: bool,
+    // HACK(eddyb) this is used to avoid noise on top of `mem`/`qptr` diagnostics.
+    func_has_mem_or_qptr_bug_diags: bool,
 }
 
 struct DeferredPtrNoop {
@@ -1597,22 +1597,44 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                 self.add_value_uses(&data_inst_def.inputs);
             }
             Err(LiftError(e)) => {
-                let data_inst_def = func_at_node.def();
+                let node = func_at_node.position;
+                let func = func_at_node.at(());
+                let data_inst_def = &mut func.nodes[node];
 
-                // HACK(eddyb) do not add redundant errors to `mem::analyze` bugs.
-                self.func_has_mem_analysis_bug_diags = self.func_has_mem_analysis_bug_diags
-                    || self.lifter.cx[data_inst_def.attrs].attrs.iter().any(|attr| match attr {
-                        Attr::Diagnostics(diags) => diags.0.iter().any(|diag| match diag.level {
-                            DiagLevel::Bug(loc) => {
-                                loc.file().ends_with("mem/analyze.rs")
-                                    || loc.file().ends_with("mem\\analyze.rs")
-                            }
-                            _ => false,
-                        }),
-                        _ => false,
-                    });
+                // HACK(eddyb) do not add redundant errors to `mem`/`qptr` bugs.
+                self.func_has_mem_or_qptr_bug_diags = self.func_has_mem_or_qptr_bug_diags
+                    || Diag::bug_src_path_prefix()
+                        .and_then(|src_path_prefix| {
+                            let qptr_lift_suffix = std::panic::Location::caller()
+                                .file()
+                                .strip_prefix(src_path_prefix)?;
+                            (qptr_lift_suffix.starts_with("qptr")
+                                && qptr_lift_suffix.ends_with("lift.rs"))
+                            .then_some((src_path_prefix, qptr_lift_suffix))
+                        })
+                        .is_some_and(|(src_path_prefix, qptr_lift_suffix)| {
+                            let all_attrs = [data_inst_def.attrs].into_iter().chain(
+                                data_inst_def
+                                    .outputs
+                                    .iter()
+                                    .map(|&output_var| func.vars[output_var].attrs),
+                            );
+                            all_attrs.flat_map(|attrs| attrs.diags(&self.lifter.cx)).any(|diag| {
+                                match diag.level {
+                                    DiagLevel::Bug(loc) => loc
+                                        .file()
+                                        .strip_prefix(src_path_prefix)
+                                        .is_some_and(|suffix| {
+                                            (suffix.starts_with("mem")
+                                                || suffix.starts_with("qptr"))
+                                                && suffix != qptr_lift_suffix
+                                        }),
+                                    _ => false,
+                                }
+                            })
+                        });
 
-                if !self.func_has_mem_analysis_bug_diags {
+                if !self.func_has_mem_or_qptr_bug_diags {
                     data_inst_def.attrs.push_diag(&self.lifter.cx, e);
                 }
             }
