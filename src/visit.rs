@@ -471,7 +471,9 @@ impl<'a> FuncAt<'a, Node> {
         match kind {
             &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
 
-            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            NodeKind::Select(
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+            )
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
             | DataInstKind::Scalar(_)

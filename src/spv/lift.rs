@@ -1585,6 +1585,14 @@ impl LazyInst<'_, '_> {
                 ids: [merge_label_id, continue_label_id].into_iter().collect(),
             },
             Self::Terminator { parent_func, terminator } => {
+                let mut ids: SmallVec<[_; 4]> = terminator
+                    .inputs
+                    .iter()
+                    .map(|&v| value_to_id(parent_func, v))
+                    .chain(terminator.targets.iter().map(|&target| parent_func.label_ids[&target]))
+                    .collect();
+
+                // FIXME(eddyb) move some of this to `spv::canonical`.
                 let inst = match terminator.kind {
                     TerminatorKind::Unreachable => wk.OpUnreachable.into(),
                     TerminatorKind::Return => {
@@ -1594,28 +1602,30 @@ impl LazyInst<'_, '_> {
                             wk.OpReturnValue.into()
                         }
                     }
-                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst))
-                    | TerminatorKind::SelectBranch(SelectionKind::SpvInst(inst)) => inst.clone(),
+                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst)) => {
+                        inst.clone()
+                    }
 
                     TerminatorKind::Branch => wk.OpBranch.into(),
 
                     TerminatorKind::SelectBranch(SelectionKind::BoolCond) => {
                         wk.OpBranchConditional.into()
                     }
+                    TerminatorKind::SelectBranch(SelectionKind::Switch { case_consts }) => {
+                        // HACK(eddyb) move the default case from last back to first.
+                        let default_target = ids.pop().unwrap();
+                        ids.insert(1, default_target);
+
+                        spv::Inst {
+                            opcode: wk.OpSwitch,
+                            imms: case_consts
+                                .iter()
+                                .flat_map(|ct| ct.encode_as_spv_imms())
+                                .collect(),
+                        }
+                    }
                 };
-                spv::InstWithIds {
-                    without_ids: inst,
-                    result_type_id: None,
-                    result_id: None,
-                    ids: terminator
-                        .inputs
-                        .iter()
-                        .map(|&v| value_to_id(parent_func, v))
-                        .chain(
-                            terminator.targets.iter().map(|&target| parent_func.label_ids[&target]),
-                        )
-                        .collect(),
-                }
+                spv::InstWithIds { without_ids: inst, result_type_id: None, result_id: None, ids }
             }
             Self::OpFunctionEnd => spv::InstWithIds {
                 without_ids: wk.OpFunctionEnd.into(),

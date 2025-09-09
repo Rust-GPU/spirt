@@ -3712,7 +3712,7 @@ impl Print for FuncAt<'_, Node> {
                             "(",
                             self.at(Either::Left(body))
                                 .print_var_defs(printer)
-                                .zip(initial_inputs)
+                                .zip_eq(initial_inputs)
                                 .map(|(lhs, initial)| {
                                     pretty::Fragment::new([
                                         lhs,
@@ -4216,7 +4216,7 @@ impl SelectionKind {
         mut cases: impl ExactSizeIterator<Item = pretty::Fragment>,
     ) -> pretty::Fragment {
         let kw = |kw| kw_style.apply(kw).into();
-        match *self {
+        match self {
             SelectionKind::BoolCond => {
                 assert_eq!(cases.len(), 2);
                 let [then_case, else_case] = [cases.next().unwrap(), cases.next().unwrap()];
@@ -4233,27 +4233,36 @@ impl SelectionKind {
                     "}".into(),
                 ])
             }
-            SelectionKind::SpvInst(spv::Inst { opcode, ref imms }) => {
-                let header = printer.pretty_spv_inst(
-                    kw_style,
-                    opcode,
-                    imms,
-                    [Some(scrutinee.print(printer))]
-                        .into_iter()
-                        .chain((0..cases.len()).map(|_| None)),
-                );
+            SelectionKind::Switch { case_consts } => {
+                assert_eq!(cases.len(), case_consts.len() + 1);
+
+                let case_patterns = case_consts
+                    .iter()
+                    .map(|&ct| {
+                        let int_to_string = (ct.int_as_u128().map(|x| x.to_string()))
+                            .or_else(|| ct.int_as_i128().map(|x| x.to_string()));
+                        match int_to_string {
+                            Some(v) => printer.numeric_literal_style().apply(v).into(),
+                            None => {
+                                let ct: Const = printer.cx.intern(ct);
+                                ct.print(printer)
+                            }
+                        }
+                    })
+                    .chain(["_".into()]);
 
                 pretty::Fragment::new([
-                    header,
+                    kw("switch"),
+                    " ".into(),
+                    scrutinee.print(printer),
                     " {".into(),
                     pretty::Node::IndentedBlock(
-                        cases
-                            .map(|case| {
+                        case_patterns
+                            .zip_eq(cases)
+                            .map(|(case_pattern, case)| {
                                 pretty::Fragment::new([
                                     pretty::Node::ForceLineSeparation.into(),
-                                    // FIXME(eddyb) this should pull information out
-                                    // of the instruction to be more precise.
-                                    kw("case"),
+                                    case_pattern,
                                     " => {".into(),
                                     pretty::Node::IndentedBlock(vec![case]).into(),
                                     "}".into(),
