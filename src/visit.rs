@@ -5,12 +5,97 @@ use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
-    DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type,
-    TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInstKind,
+    DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
+    FuncDefBody, FuncParam, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit,
+    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region,
+    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
 };
+
+// FIXME(eddyb) should this be placed somewhere else?
+pub struct ReachableUseCollector<'a> {
+    cx: &'a Context,
+    current_module: Option<&'a Module>,
+
+    pub all_uses: AllUses,
+}
+
+// FIXME(eddyb) better names and/or grouping interned and entity separately.
+// FIXME(eddyb) some of these sets could be bitsets etc.
+#[derive(Default)]
+pub struct AllUses {
+    pub attr_sets: FxIndexSet<AttrSet>,
+    pub types: FxIndexSet<Type>,
+    pub consts: FxIndexSet<Const>,
+
+    pub global_vars: FxIndexSet<GlobalVar>,
+    pub funcs: FxIndexSet<Func>,
+}
+
+impl AllUses {
+    // FIXME(eddyb) better APIs, perhaps by merging with callgraphs?
+    // (and/or moving global vars imports to func defs, like Cranelift?)
+    pub fn from_module(module: &Module) -> Self {
+        let mut collector = ReachableUseCollector::new(module.cx_ref());
+        collector.visit_module(module);
+        collector.all_uses
+    }
+}
+
+impl<'a> ReachableUseCollector<'a> {
+    pub fn new(cx: &'a Context) -> Self {
+        ReachableUseCollector { cx, current_module: None, all_uses: AllUses::default() }
+    }
+}
+
+impl<'a> Visitor<'a> for ReachableUseCollector<'a> {
+    fn visit_attr_set_use(&mut self, attrs: AttrSet) {
+        if self.all_uses.attr_sets.insert(attrs) {
+            self.visit_attr_set_def(&self.cx[attrs]);
+        }
+    }
+    fn visit_type_use(&mut self, ty: Type) {
+        if self.all_uses.types.insert(ty) {
+            self.visit_type_def(&self.cx[ty]);
+        }
+    }
+    fn visit_const_use(&mut self, ct: Const) {
+        if self.all_uses.consts.insert(ct) {
+            self.visit_const_def(&self.cx[ct]);
+        }
+    }
+
+    fn visit_global_var_use(&mut self, gv: GlobalVar) {
+        if let Some(module) = self.current_module {
+            if self.all_uses.global_vars.insert(gv) {
+                self.visit_global_var_decl(&module.global_vars[gv]);
+            }
+        } else {
+            // FIXME(eddyb) should this be a hard error?
+        }
+    }
+    fn visit_func_use(&mut self, func: Func) {
+        if let Some(module) = self.current_module {
+            if self.all_uses.funcs.insert(func) {
+                self.visit_func_decl(&module.funcs[func]);
+            }
+        } else {
+            // FIXME(eddyb) should this be a hard error?
+        }
+    }
+
+    fn visit_module(&mut self, module: &'a Module) {
+        assert!(
+            std::ptr::eq(self.cx, &**module.cx_ref()),
+            "print: `Plan::visit_module` does not support `Module`s from a \
+             different `Context` than the one it was initially created with",
+        );
+
+        let old_module = self.current_module.replace(module);
+        module.inner_visit_with(self);
+        self.current_module = old_module;
+    }
+}
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
 // writing `impl Visitor<'a> + ?Sized` in `fn inner_visit_with` signatures.

@@ -1,5 +1,5 @@
 use crate::transform::{InnerTransform, Transformed, Transformer};
-use crate::visit::{InnerVisit, Visitor};
+use crate::visit::{self, InnerVisit, Visitor};
 use crate::{
     AttrSet, Const, Context, DeclDef, ExportKey, Exportee, Func, FxIndexSet, GlobalVar, Import,
     Module, Type,
@@ -51,6 +51,8 @@ pub fn minimize_exports(module: &mut Module, is_root: impl Fn(&ExportKey) -> boo
         .collect();
 }
 
+// FIXME(eddyb) the difference between this and `visit::ReachableUsesCollector`
+// is that this also needs to hook up `visit_import` to track `live_exports`.
 struct LiveExportCollector<'a> {
     cx: &'a Context,
     module: &'a Module,
@@ -111,22 +113,43 @@ impl Visitor<'_> for LiveExportCollector<'_> {
 //
 // FIXME(eddyb) make this operate on multiple modules.
 pub fn resolve_imports(module: &mut Module) {
-    let (resolved_global_vars, resolved_funcs) = {
-        let mut collector = ImportResolutionCollector {
-            cx: module.cx_ref(),
-            module,
+    // FIXME(eddyb) reuse this collection work in some kind of "pass manager".
+    let visit::AllUses { global_vars, funcs, .. } = visit::AllUses::from_module(module);
 
-            resolved_global_vars: FxHashMap::default(),
-            resolved_funcs: FxHashMap::default(),
+    let resolved_global_vars = global_vars
+        .into_iter()
+        .filter_map(|gv| {
+            // FIXME(eddyb) if the export is missing (or the wrong kind), it will
+            // simply not get remapped - perhaps some kind of diagnostic is in
+            // order? (maybe an entire pass infrastructure that can report errors)
+            let gv_decl = &module.global_vars[gv];
+            if let DeclDef::Imported(Import::LinkName(name)) = gv_decl.def
+                && let Some(&Exportee::GlobalVar(def_gv)) =
+                    module.exports.get(&ExportKey::LinkName(name))
+            {
+                return Some((gv, def_gv));
+            }
+            None
+        })
+        .collect();
 
-            seen_types: FxHashSet::default(),
-            seen_consts: FxHashSet::default(),
-            seen_global_vars: FxHashSet::default(),
-            seen_funcs: FxHashSet::default(),
-        };
-        collector.visit_module(module);
-        (collector.resolved_global_vars, collector.resolved_funcs)
-    };
+    let resolved_funcs = funcs
+        .into_iter()
+        .filter_map(|func| {
+            // FIXME(eddyb) if the export is missing (or the wrong kind), it will
+            // simply not get remapped - perhaps some kind of diagnostic is in
+            // order? (maybe an entire pass infrastructure that can report errors)
+            let func_decl = &module.funcs[func];
+            if let DeclDef::Imported(Import::LinkName(name)) = func_decl.def
+                && let Some(&Exportee::Func(def_func)) =
+                    module.exports.get(&ExportKey::LinkName(name))
+            {
+                return Some((func, def_func));
+            }
+
+            None
+        })
+        .collect();
 
     let mut resolver = ImportResolver {
         cx: &module.cx(),
@@ -154,72 +177,6 @@ pub fn resolve_imports(module: &mut Module) {
         }
         while let Some(func) = resolver.func_queue.pop_front() {
             resolver.in_place_transform_func_decl(&mut module.funcs[func]);
-        }
-    }
-}
-
-// FIXME(eddyb) figure out if this step can be skipped by somehow letting
-// `ImportResolver` access declarations while mutating definitions.
-struct ImportResolutionCollector<'a> {
-    cx: &'a Context,
-    module: &'a Module,
-
-    resolved_global_vars: FxHashMap<GlobalVar, GlobalVar>,
-    resolved_funcs: FxHashMap<Func, Func>,
-
-    // FIXME(eddyb) build some automation to avoid ever repeating these.
-    seen_types: FxHashSet<Type>,
-    seen_consts: FxHashSet<Const>,
-    seen_global_vars: FxHashSet<GlobalVar>,
-    seen_funcs: FxHashSet<Func>,
-}
-
-impl Visitor<'_> for ImportResolutionCollector<'_> {
-    // FIXME(eddyb) build some automation to avoid ever repeating these.
-    fn visit_attr_set_use(&mut self, _attrs: AttrSet) {
-        // FIXME(eddyb) if `AttrSet`s are ignored, why not `Type`s too?
-    }
-    fn visit_type_use(&mut self, ty: Type) {
-        if self.seen_types.insert(ty) {
-            self.visit_type_def(&self.cx[ty]);
-        }
-    }
-    fn visit_const_use(&mut self, ct: Const) {
-        if self.seen_consts.insert(ct) {
-            self.visit_const_def(&self.cx[ct]);
-        }
-    }
-
-    fn visit_global_var_use(&mut self, gv: GlobalVar) {
-        if self.seen_global_vars.insert(gv) {
-            let gv_decl = &self.module.global_vars[gv];
-            self.visit_global_var_decl(gv_decl);
-
-            // FIXME(eddyb) if the export is missing (or the wrong kind), it will
-            // simply not get remapped - perhaps some kind of diagnostic is in
-            // order? (maybe an entire pass infrastructure that can report errors)
-            if let DeclDef::Imported(Import::LinkName(name)) = gv_decl.def
-                && let Some(&Exportee::GlobalVar(def_gv)) =
-                    self.module.exports.get(&ExportKey::LinkName(name))
-            {
-                self.resolved_global_vars.insert(gv, def_gv);
-            }
-        }
-    }
-    fn visit_func_use(&mut self, func: Func) {
-        if self.seen_funcs.insert(func) {
-            let func_decl = &self.module.funcs[func];
-            self.visit_func_decl(func_decl);
-
-            // FIXME(eddyb) if the export is missing (or the wrong kind), it will
-            // simply not get remapped - perhaps some kind of diagnostic is in
-            // order? (maybe an entire pass infrastructure that can report errors)
-            if let DeclDef::Imported(Import::LinkName(name)) = func_decl.def
-                && let Some(&Exportee::Func(def_func)) =
-                    self.module.exports.get(&ExportKey::LinkName(name))
-            {
-                self.resolved_funcs.insert(func, def_func);
-            }
         }
     }
 }
