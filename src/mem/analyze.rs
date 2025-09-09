@@ -1017,10 +1017,28 @@ impl<'a> GatherAccesses<'a> {
                 let mut new_accesses = Some(new_accesses);
 
                 let accesses = match ptr {
-                    Value::Const(ct) => match cx[ct].kind {
+                    Value::Const(ct) => match &cx[ct].kind {
+                        // HACK(eddyb) this only sort of makes sense
+                        // for invalid pointers, which cannot themselves
+                        // be meaningfully used in accesses, and only
+                        // require lifting to a logical pointer type
+                        // when they're e.g. a selection case output
+                        // (with a valid pointer in a sibling case).
+                        ConstKind::Undef => return,
+                        ConstKind::SpvInst { spv_inst_and_const_inputs }
+                            if {
+                                // FIXME(eddyb) maybe `qptr` should have its own null constant?
+                                let (spv_inst, _) = &**spv_inst_and_const_inputs;
+                                spv_inst.opcode
+                                    == crate::spv::spec::Spec::get().well_known.OpConstantNull
+                            } =>
+                        {
+                            return;
+                        }
+
                         // TODO(eddyb) implement `offset: Some(_)` by analogy
                         // to `qptr.offset` on the `offset: None` case.
-                        ConstKind::PtrToGlobalVar { global_var, offset } => {
+                        &ConstKind::PtrToGlobalVar { global_var, offset } => {
                             if let Some(offset) = offset
                                 && let Some(Ok(accesses)) = new_accesses
                             {
