@@ -8,11 +8,10 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
     FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, Region, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
+    TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv,
 };
 use itertools::Either;
 use smallvec::SmallVec;
-use std::cell::Cell;
 use std::mem;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -30,8 +29,6 @@ pub struct LiftToSpvPtrs<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
     layout_cache: LayoutCache<'a>,
-
-    cached_u32_type: Cell<Option<Type>>,
 }
 
 impl<'a> LiftToSpvPtrs<'a> {
@@ -40,7 +37,6 @@ impl<'a> LiftToSpvPtrs<'a> {
             cx: cx.clone(),
             wk: &spv::spec::Spec::get().well_known,
             layout_cache: LayoutCache::new(cx, layout_config),
-            cached_u32_type: Default::default(),
         }
     }
 
@@ -295,7 +291,9 @@ impl<'a> LiftToSpvPtrs<'a> {
                 spv_inst: spv_opcode.into(),
                 type_and_const_inputs: [TypeOrConst::Type(element_type)]
                     .into_iter()
-                    .chain(fixed_len.map(|len| TypeOrConst::Const(self.const_u32(len))))
+                    .chain(fixed_len.map(|len| {
+                        TypeOrConst::Const(self.cx.intern(scalar::Const::from_u32(len)))
+                    }))
                     .collect(),
             },
         }))
@@ -331,48 +329,6 @@ impl<'a> LiftToSpvPtrs<'a> {
             attrs: self.cx.intern(attrs),
             kind: TypeKind::SpvInst { spv_inst: wk.OpTypeStruct.into(), type_and_const_inputs },
         }))
-    }
-
-    /// Get the (likely cached) `u32` type.
-    fn u32_type(&self) -> Type {
-        if let Some(cached) = self.cached_u32_type.get() {
-            return cached;
-        }
-        let wk = self.wk;
-        let ty = self.cx.intern(TypeKind::SpvInst {
-            spv_inst: spv::Inst {
-                opcode: wk.OpTypeInt,
-                imms: [
-                    spv::Imm::Short(wk.LiteralInteger, 32),
-                    spv::Imm::Short(wk.LiteralInteger, 0),
-                ]
-                .into_iter()
-                .collect(),
-            },
-            type_and_const_inputs: [].into_iter().collect(),
-        });
-        self.cached_u32_type.set(Some(ty));
-        ty
-    }
-
-    fn const_u32(&self, x: u32) -> Const {
-        let wk = self.wk;
-
-        self.cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty: self.u32_type(),
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((
-                    spv::Inst {
-                        opcode: wk.OpConstant,
-                        imms: [spv::Imm::Short(wk.LiteralContextDependentNumber, x)]
-                            .into_iter()
-                            .collect(),
-                    },
-                    [].into_iter().collect(),
-                )),
-            },
-        })
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
@@ -640,7 +596,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         ]))
                     })?;
                     access_chain_inputs
-                        .push(Value::Const(self.lifter.const_u32(idx_as_i32 as u32)));
+                        .push(Value::Const(cx.intern(scalar::Const::from_u32(idx_as_i32 as u32))));
 
                     match &layout.components {
                         Components::Scalar => unreachable!(),
@@ -746,7 +702,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         ]))
                     })?;
                     access_chain_inputs
-                        .push(Value::Const(self.lifter.const_u32(idx_as_i32 as u32)));
+                        .push(Value::Const(cx.intern(scalar::Const::from_u32(idx_as_i32 as u32))));
 
                     layout = match &layout.components {
                         Components::Scalar => unreachable!(),
@@ -960,7 +916,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         let mut access_chain_inputs: SmallVec<_> = [ptr].into_iter().collect();
 
         if let TypeLayout::HandleArray(handle, _) = pointee_layout {
-            access_chain_inputs.push(Value::Const(self.lifter.const_u32(0)));
+            access_chain_inputs
+                .push(Value::Const(self.lifter.cx.intern(scalar::Const::from_u32(0))));
             pointee_layout = TypeLayout::Handle(handle);
         }
         match (pointee_layout, access_layout) {
@@ -1029,8 +986,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             format!("{idx} not representable as a positive s32").into()
                         ]))
                     })?;
-                    access_chain_inputs
-                        .push(Value::Const(self.lifter.const_u32(idx_as_i32 as u32)));
+                    access_chain_inputs.push(Value::Const(
+                        self.lifter.cx.intern(scalar::Const::from_u32(idx_as_i32 as u32)),
+                    ));
 
                     pointee_layout = match &pointee_layout.components {
                         Components::Scalar => unreachable!(),
