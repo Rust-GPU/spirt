@@ -576,7 +576,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
             let wk = &spv::spec::Spec::get().well_known;
 
             match &self.cx[gv_decl.type_of_ptr_to].kind {
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                     if spv_inst.opcode == wk.OpTypePointer =>
                 {
                     match type_and_const_inputs[..] {
@@ -3067,15 +3067,16 @@ impl Print for TypeDef {
 
                 TypeKind::Thunk => printer.imperative_keyword_style().apply("thunk").into(),
 
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs } => printer.pretty_spv_inst(
-                    printer.spv_op_style(),
-                    spv_inst.opcode,
-                    &spv_inst.imms,
-                    type_and_const_inputs.iter().map(|&ty_or_ct| match ty_or_ct {
-                        TypeOrConst::Type(ty) => ty.print(printer),
-                        TypeOrConst::Const(ct) => ct.print(printer),
-                    }),
-                ),
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. } => printer
+                    .pretty_spv_inst(
+                        printer.spv_op_style(),
+                        spv_inst.opcode,
+                        &spv_inst.imms,
+                        type_and_const_inputs.iter().map(|&ty_or_ct| match ty_or_ct {
+                            TypeOrConst::Type(ty) => ty.print(printer),
+                            TypeOrConst::Const(ct) => ct.print(printer),
+                        }),
+                    ),
                 TypeKind::SpvStringLiteralForExtInst => pretty::Fragment::new([
                     printer.error_style().apply("type_of").into(),
                     "(".into(),
@@ -3363,7 +3364,7 @@ impl Print for GlobalVarDecl {
                     printer.pretty_type_ascription_suffix(ty)
                 }
             },
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                 if spv_inst.opcode == wk.OpTypePointer =>
             {
                 match type_and_const_inputs[..] {
@@ -3419,7 +3420,19 @@ impl Print for AddrSpace {
 impl Print for FuncDecl {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
+
+        let sig_ret = if !ret_types.is_empty() {
+            let mut ret_types = ret_types.iter().map(|ty| ty.print(printer));
+            let ret_type = if ret_types.len() == 1 {
+                ret_types.next().unwrap()
+            } else {
+                pretty::join_comma_sep("(", ret_types, ")")
+            };
+            pretty::Fragment::new([" -> ".into(), ret_type])
+        } else {
+            pretty::Fragment::default()
+        };
 
         let params = match def {
             DeclDef::Imported(_) => Either::Left(
@@ -3431,11 +3444,7 @@ impl Print for FuncDecl {
             }
         };
 
-        let sig = pretty::Fragment::new([
-            pretty::join_comma_sep("(", params, ")"),
-            " -> ".into(),
-            ret_type.print(printer),
-        ]);
+        let sig = pretty::Fragment::new([pretty::join_comma_sep("(", params, ")"), sig_ret]);
 
         let def_without_name = match def {
             DeclDef::Imported(import) => {
@@ -3521,20 +3530,24 @@ impl<'a> FuncAt<'a, Either<Region, Node>> {
         let func = self.at(());
         let vars = def_parent
             .either(|region| &func.at(region).def().inputs, |node| &func.at(node).def().outputs);
-        vars.iter().map(move |&var| func.at(var).print_with_def_parent(printer, def_parent))
+        vars.iter().map(move |&var| {
+            func.at(var).decl().print(printer).insert_name_before_def(
+                func.at(var).print_name_with_def_parent(printer, def_parent),
+            )
+        })
     }
 }
 
 impl FuncAt<'_, Var> {
-    fn print_with_def_parent(
+    fn print_name_with_def_parent(
         &self,
         printer: &Printer<'_>,
         expected_def_parent: Either<Region, Node>,
     ) -> pretty::Fragment {
-        let VarDecl { attrs, ty, def_parent, def_idx } = *self.decl();
+        let VarDecl { attrs: _, ty: _, def_parent, def_idx } = *self.decl();
         let var = self.position;
 
-        let mut name = Use::Var(var).print_as_def(printer);
+        let name = Use::Var(var).print_as_def(printer);
 
         let valid_attachment_or_err = if def_parent != expected_def_parent {
             Err("/* BUG (attached elsewhere) */".into())
@@ -3554,16 +3567,25 @@ impl FuncAt<'_, Var> {
                 Ok(())
             }
         };
-        if let Err(msg) = valid_attachment_or_err {
-            name =
-                pretty::Fragment::new([printer.error_style().apply(msg).into(), " ".into(), name]);
+
+        match valid_attachment_or_err {
+            Ok(()) => name,
+            Err(msg) => {
+                pretty::Fragment::new([printer.error_style().apply(msg).into(), " ".into(), name])
+            }
         }
+    }
+}
+
+impl Print for VarDecl {
+    type Output = AttrsAndDef;
+    fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
+        let Self { attrs, ty, def_parent: _, def_idx: _ } = *self;
 
         AttrsAndDef {
             attrs: attrs.print(printer),
             def_without_name: printer.pretty_type_ascription_suffix(ty),
         }
-        .insert_name_before_def(name)
     }
 }
 
@@ -3761,7 +3783,7 @@ impl Print for FuncAt<'_, Node> {
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::ThunkBind(_)
-            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvInst(..)
             | DataInstKind::SpvExtInst { .. } => {
                 // FIXME(eddyb) `outputs_header` is wastefully built even in
                 // this case (though ideally the logic would just be shared).
@@ -3779,6 +3801,21 @@ impl Print for FuncAt<'_, Node> {
     }
 }
 
+impl Print for spv::ReaggregatedIdOperand<'_, Value> {
+    type Output = pretty::Fragment;
+    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        match *self {
+            Self::Direct(v) => v.print(printer),
+            // FIXME(eddyb) should this be recursive? it's not on the
+            // output side, and we largely don't care about nesting.
+            Self::Aggregate { ty, leaves } => pretty::Fragment::new([
+                pretty::join_comma_sep("(", leaves.iter().map(|v| v.print(printer)), ")"),
+                printer.pretty_type_ascription_suffix(ty),
+            ]),
+        }
+    }
+}
+
 impl FuncAt<'_, DataInst> {
     fn print_data_inst(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.def();
@@ -3787,17 +3824,30 @@ impl FuncAt<'_, DataInst> {
 
         let attrs = attrs.print(printer);
 
-        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-        let output_type = if !outputs.is_empty() {
-            assert_eq!(outputs.len(), 1);
-            Some(self.at(outputs[0]).decl().ty)
-        } else {
-            None
-        };
+        // NOTE(eddyb) the LHS types and the ascryption type don't have to line up,
+        // all the edge cases (likely only single-leaf aggregates) are handled
+        // by comparing the types being printed (and showing both if not redundant).
+        let mut show_outputs_lhs = !outputs.is_empty();
 
-        let mut output_use_to_print_as_lhs = output_type.map(|_| Use::Var(outputs[0]));
+        let mut output_type_for_ascription_suffix = match kind {
+            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                unreachable!()
+            }
 
-        let mut output_type_to_print = output_type;
+            DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::FuncCall(_)
+            | DataInstKind::Mem(_)
+            | DataInstKind::QPtr(_)
+            | DataInstKind::ThunkBind(_) => None,
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                lowering.disaggregated_output
+            }
+        }
+        .or_else(|| match outputs[..] {
+            [o] => Some(self.at(o).decl().ty),
+            _ => None,
+        });
 
         // FIXME(eddyb) should this be a method on `scalar::Op` instead?
         let print_scalar = |op: scalar::Op| {
@@ -3811,7 +3861,7 @@ impl FuncAt<'_, DataInst> {
             ])
         };
 
-        let def_without_type = match kind {
+        let def_without_types = match kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                 unreachable!()
             }
@@ -4044,38 +4094,43 @@ impl FuncAt<'_, DataInst> {
                 ),
             ]),
 
-            DataInstKind::SpvInst(inst) => printer.pretty_spv_inst(
+            DataInstKind::SpvInst(inst, lowering) => printer.pretty_spv_inst(
                 printer.spv_op_style(),
                 inst.opcode,
                 &inst.imms,
-                inputs.iter().map(|v| v.print(printer)),
+                lowering.reaggreate_inputs(inputs).map(|o| o.print(printer)),
             ),
-            &DataInstKind::SpvExtInst { ext_set, inst } => {
+            DataInstKind::SpvExtInst { ext_set, inst, lowering } => {
                 let spv_spec = spv::spec::Spec::get();
                 let wk = &spv_spec.well_known;
+
+                // HACK(eddyb) prevent accidentally using non-reaggregated `inputs`.
+                let inputs = lowering.reaggreate_inputs(inputs);
 
                 // HACK(eddyb) hide `OpTypeVoid` types, as they're effectively
                 // the default, and not meaningful *even if* the resulting
                 // value is "used" in a kind of "untyped token" way.
-                output_type_to_print = output_type_to_print.filter(|&ty| {
-                    let is_void = match &printer.cx[ty].kind {
-                        TypeKind::SpvInst { spv_inst, .. } => spv_inst.opcode == wk.OpTypeVoid,
-                        _ => false,
-                    };
-                    !is_void
-                });
+                output_type_for_ascription_suffix =
+                    output_type_for_ascription_suffix.filter(|&ty| {
+                        let is_void = match &printer.cx[ty].kind {
+                            TypeKind::SpvInst { spv_inst, .. } => spv_inst.opcode == wk.OpTypeVoid,
+                            _ => false,
+                        };
+                        !is_void
+                    });
                 // HACK(eddyb) only keep around untyped outputs if they're used.
-                if output_type_to_print.is_none() {
-                    output_use_to_print_as_lhs = output_use_to_print_as_lhs.filter(|output_use| {
+                if output_type_for_ascription_suffix.is_none() {
+                    show_outputs_lhs = show_outputs_lhs && {
+                        assert_eq!(outputs.len(), 1);
                         printer
                             .use_styles
-                            .get(output_use)
+                            .get(&Use::Var(outputs[0]))
                             .is_some_and(|style| !matches!(style, UseStyle::Inline))
-                    });
+                    };
                 }
 
                 // FIXME(eddyb) this may get expensive, cache it?
-                let ext_set_name = &printer.cx[ext_set];
+                let ext_set_name = &printer.cx[*ext_set];
                 let lowercase_ext_set_name = ext_set_name.to_ascii_lowercase();
                 let (ext_set_alias, known_inst_desc) = (spv_spec
                     .get_ext_inst_set_by_lowercase_name(&lowercase_ext_set_name))
@@ -4085,7 +4140,7 @@ impl FuncAt<'_, DataInst> {
                 .map_or((&None, None), |ext_inst_set| {
                     // FIXME(eddyb) check that these aliases are unique
                     // across the entire output before using them!
-                    (&ext_inst_set.short_alias, ext_inst_set.instructions.get(&inst))
+                    (&ext_inst_set.short_alias, ext_inst_set.instructions.get(inst))
                 });
 
                 // FIXME(eddyb) extract and separate out the version?
@@ -4103,8 +4158,8 @@ impl FuncAt<'_, DataInst> {
                     Str(&'a str),
                     U32(u32),
                 }
-                let pseudo_imm_from_value = |v: Value| {
-                    if let Value::Const(ct) = v {
+                let pseudo_imm_from_input = |v: spv::ReaggregatedIdOperand<'_, Value>| {
+                    if let spv::ReaggregatedIdOperand::Direct(Value::Const(ct)) = v {
                         match &printer.cx[ct].kind {
                             ConstKind::Undef
                             | ConstKind::Vector(_)
@@ -4126,10 +4181,8 @@ impl FuncAt<'_, DataInst> {
                 };
 
                 let debuginfo_with_pseudo_imm_inputs: Option<SmallVec<[_; 8]>> = known_inst_desc
-                    .filter(|inst_desc| {
-                        inst_desc.is_debuginfo && output_use_to_print_as_lhs.is_none()
-                    })
-                    .and_then(|_| inputs.iter().copied().map(pseudo_imm_from_value).collect());
+                    .filter(|inst_desc| inst_desc.is_debuginfo && !show_outputs_lhs)
+                    .and_then(|_| inputs.clone().map(pseudo_imm_from_input).collect());
                 let printing_debuginfo_as_comment = debuginfo_with_pseudo_imm_inputs.is_some();
 
                 let [spv_base_style, string_literal_style, numeric_literal_style] =
@@ -4209,9 +4262,9 @@ impl FuncAt<'_, DataInst> {
                     } else {
                         pretty::join_comma_sep(
                             "(",
-                            inputs.iter().zip(operand_names).map(|(&input, name)| {
+                            inputs.zip(operand_names).map(|(input, name)| {
                                 // HACK(eddyb) no need to wrap strings in `OpString(...)`.
-                                let printed_input = match pseudo_imm_from_value(input) {
+                                let printed_input = match pseudo_imm_from_input(input) {
                                     Some(PseudoImm::Str(s)) => printer.pretty_string_literal(s),
                                     _ => input.print(printer),
                                 };
@@ -4241,8 +4294,8 @@ impl FuncAt<'_, DataInst> {
         };
 
         let def_without_name = pretty::Fragment::new([
-            def_without_type,
-            output_type_to_print
+            def_without_types,
+            output_type_for_ascription_suffix
                 .map(|ty| printer.pretty_type_ascription_suffix(ty))
                 .unwrap_or_default(),
         ]);
@@ -4253,11 +4306,42 @@ impl FuncAt<'_, DataInst> {
             def_without_name,
         ]);
 
+        // NOTE(eddyb) adding a type to a single output on the LHS can only
+        // be needed when *a different type* was shown via type ascription.
+        let sole_output_needs_lhs_type = outputs.len() == 1
+            && output_type_for_ascription_suffix
+                .is_some_and(|ty| self.at(outputs[0]).decl().ty != ty);
+
+        let outputs_lhs = show_outputs_lhs.then(|| {
+            // FIXME(eddyb) `_names` convention not used elsewhere, reconsider?
+            let output_names = outputs.iter().map(|&output_var| {
+                self.at(output_var)
+                    .print_name_with_def_parent(printer, Either::Right(self.position))
+            });
+
+            if let [output_var] = outputs[..]
+                && !sole_output_needs_lhs_type
+            {
+                let output_name = output_names.exactly_one().ok().unwrap();
+                return AttrsAndDef {
+                    attrs: self.at(output_var).decl().attrs.print(printer),
+                    def_without_name: pretty::Fragment::default(),
+                }
+                .insert_name_before_def(output_name);
+            }
+
+            pretty::join_comma_sep(
+                "(",
+                output_names.zip_eq(outputs).map(|(output_name, &output_var)| {
+                    self.at(output_var).decl().print(printer).insert_name_before_def(output_name)
+                }),
+                ")",
+            )
+        });
+
         AttrsAndDef { attrs, def_without_name }.insert_name_before_def(
-            output_use_to_print_as_lhs
-                .map(|output_use| {
-                    pretty::Fragment::new([output_use.print_as_def(printer), " = ".into()])
-                })
+            outputs_lhs
+                .map(|outputs_lhs| pretty::Fragment::new([outputs_lhs, " = ".into()]))
                 .unwrap_or_default(),
         )
     }

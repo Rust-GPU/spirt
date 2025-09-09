@@ -397,7 +397,7 @@ impl<'a> LayoutCache<'a> {
             TypeKind::Thunk => {
                 return Err(LayoutError(Diag::bug(["`layout_of(thunk)`".into()])));
             }
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs } => {
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. } => {
                 (spv_inst, type_and_const_inputs)
             }
             TypeKind::SpvStringLiteralForExtInst => {

@@ -923,7 +923,7 @@ impl<'a> GatherAccesses<'a> {
             let node_def = func_def_body.at(node).def();
 
             // FIXME(eddyb) consider avoiding this collection step.
-            let per_output_accesses = small_vec_from_position_value_pairs::<_, 1>(
+            let mut per_output_accesses = small_vec_from_position_value_pairs::<_, 1>(
                 node_def
                     .outputs
                     .iter()
@@ -1053,13 +1053,19 @@ impl<'a> GatherAccesses<'a> {
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::ThunkBind(_)
-                | DataInstKind::SpvInst(_)
+                | DataInstKind::SpvInst(..)
                 | DataInstKind::SpvExtInst { .. } => {}
             }
 
-            // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-            assert!(per_output_accesses.len() <= 1);
-            let output_accesses = per_output_accesses.into_iter().next().flatten();
+            // HACK(eddyb) this may be a bit wasteful, but it avoids
+            // complicating acessing `per_output_accesses` below, and
+            // most instructions should only have at most two outputs.
+            {
+                let expected = node_def.outputs.len();
+                if per_output_accesses.len() < expected {
+                    per_output_accesses.extend((per_output_accesses.len()..expected).map(|_| None));
+                }
+            }
 
             // FIXME(eddyb) merge with `match &node_def.kind` above.
             let data_inst_def = node_def;
@@ -1095,10 +1101,12 @@ impl<'a> GatherAccesses<'a> {
                     // with the inherent size/align (given by `_mem_layout`)?
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
+                    assert_eq!(per_output_accesses.len(), 1);
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
-                        output_accesses
+                        per_output_accesses[0]
+                            .take()
                             .unwrap_or_else(|| {
                                 Err(AnalysisError(Diag::bug([
                                     "HandleArrayIndex: unknown element".into()
@@ -1113,11 +1121,14 @@ impl<'a> GatherAccesses<'a> {
                     );
                 }
                 DataInstKind::QPtr(QPtrOp::BufferData) => {
+                    assert_eq!(per_output_accesses.len(), 1);
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
-                        output_accesses.unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD))).and_then(
-                            |accesses| {
+                        per_output_accesses[0]
+                            .take()
+                            .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                            .and_then(|accesses| {
                                 let happ = match accesses {
                                     MemAccesses::Handles(_) => {
                                         return Err(AnalysisError(Diag::bug([
@@ -1130,8 +1141,7 @@ impl<'a> GatherAccesses<'a> {
                                     AddrSpace::Handles,
                                     happ,
                                 )))
-                            },
-                        ),
+                            }),
                     );
                 }
                 &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
@@ -1162,6 +1172,7 @@ impl<'a> GatherAccesses<'a> {
                     );
                 }
                 &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+                    assert_eq!(per_output_accesses.len(), 1);
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
@@ -1175,7 +1186,8 @@ impl<'a> GatherAccesses<'a> {
                             })
                             .and_then(|offset| {
                                 offset_accesses(
-                                    output_accesses
+                                    per_output_accesses[0]
+                                        .take()
                                         .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))?,
                                     offset,
                                 )
@@ -1183,11 +1195,14 @@ impl<'a> GatherAccesses<'a> {
                     );
                 }
                 DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
+                    assert_eq!(per_output_accesses.len(), 1);
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
-                        output_accesses.unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD))).and_then(
-                            |accesses| {
+                        per_output_accesses[0]
+                            .take()
+                            .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                            .and_then(|accesses| {
                                 let happ = match accesses {
                                     MemAccesses::Handles(_) => {
                                         return Err(AnalysisError(Diag::bug([
@@ -1241,8 +1256,7 @@ impl<'a> GatherAccesses<'a> {
                                         stride: *stride,
                                     },
                                 }))
-                            },
-                        ),
+                            }),
                     );
                 }
                 DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
@@ -1358,7 +1372,7 @@ impl<'a> GatherAccesses<'a> {
                     }
                 }
 
-                DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+                DataInstKind::SpvInst(..) | DataInstKind::SpvExtInst { .. } => {
                     for attr in &cx[data_inst_def.attrs].attrs {
                         if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) = *attr {
                             let ty = pointee.0;
