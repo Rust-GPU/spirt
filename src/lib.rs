@@ -166,6 +166,7 @@ pub mod passes {
     pub mod link;
     pub mod qptr;
 }
+pub mod mem;
 pub mod qptr;
 pub mod spv;
 
@@ -394,6 +395,10 @@ pub enum Attr {
     // of `AttrSetDef::{dbg_src_loc,set_dbg_src_loc}`.
     DbgSrcLoc(OrdAssertEq<DbgSrcLoc>),
 
+    /// Memory-specific attributes (see [`mem::MemAttr`]).
+    #[from]
+    Mem(mem::MemAttr),
+
     /// `QPtr`-specific attributes (see [`qptr::QPtrAttr`]).
     #[from]
     QPtr(qptr::QPtrAttr),
@@ -499,7 +504,7 @@ pub enum DiagMsgPart {
     Attrs(AttrSet),
     Type(Type),
     Const(Const),
-    QPtrUsage(qptr::QPtrUsage),
+    MemAccesses(mem::MemAccesses),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])
@@ -661,7 +666,7 @@ pub struct GlobalVarDecl {
 
     /// When `type_of_ptr_to` is `QPtr`, `shape` must be used to describe the
     /// global variable (see `GlobalVarShape`'s documentation for more details).
-    pub shape: Option<qptr::shapes::GlobalVarShape>,
+    pub shape: Option<mem::shapes::GlobalVarShape>,
 
     /// The address space the global variable will be allocated into.
     pub addr_space: AddrSpace,
@@ -969,6 +974,10 @@ pub enum DataInstKind {
     // FIXME(eddyb) try to split this into recursive and non-recursive calls,
     // to avoid needing special handling for recursion where it's impossible.
     FuncCall(Func),
+
+    /// Memory-specific operations (see [`mem::MemOp`]).
+    #[from]
+    Mem(mem::MemOp),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
