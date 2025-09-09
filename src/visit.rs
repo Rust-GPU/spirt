@@ -331,7 +331,8 @@ impl InnerVisit for TypeDef {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            TypeKind::QPtr
+            TypeKind::Scalar(_)
+            | TypeKind::QPtr
             | TypeKind::Thunk
             | TypeKind::SpvTypeOperand
             | TypeKind::SpvStringLiteralForExtInst => {}
@@ -355,7 +356,7 @@ impl InnerVisit for ConstDef {
         visitor.visit_attr_set_use(*attrs);
         visitor.visit_type_use(*ty);
         match kind {
-            ConstKind::Undef | ConstKind::SpvStringLiteralForExtInst(_) => {}
+            ConstKind::Undef | ConstKind::Scalar(_) | ConstKind::SpvStringLiteralForExtInst(_) => {}
 
             &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
             &ConstKind::PtrToFunc(func) => visitor.visit_func_use(func),
