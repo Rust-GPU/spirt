@@ -3892,18 +3892,35 @@ impl FuncAt<'_, DataInst> {
                         )
                     }
 
-                    MemOp::Load => {
+                    &MemOp::Load { offset } => {
                         assert_eq!(inputs.len(), 1);
-                        ("load", [inputs[0].print(printer)].into_iter().collect())
+                        let mut ptr = inputs[0].print(printer);
+                        if let Some(offset) = offset {
+                            ptr = pretty::Fragment::new([
+                                ptr,
+                                if offset.get() < 0 { " - " } else { " + " }.into(),
+                                printer
+                                    .numeric_literal_style()
+                                    .apply(offset.abs().to_string())
+                                    .into(),
+                            ]);
+                        }
+                        ("load", [ptr].into_iter().collect())
                     }
-                    MemOp::Store => {
+                    &MemOp::Store { offset } => {
                         assert_eq!(inputs.len(), 2);
-                        (
-                            "store",
-                            [inputs[0].print(printer), inputs[1].print(printer)]
-                                .into_iter()
-                                .collect(),
-                        )
+                        let mut ptr = inputs[0].print(printer);
+                        if let Some(offset) = offset {
+                            ptr = pretty::Fragment::new([
+                                ptr,
+                                if offset.get() < 0 { " - " } else { " + " }.into(),
+                                printer
+                                    .numeric_literal_style()
+                                    .apply(offset.abs().to_string())
+                                    .into(),
+                            ]);
+                        }
+                        ("store", [ptr, inputs[1].print(printer)].into_iter().collect())
                     }
                 };
 
