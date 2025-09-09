@@ -1278,26 +1278,11 @@ impl<'a> Structurizer<'a> {
                     .iter()
                     .filter_map(|case| {
                         let &ClaimedRegion { structured_body, .. } = case.as_ref().ok()?;
-                        // FIXME(eddyb) maybe there should be a `FuncAt<Region>`
-                        // helper for "debug locations from all `Block` `DataInst`s
-                        // and non-`Block` `Node`"? (i.e. only flattening `Block`s)
                         this.func_def_body
                             .at(structured_body)
                             .at_children()
                             .into_iter()
-                            .flat_map(|func_at_child| {
-                                let child_def = func_at_child.def();
-                                if let NodeKind::Block { insts } = child_def.kind {
-                                    Either::Left(
-                                        func_at_child
-                                            .at(insts)
-                                            .into_iter()
-                                            .map(|func_at_inst| func_at_inst.def().attrs),
-                                    )
-                                } else {
-                                    Either::Right([child_def.attrs].into_iter())
-                                }
-                            })
+                            .map(|func_at_child| func_at_child.def().attrs)
                             .rev()
                             .find_map(&mut relevant_dbg_src_loc)
                             .map(|dbg_src_loc| dbg_src_loc.end_line_col)
