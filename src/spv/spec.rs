@@ -138,6 +138,7 @@ def_well_known! {
         OpConstantTrue,
         OpConstant,
         OpUndef,
+        OpConstantFunctionPointerINTEL,
 
         OpVariable,
 
@@ -202,6 +203,8 @@ def_well_known! {
         HitAttributeKHR,
         RayPayloadKHR,
         CallableDataKHR,
+
+        CodeSectionINTEL,
     ],
     decoration: u32 = [
         LinkageAttributes,
