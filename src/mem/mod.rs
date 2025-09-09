@@ -18,6 +18,7 @@ use std::rc::Rc;
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
 pub mod analyze;
+pub mod const_data;
 // FIXME(eddyb) make this public?
 pub(crate) mod layout;
 pub mod shapes;

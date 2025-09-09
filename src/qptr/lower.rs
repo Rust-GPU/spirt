@@ -1,13 +1,14 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lowering (e.g. from SPIR-V).
 
 use crate::func_at::FuncAtMut;
-use crate::mem::{MemOp, shapes};
+use crate::mem::{MemOp, const_data, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, Node, NodeDef,
-    NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl, VarKind, spv,
+    DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, GlobalVarInit,
+    Node, NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl,
+    VarKind, scalar, spv,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -53,7 +54,29 @@ impl<'a> LowerFromSpvPtrs<'a> {
                 shapes::Handle::Buffer(addr_space, buf.mem_layout)
             }
         };
-        let mut shape_result = self.layout_of(pointee_type).and_then(|layout| {
+        let addr_space_requires_typed_interface = match global_var_decl.addr_space {
+            // These SPIR-V Storage Classes are defined to require
+            // exact types, either because they're `BuiltIn`s, or
+            // for "interface matching" between pipeline stages.
+            AddrSpace::SpvStorageClass(sc) => [
+                wk.Input,
+                wk.Output,
+                wk.IncomingRayPayloadKHR,
+                wk.IncomingCallableDataKHR,
+                wk.HitAttributeKHR,
+                wk.RayPayloadKHR,
+                wk.CallableDataKHR,
+            ]
+            .contains(&sc),
+
+            AddrSpace::Handles => false,
+        };
+        let layout_result = self.layout_of(pointee_type);
+        let concrete_mem_layout = layout_result.as_ref().ok().and_then(|layout| match layout {
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => None,
+            TypeLayout::Concrete(concrete) => Some(concrete.mem_layout),
+        });
+        let mut shape_result = layout_result.and_then(|layout| {
             Ok(match layout {
                 TypeLayout::Handle(handle) => shapes::GlobalVarShape::Handles {
                     handle: handle_layout_to_handle(handle),
@@ -71,26 +94,10 @@ impl<'a> LowerFromSpvPtrs<'a> {
                             "`".into(),
                         ])));
                     }
-                    match global_var_decl.addr_space {
-                        // These SPIR-V Storage Classes are defined to require
-                        // exact types, either because they're `BuiltIn`s, or
-                        // for "interface matching" between pipeline stages.
-                        AddrSpace::SpvStorageClass(sc)
-                            if [
-                                wk.Input,
-                                wk.Output,
-                                wk.IncomingRayPayloadKHR,
-                                wk.IncomingCallableDataKHR,
-                                wk.HitAttributeKHR,
-                                wk.RayPayloadKHR,
-                                wk.CallableDataKHR,
-                            ]
-                            .contains(&sc) =>
-                        {
-                            shapes::GlobalVarShape::TypedInterface(pointee_type)
-                        }
-
-                        _ => shapes::GlobalVarShape::UntypedData(concrete.mem_layout.fixed_base),
+                    if addr_space_requires_typed_interface {
+                        shapes::GlobalVarShape::TypedInterface(pointee_type)
+                    } else {
+                        shapes::GlobalVarShape::UntypedData(concrete.mem_layout.fixed_base)
                     }
                 }
             })
@@ -126,22 +133,239 @@ impl<'a> LowerFromSpvPtrs<'a> {
                 global_var_decl.addr_space = AddrSpace::Handles;
             }
         }
+
+        // HACK(eddyb) the interactions with `shape_result` are a bit too ad-hoc,
+        // but they help testing for now (until Rust-GPU is more accurate).
+        if let DeclDef::Present(global_var_def_body) = &mut global_var_decl.def {
+            let lowered_init = global_var_def_body.initializer.as_ref().and_then(|init| {
+                self.try_lower_global_var_init(init)
+                    .map_err(|LowerError(e)| {
+                        if shape_result.is_ok() {
+                            shape_result = Err(LowerError(e));
+                        } else {
+                            global_var_decl.attrs.push_diag(&self.cx, e);
+                        }
+                    })
+                    .ok()
+            });
+            if let Some(init) = lowered_init {
+                // HACK(eddyb) recover the shape from the initializer.
+                match (&shape_result, concrete_mem_layout, &init) {
+                    (Err(_), Some(mem_layout), GlobalVarInit::Data(data))
+                        if !addr_space_requires_typed_interface
+                            && mem_layout.dyn_unit_stride.is_some()
+                            && mem_layout.fixed_base.size <= data.size() =>
+                    {
+                        let mut fixed_layout = mem_layout.fixed_base;
+                        fixed_layout.size = data.size();
+                        shape_result = Ok(shapes::GlobalVarShape::UntypedData(fixed_layout));
+                    }
+                    _ => {}
+                }
+                if shape_result.is_ok() {
+                    global_var_def_body.initializer = Some(init);
+                }
+            }
+        }
+
+        // HACK(eddyb) in case anything goes wrong, we want to keep `OpTypePointer`.
+        let original_type_of_ptr_to = global_var_decl.type_of_ptr_to;
+
+        EraseSpvPtrs { lowerer: self }.in_place_transform_global_var_decl(global_var_decl);
+
         match shape_result {
             Ok(shape) => {
                 global_var_decl.shape = Some(shape);
-
-                // HACK(eddyb) this should handle shallow `QPtr` in the initializer, but
-                // typed initializers should be replaced with miri/linker-style ones.
-                // FIXME(eddyb) this is even worse now, with disaggregation,
-                // the initializer should be disaggregated leaves, which then
-                // need to flattened into a miri-like representation, or at least
-                // have offsets assigned to each leaf (for `qptr::lift` to use).
-                EraseSpvPtrs { lowerer: self }.in_place_transform_global_var_decl(global_var_decl);
             }
             Err(LowerError(e)) => {
                 global_var_decl.attrs.push_diag(&self.cx, e);
+
+                // HACK(eddyb) effectively undoes `EraseSpvPtrs` for one field.
+                global_var_decl.type_of_ptr_to = original_type_of_ptr_to;
             }
         }
+    }
+    fn try_lower_global_var_init(
+        &self,
+        global_var_init: &GlobalVarInit,
+    ) -> Result<GlobalVarInit, LowerError> {
+        let (aggregate_type, aggregate_leaves) = match global_var_init {
+            &GlobalVarInit::Direct(ct) => return Ok(GlobalVarInit::Direct(ct)),
+
+            GlobalVarInit::Data(_) => {
+                return Err(LowerError(Diag::bug([
+                    "unexpected `GlobalVarInit::Data` (already lowered?)".into(),
+                ])));
+            }
+
+            GlobalVarInit::SpvAggregate { ty, leaves } => (*ty, leaves),
+        };
+        let aggregate_layout = match self.layout_of(aggregate_type)? {
+            // FIXME(eddyb) consider bad interactions with "interface blocks"?
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => {
+                return Err(LowerError(Diag::bug(["handles are not aggregates".into()])));
+            }
+            TypeLayout::Concrete(layout) => layout,
+        };
+
+        let mut leaf_values = aggregate_leaves.iter().copied();
+        let mut data = const_data::ConstData::new(aggregate_layout.mem_layout.fixed_base.size);
+        let result = aggregate_layout.deeply_flatten_if(
+            0,
+            // Whether `candidate_layout` is an aggregate (to recurse into).
+            &|candidate_layout| {
+                matches!(
+                    &self.cx[candidate_layout.original_type].kind,
+                    TypeKind::SpvInst { value_lowering: spv::ValueLowering::Disaggregate(_), .. }
+                )
+            },
+            &mut |leaf_offset, leaf| {
+                let leaf_offset = u32::try_from(leaf_offset).ok().ok_or_else(|| {
+                    LayoutError(Diag::bug([format!(
+                        "negative initializer leaf offset {leaf_offset}"
+                    )
+                    .into()]))
+                })?;
+
+                let leaf_value = leaf_values.next().ok_or_else(|| {
+                    LayoutError(Diag::bug(["fewer initializer leaves than layout".into()]))
+                })?;
+                let leaf_value_def = &self.cx[leaf_value];
+
+                // FIXME(eddyb) should this compare only size/shape?
+                let expected_ty = leaf.original_type;
+                let found_ty = leaf_value_def.ty;
+                if expected_ty != found_ty {
+                    return Err(LayoutError(Diag::bug([
+                        "initializer leaf type mismatch: expected `".into(),
+                        expected_ty.into(),
+                        "`, found `".into(),
+                        found_ty.into(),
+                        "` typed value `".into(),
+                        leaf_value.into(),
+                        "`".into(),
+                    ])));
+                }
+
+                let leaf_size =
+                    NonZeroU32::new(leaf.mem_layout.fixed_base.size).ok_or_else(|| {
+                        LayoutError(Diag::bug([
+                            format!(
+                                "zero-sized initializer leaf at offset {leaf_offset}, with value `"
+                            )
+                            .into(),
+                            leaf_value.into(),
+                            "`".into(),
+                        ]))
+                    })?;
+
+                self.try_write_to_const_data_at(&mut data, leaf_offset, leaf_size, leaf_value)
+            },
+        );
+        result.map_err(|LayoutError(e)| LowerError(e))?;
+
+        if leaf_values.next().is_some() {
+            return Err(LowerError(Diag::bug(["more initializer leaves than layout".into()])));
+        }
+
+        Ok(GlobalVarInit::Data(data))
+    }
+    // FIXME(eddyb) move this to a more general `ConstData` helper.
+    fn try_write_to_const_data_at(
+        &self,
+        data: &mut const_data::ConstData<Const>,
+        offset: u32,
+        size: NonZeroU32,
+        ct: Const,
+    ) -> Result<(), LayoutError> {
+        // HACK(eddyb) strip bitcasts as long as the input and output size match.
+        let (ct, ct_def) = {
+            let (mut ct, mut ct_def) = (ct, &self.cx[ct]);
+            while let ConstKind::SpvInst { spv_inst_and_const_inputs } = &ct_def.kind {
+                let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
+
+                if let (&[input], &[spv::Imm::Short(_, op)]) =
+                    (&const_inputs[..], &spv_inst.imms[..])
+                    && spv_inst.opcode == self.wk.OpSpecConstantOp
+                    && op == u32::from(self.wk.OpBitcast.as_u16())
+                {
+                    let input_def = &self.cx[input];
+                    let input_size =
+                        self.layout_cache.layout_of(input_def.ty).ok().and_then(|layout| {
+                            match layout {
+                                TypeLayout::Concrete(layout)
+                                    if layout.mem_layout.dyn_unit_stride.is_none() =>
+                                {
+                                    NonZeroU32::new(layout.mem_layout.fixed_base.size)
+                                }
+                                _ => None,
+                            }
+                        });
+                    if input_size == Some(size) {
+                        (ct, ct_def) = (input, input_def);
+                        continue;
+                    }
+                }
+                break;
+            }
+            (ct, ct_def)
+        };
+
+        let err_to_diag = |err| {
+            let const_data::PartialSymbolicOverlap { offsets } = err;
+            LayoutError(Diag::bug([
+                format!("initializer leaf at offset {offset}, with value `").into(),
+                ct.into(),
+                format!("`, overlaps with leaf at offsets {offsets:?} (invalid layout?)").into(),
+            ]))
+        };
+
+        let mut total_written_range = offset..offset;
+
+        // HACK(eddyb) helper shared by `Scalar` and `Vector`.
+        let mut write_next_scalar = |leaf_scalar: scalar::Const| {
+            // FIXME(eddyb) try harder to avoid panicking due to out-of-bounds
+            // offsets caused by e.g. malformed layouts (and/or guarantee certain
+            // invariants for types that didn't error during layout computation).
+            let written_range = data
+                .write_scalar(total_written_range.end, leaf_scalar, self.layout_cache.config)
+                .map_err(err_to_diag)?;
+            total_written_range.end = written_range.end;
+            Ok(())
+        };
+
+        match &ct_def.kind {
+            // HACK(eddyb) Rust-GPU still uses `undef`
+            // w/ custom attributes for some error cases,
+            // so care must be taken until that's deemed
+            // incorrect (if at all).
+            // FIXME(eddyb) handle this elsewhere, too.
+            ConstKind::Undef if ct_def.attrs == AttrSet::default() => {
+                return Ok(());
+            }
+
+            &ConstKind::Scalar(leaf_scalar) => {
+                write_next_scalar(leaf_scalar)?;
+            }
+
+            ConstKind::Vector(leaf_vector) => {
+                for elem in leaf_vector.elems() {
+                    write_next_scalar(elem)?;
+                }
+            }
+
+            // FIXME(eddyb) try harder to avoid panicking due to out-of-bounds
+            // offsets caused by e.g. malformed layouts (and/or guarantee certain
+            // invariants for types that didn't error during layout computation).
+            _ => {
+                data.write_symbolic(offset, size, ct).map_err(err_to_diag)?;
+                total_written_range.end += size.get();
+            }
+        }
+
+        assert_eq!(total_written_range, offset..(offset + size.get()));
+
+        Ok(())
     }
 
     pub fn lower_func(&self, func_decl: &mut FuncDecl) {
