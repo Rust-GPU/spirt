@@ -344,6 +344,7 @@ impl InnerVisit for ConstDef {
         visitor.visit_type_use(*ty);
         match kind {
             &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
+            &ConstKind::PtrToFunc(func) => visitor.visit_func_use(func),
             ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                 let (_spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                 for &ct in const_inputs {

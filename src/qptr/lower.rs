@@ -162,6 +162,14 @@ impl<'a> LowerFromSpvPtrs<'a> {
                     [spv::Imm::Short(_, sc)] => sc,
                     _ => unreachable!(),
                 };
+
+                // HACK(eddyb) keep function pointers separate, perhaps eventually
+                // adding an `OpTypeUntypedPointerKHR CodeSectionINTEL` equivalent
+                // to SPIR-T itself (after `SPV_KHR_untyped_pointers` support).
+                if sc == self.wk.CodeSectionINTEL {
+                    return None;
+                }
+
                 let pointee = match type_and_const_inputs[..] {
                     [TypeOrConst::Type(elem_type)] => elem_type,
                     _ => unreachable!(),

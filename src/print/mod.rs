@@ -3348,6 +3348,9 @@ impl Print for ConstDef {
                 &ConstKind::PtrToGlobalVar(gv) => {
                     pretty::Fragment::new(["&".into(), gv.print(printer)])
                 }
+                &ConstKind::PtrToFunc(func) => {
+                    pretty::Fragment::new(["&".into(), func.print(printer)])
+                }
                 ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                     let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                     pretty::Fragment::new([
@@ -4130,7 +4133,7 @@ impl Print for FuncAt<'_, DataInst> {
                                     }
                                 }
                             }
-                            ConstKind::PtrToGlobalVar(_) => {}
+                            ConstKind::PtrToGlobalVar(_) | ConstKind::PtrToFunc(_) => {}
                         }
                     }
                     None

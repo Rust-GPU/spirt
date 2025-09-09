@@ -473,6 +473,10 @@ impl InnerTransform for ConstDef {
                     gv -> transformer.transform_global_var_use(*gv),
                 } => ConstKind::PtrToGlobalVar(gv)),
 
+                ConstKind::PtrToFunc(func) => transform!({
+                    func -> transformer.transform_func_use(*func),
+                } => ConstKind::PtrToFunc(func)),
+
                 ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                     let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                     Transformed::map_iter(
