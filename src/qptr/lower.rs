@@ -1038,14 +1038,21 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         .deeply_flatten_if(
                             base_offset,
                             // Whether `candidate_layout` is an aggregate (to recurse into).
-                            &|candidate_layout| matches!(
-                                &cx[candidate_layout.original_type].kind,
-                                TypeKind::SpvInst { value_lowering: spv::ValueLowering::Disaggregate(_), .. }
-                            ),
+                            &|candidate_layout| {
+                                matches!(
+                                    &cx[candidate_layout.original_type].kind,
+                                    TypeKind::SpvInst {
+                                        value_lowering: spv::ValueLowering::Disaggregate(_),
+                                        ..
+                                    }
+                                )
+                            },
                             &mut |leaf_offset, leaf| {
                                 let leaf_access = leaf_accesses.next().ok_or_else(|| {
                                     LayoutError(Diag::bug([
-                                        "`spv::lower` and `mem::layout` disagree on aggregate leaves of ".into(),
+                                        "`spv::lower` and `mem::layout` disagree \
+                                         on aggregate leaves of "
+                                            .into(),
                                         pointee_type.into(),
                                     ]))
                                 })?;
@@ -1056,7 +1063,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                                         leaf_type.into(),
                                         "` vs `".into(),
                                         leaf.original_type.into(),
-                                        "`".into()
+                                        "`".into(),
                                     ])));
                                 }
                                 leaf_accesses_with_offsets.push((leaf_access, leaf_offset));
@@ -1160,15 +1167,18 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
             // FIXME(eddyb) this may need to automatically generate an
             // intermediary `QPtrOp::BufferData` when accessing buffers.
-            let mem_data_layout = match self.lowerer.layout_of(src_pointee_type)? {
-                TypeLayout::Concrete(mem) => mem,
-                _ => {
-                    return Err(LowerError(Diag::bug([
-                        "`OpCopyMemory` of data with non-memory type: ".into(),
-                        src_pointee_type.into(),
-                    ])));
-                }
-            };
+            let mem_data_layout_or_opaque_handle_type =
+                match self.lowerer.layout_of(src_pointee_type)? {
+                    TypeLayout::Concrete(mem) => Ok(mem),
+                    // HACK(eddyb) Rust-GPU generates `OpCopyMemory`s of handles.
+                    TypeLayout::Handle(shapes::Handle::Opaque(ty)) => Err(ty),
+                    _ => {
+                        return Err(LowerError(Diag::bug([
+                            "`OpCopyMemory` of data with non-memory type: ".into(),
+                            src_pointee_type.into(),
+                        ])));
+                    }
+                };
 
             let (dst_ptr, dst_base_offset) = flatten_offsets(dst_ptr);
             let (src_ptr, src_base_offset) = flatten_offsets(src_ptr);
@@ -1220,6 +1230,13 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 // be generating, because we don't know ahead of time whether we
                 // even want to expand the `OpCopyMemory`, at all.
                 let mut leaf_offsets_and_types = SmallVec::<[_; 8]>::new();
+                let mem_data_layout = match mem_data_layout_or_opaque_handle_type {
+                    Ok(mem_data_layout) => mem_data_layout,
+                    Err(opaque_handle_type) => {
+                        leaf_offsets_and_types.push((0, opaque_handle_type));
+                        return Some(leaf_offsets_and_types);
+                    }
+                };
                 mem_data_layout
                     .deeply_flatten_if(
                         0,
@@ -1375,6 +1392,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         mut func_at_data_inst: FuncAtMut<'_, DataInst>,
         extra_error: Option<LowerError>,
     ) {
+        let wk = self.lowerer.wk;
         let cx = &self.lowerer.cx;
 
         let func_at_data_inst_frozen = func_at_data_inst.reborrow().freeze();
@@ -1431,6 +1449,23 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     ]));
                     continue;
                 }
+
+                // HACK(eddyb) avoid otherwise-unsupported instructions ending up
+                // with invalid address spaces (such cases should be errors,
+                // but Rust-GPU still emits `Generic` everywhere, and having
+                // def-vs-use type mismatches, instead, would also cause issues).
+                let addr_space = match &data_inst_def.kind {
+                    DataInstKind::SpvInst(spv_inst, _) => {
+                        if spv_inst.opcode == wk.OpVariable {
+                            AddrSpace::SpvStorageClass(wk.Function)
+                        } else if spv_inst.opcode == wk.OpImageTexelPointer {
+                            AddrSpace::SpvStorageClass(wk.Image)
+                        } else {
+                            addr_space
+                        }
+                    }
+                    _ => addr_space,
+                };
 
                 old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
                     QPtrAttr::FromSpvPtrOutput {
