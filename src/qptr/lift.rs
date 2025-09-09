@@ -659,9 +659,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
                 // HACK(eddyb) `_` will match multiple variants soon.
                 #[allow(clippy::match_wildcard_for_single_variants)]
-                let (spv_opcode, access_type) = match op {
-                    MemOp::Load { .. } => (wk.OpLoad, func.at(data_inst_def.outputs[0]).decl().ty),
-                    MemOp::Store { .. } => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
+                let (access_op, access_type) = match op {
+                    MemOp::Load { .. } => {
+                        (MemOp::Load { offset: None }, func.at(data_inst_def.outputs[0]).decl().ty)
+                    }
+                    MemOp::Store { .. } => {
+                        (MemOp::Store { offset: None }, type_of_val(data_inst_def.inputs[1]))
+                    }
                     _ => unreachable!(),
                 };
 
@@ -681,10 +685,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     .into_iter()
                 };
 
-                let mut new_data_inst_def = DataInstDef {
-                    kind: DataInstKind::SpvInst(spv_opcode.into()),
-                    ..data_inst_def.clone()
-                };
+                let mut new_data_inst_def =
+                    DataInstDef { kind: access_op.into(), ..data_inst_def.clone() };
 
                 // FIXME(eddyb) written in a more general style for future deduplication.
                 for (input_idx, (access_chain_output_ptr_type, mut access_chain_data_inst_def)) in
@@ -831,7 +833,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
     /// If necessary, construct an `OpAccessChain` instruction to offset `ptr`
     /// (pointing to a type with `pointee_layout`) by `offset`, and (optionally)
-    /// turn it into a pointer to `access_type` (for e.g. `OpLoad`/`OpStore`).
+    /// turn it into a pointer to `access_type`.
     ///
     /// **Note**: the returned instruction has empty `outputs`, the caller must
     /// add one, using the type returend alongside the instruction.

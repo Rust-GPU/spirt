@@ -2,6 +2,7 @@
 
 use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
+use crate::mem::MemOp;
 use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
@@ -258,6 +259,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             | NodeKind::ExitInvocation(_)
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
+            | DataInstKind::Mem(MemOp::Load { offset: None } | MemOp::Store { offset: None })
             | DataInstKind::FuncCall(_)
             | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_) => {}

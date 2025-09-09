@@ -7,6 +7,7 @@
 //
 // FIXME(eddyb) should interning attempts check/apply these canonicalizations?
 
+use crate::mem::MemOp;
 use crate::spv::{self, spec};
 use crate::{Const, ConstKind, Context, NodeKind, Type, TypeKind, TypeOrConst, scalar, vector};
 use itertools::Itertools;
@@ -564,11 +565,21 @@ impl spv::Inst {
                 }
             }),
 
+            // FIXME(eddyb) consider lowering `OpLoad`/`OpStore` to `mem.{load,store}`
+            // as well, not just this lifting (but that'd require more changes).
+            NodeKind::Mem(op) => {
+                let wk = &spec::Spec::get().well_known;
+                match op {
+                    MemOp::Load { offset: None } => Some(wk.OpLoad.into()),
+                    MemOp::Store { offset: None } => Some(wk.OpStore.into()),
+                    _ => None,
+                }
+            }
+
             NodeKind::Select(_)
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
             | NodeKind::FuncCall(_)
-            | NodeKind::Mem(_)
             | NodeKind::QPtr(_)
             | NodeKind::ThunkBind(_)
             | NodeKind::SpvInst(..)
