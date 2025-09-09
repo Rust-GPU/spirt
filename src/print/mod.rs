@@ -1499,7 +1499,7 @@ impl<'a> Printer<'a> {
                             intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
                         });
 
-                        let NodeDef { attrs, kind, outputs } = func_at_node.def();
+                        let NodeDef { attrs, inputs: _, kind, outputs } = func_at_node.def();
 
                         define(Use::AlignmentAnchorForNode(node), Some(*attrs));
 
@@ -3739,7 +3739,7 @@ impl Print for FuncAt<'_, Node> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let node = self.position;
-        let NodeDef { attrs, kind, outputs } = self.def();
+        let NodeDef { attrs, inputs, kind, outputs } = self.def();
 
         let attrs = attrs.print(printer);
 
@@ -3775,15 +3775,16 @@ impl Print for FuncAt<'_, Node> {
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
             }
-            NodeKind::Select { kind, scrutinee, cases } => kind.print_with_scrutinee_and_cases(
+            NodeKind::Select { kind, cases } => kind.print_with_scrutinee_and_cases(
                 printer,
                 kw_style,
-                *scrutinee,
+                inputs[0],
                 cases.iter().map(|&case| self.at(case).print(printer)),
             ),
-            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
+            NodeKind::Loop { body, repeat_condition } => {
                 assert!(outputs.is_empty());
 
+                let initial_inputs = inputs;
                 let inputs = &self.at(*body).def().inputs;
                 assert_eq!(initial_inputs.len(), inputs.len());
 
@@ -3862,10 +3863,10 @@ impl Print for FuncAt<'_, Node> {
                     repeat_condition.print(printer),
                 ])
             }
-            NodeKind::ExitInvocation {
-                kind: cf::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
-                inputs,
-            } => printer.pretty_spv_inst(
+            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(spv::Inst {
+                opcode,
+                imms,
+            })) => printer.pretty_spv_inst(
                 kw_style,
                 *opcode,
                 imms,

@@ -646,8 +646,11 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         // HACK(eddyb) handle all pre-child-regions fields separately to
         // allow reborrowing `FuncAtMut` (for the child region recursion).
-        let NodeDef { attrs, kind, outputs: _ } = self.reborrow().def();
+        let NodeDef { attrs, inputs, kind, outputs: _ } = self.reborrow().def();
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
+        for v in inputs {
+            transformer.transform_value_use(v).apply_to(v);
+        }
         match kind {
             &mut NodeKind::Block { insts } => {
                 let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
@@ -657,17 +660,10 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             }
             NodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                scrutinee,
                 cases: _,
-            } => {
-                transformer.transform_value_use(scrutinee).apply_to(scrutinee);
             }
-            NodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
-            | NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs } => {
-                for v in inputs {
-                    transformer.transform_value_use(v).apply_to(v);
-                }
-            }
+            | NodeKind::Loop { body: _, repeat_condition: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
         }
 
         // FIXME(eddyb) represent the list of child regions without having them
@@ -677,15 +673,15 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             transformer.in_place_transform_region_def(self.reborrow().at(child_region));
         }
 
-        let NodeDef { attrs: _, kind, outputs } = self.reborrow().def();
+        let NodeDef { attrs: _, inputs: _, kind, outputs } = self.reborrow().def();
 
         match kind {
             // Fully handled above, before recursing into any child regions.
             NodeKind::Block { insts: _ }
-            | NodeKind::Select { kind: _, scrutinee: _, cases: _ }
-            | NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs: _ } => {}
+            | NodeKind::Select { kind: _, cases: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
 
-            NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
+            NodeKind::Loop { body: _, repeat_condition } => {
                 transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
             }
         };

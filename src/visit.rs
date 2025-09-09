@@ -475,9 +475,12 @@ impl<'a> FuncAt<'a, EntityListIter<Node>> {
 // requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
 impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let NodeDef { attrs, kind, outputs } = self.def();
+        let NodeDef { attrs, inputs, kind, outputs } = self.def();
 
         visitor.visit_attr_set_use(*attrs);
+        for v in inputs {
+            visitor.visit_value_use(v);
+        }
         match kind {
             NodeKind::Block { insts } => {
                 for func_at_inst in self.at(*insts) {
@@ -486,26 +489,17 @@ impl<'a> FuncAt<'a, Node> {
             }
             NodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                scrutinee,
                 cases,
             } => {
-                visitor.visit_value_use(scrutinee);
                 for &case in cases {
                     visitor.visit_region_def(self.at(case));
                 }
             }
-            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
-                for v in initial_inputs {
-                    visitor.visit_value_use(v);
-                }
+            NodeKind::Loop { body, repeat_condition } => {
                 visitor.visit_region_def(self.at(*body));
                 visitor.visit_value_use(repeat_condition);
             }
-            NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs } => {
-                for v in inputs {
-                    visitor.visit_value_use(v);
-                }
-            }
+            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_)) => {}
         }
         for output in outputs {
             output.inner_visit_with(visitor);

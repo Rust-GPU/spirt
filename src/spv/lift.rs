@@ -575,11 +575,12 @@ impl<'a> FuncLifting<'a> {
                 CfgPoint::RegionExit(_) => SmallVec::new(),
 
                 CfgPoint::NodeEntry(node) => {
-                    match &func_def_body.at(node).def().kind {
+                    let node_def = func_def_body.at(node).def();
+                    match &node_def.kind {
                         // The backedge of a SPIR-V structured loop points to
                         // the "loop header", i.e. the `Entry` of the `Loop`,
                         // so that's where `body` `inputs` phis have to go.
-                        NodeKind::Loop { initial_inputs, body, .. } => {
+                        NodeKind::Loop { body, .. } => {
                             let loop_body_def = func_def_body.at(*body).def();
                             let loop_body_inputs = &loop_body_def.inputs;
 
@@ -598,7 +599,7 @@ impl<'a> FuncLifting<'a> {
 
                                         result_id: alloc_id()?,
                                         cases: FxIndexMap::default(),
-                                        default_value: Some(initial_inputs[i]),
+                                        default_value: Some(node_def.inputs[i]),
                                     })
                                 })
                                 .collect::<Result<_, _>>()?
@@ -687,12 +688,12 @@ impl<'a> FuncLifting<'a> {
                             unreachable!()
                         }
 
-                        NodeKind::Select { kind, scrutinee, cases } => Terminator {
+                        NodeKind::Select { kind, cases } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cf::unstructured::ControlInstKind::SelectBranch(
                                 kind.clone(),
                             )),
-                            inputs: [*scrutinee].into_iter().collect(),
+                            inputs: [node_def.inputs[0]].into_iter().collect(),
                             targets: cases
                                 .iter()
                                 .map(|&case| CfgPoint::RegionEntry(case))
@@ -701,7 +702,7 @@ impl<'a> FuncLifting<'a> {
                             merge: Some(Merge::Selection(CfgPoint::NodeExit(node))),
                         },
 
-                        NodeKind::Loop { initial_inputs: _, body, repeat_condition: _ } => {
+                        NodeKind::Loop { body, repeat_condition: _ } => {
                             Terminator {
                                 attrs: AttrSet::default(),
                                 kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
@@ -722,12 +723,12 @@ impl<'a> FuncLifting<'a> {
                             }
                         }
 
-                        NodeKind::ExitInvocation { kind, inputs } => Terminator {
+                        NodeKind::ExitInvocation(kind) => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cf::unstructured::ControlInstKind::ExitInvocation(
                                 kind.clone(),
                             )),
-                            inputs: inputs.clone(),
+                            inputs: node_def.inputs.clone(),
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
                             merge: None,
@@ -763,7 +764,7 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
+                        NodeKind::Loop { body: _, repeat_condition } => {
                             let backedge = CfgPoint::NodeEntry(parent_node);
                             let target_phi_values = region_outputs
                                 .map(|outputs| (backedge, outputs))

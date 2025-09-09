@@ -855,6 +855,9 @@ pub use context::Node;
 pub struct NodeDef {
     pub attrs: AttrSet,
 
+    // FIXME(eddyb) change the inline size of this to fit most nodes.
+    pub inputs: SmallVec<[Value; 2]>,
+
     pub kind: NodeKind,
 
     /// Outputs from this [`Node`]:
@@ -885,16 +888,16 @@ pub enum NodeKind {
     },
 
     /// Choose one [`Region`] out of `cases` to execute, based on a single
-    /// value input (`scrutinee`) interpreted according to [`SelectionKind`].
+    /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: cf::SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
+    Select { kind: cf::SelectionKind, cases: SmallVec<[Region; 2]> },
 
     /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
     ///
-    /// To represent "loop state", `body` can take `inputs`, getting values from:
-    /// * on the first iteration: `initial_inputs`
+    /// To represent "loop state", `body` can take inputs, getting values from:
+    /// * on the first iteration: initial `inputs` (from `NodeDef`)
     /// * on later iterations: `body`'s own `outputs` (from the last iteration)
     ///
     /// As the condition is checked only *after* the body, this type of loop is
@@ -903,8 +906,6 @@ pub enum NodeKind {
     ///
     /// This corresponds to "theta" (`θ`) nodes in (R)VSDG.
     Loop {
-        initial_inputs: SmallVec<[Value; 2]>,
-
         body: Region,
 
         // FIXME(eddyb) should this be kept in `body.outputs`? (that would not
@@ -917,13 +918,7 @@ pub enum NodeKind {
     /// indicating a fatal error as well.
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
-    ExitInvocation {
-        kind: cf::ExitInvocationKind,
-
-        // FIXME(eddyb) centralize `Value` inputs across `Node`s,
-        // and only use stricter types for building/traversing the IR.
-        inputs: SmallVec<[Value; 2]>,
-    },
+    ExitInvocation(cf::ExitInvocationKind),
 }
 
 /// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
