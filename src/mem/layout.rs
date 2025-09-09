@@ -65,10 +65,11 @@ impl LayoutConfig {
         Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT_LE };
 }
 
-pub(crate) struct LayoutError(pub(crate) Diag);
+pub struct LayoutError(pub(crate) Diag);
 
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
 #[derive(Clone)]
-pub(crate) enum TypeLayout {
+pub enum TypeLayout {
     Handle(HandleLayout),
     HandleArray(HandleLayout, Option<NonZeroU32>),
 
@@ -79,14 +80,15 @@ pub(crate) enum TypeLayout {
 // NOTE(eddyb) `Handle` is parameterized over the `Buffer` layout.
 pub(crate) type HandleLayout = shapes::Handle<Rc<MemTypeLayout>>;
 
-pub(crate) struct MemTypeLayout {
-    pub(crate) original_type: Type,
-    pub(crate) mem_layout: shapes::MaybeDynMemLayout,
-    pub(crate) components: Components,
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
+pub struct MemTypeLayout {
+    pub original_type: Type,
+    pub mem_layout: shapes::MaybeDynMemLayout,
+    pub components: Components,
 }
 
 // FIXME(eddyb) use proper newtypes for byte sizes.
-pub(crate) enum Components {
+pub enum Components {
     Scalar,
 
     /// Vector and array elements (all of them having the same `elem` layout).
@@ -115,7 +117,9 @@ impl MemTypeLayout {
     /// `Err` may be returned in some cases (e.g. offset overflows, dynamic arrays),
     /// in which case the sequence of leaves `each_leaf` produced can be considered
     /// incomplete and shouldn't be used.
-    pub(crate) fn deeply_flatten_if(
+    //
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn deeply_flatten_if(
         &self,
         base_offset: i32,
         recurse_into: &impl Fn(&Self) -> bool,
@@ -284,17 +288,20 @@ impl Components {
 }
 
 /// Context for computing `TypeLayout`s from `Type`s (with caching).
-pub(crate) struct LayoutCache<'a> {
+//
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
+pub struct LayoutCache<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
 
-    pub(crate) config: &'a LayoutConfig,
+    pub config: &'a LayoutConfig,
 
     cache: RefCell<FxIndexMap<Type, TypeLayout>>,
 }
 
 impl<'a> LayoutCache<'a> {
-    pub(crate) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
         Self { cx, wk: &spv::spec::Spec::get().well_known, config, cache: Default::default() }
     }
 
@@ -305,7 +312,9 @@ impl<'a> LayoutCache<'a> {
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
-    pub(crate) fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
+    //
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
         if let Some(cached) = self.cache.borrow().get(&ty).cloned() {
             return Ok(cached);
         }
