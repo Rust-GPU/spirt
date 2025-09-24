@@ -620,23 +620,6 @@ impl Spec {
 
     /// Implementation detail of [`Spec::get`], indexes the raw data to produce a [`Spec`].
     fn from_raw(raw_core_grammar: raw::CoreGrammar<'static>) -> Self {
-        /// Helper for picking a name when the same index has multiple names.
-        fn preferred_name_between_dups<'a>(a: &'a str, b: &'a str) -> &'a str {
-            // Prefer standard / Khronos extensions over vendor extensions.
-            let is_khr_and_vnd = |khr: &str, vnd: &str| {
-                let base = khr.trim_end_matches("KHR");
-                vnd.starts_with(base) && vnd.len() > base.len()
-            };
-            if is_khr_and_vnd(a, b) {
-                a
-            } else if is_khr_and_vnd(b, a) {
-                b
-            } else {
-                // Worst case, use the first in alphabetical order.
-                a.min(b)
-            }
-        }
-
         // HACK(eddyb) ad-hoc interning, to reduce the cost of tracking operand names
         // down to a single extra byte per operand (see `PackedOperandNameAndKind`).
         let mut operand_names = FxIndexSet::default();
@@ -702,12 +685,7 @@ impl Spec {
                             if e.value == 0 {
                                 assert!(e.parameters.is_empty());
 
-                                empty_name = Some(match empty_name {
-                                    None => new_name,
-                                    Some(prev_name) => {
-                                        preferred_name_between_dups(prev_name, new_name)
-                                    }
-                                });
+                                assert!(empty_name.replace(new_name).is_none());
 
                                 continue;
                             }
@@ -721,27 +699,8 @@ impl Spec {
                             if i >= bits.len() {
                                 bits.resize_with(i + 1, || None);
                             }
-                            let slot = &mut bits[i];
 
-                            *slot = Some(match slot.take() {
-                                None => (new_name, new_enumerant),
-                                Some((prev_name, prev_enumerant)) => {
-                                    // Only allow aliases that do not meaningfully differ.
-                                    assert!(
-                                        prev_enumerant == new_enumerant,
-                                        "{} bits {} and {} share a bit index \
-                                         but differ in definition",
-                                        o.kind,
-                                        prev_name,
-                                        new_name,
-                                    );
-
-                                    (
-                                        preferred_name_between_dups(prev_name, new_name),
-                                        new_enumerant,
-                                    )
-                                }
-                            });
+                            assert!(bits[i].replace((new_name, new_enumerant)).is_none());
                         }
 
                         // FIXME(eddyb) automate this in `indexed::NamedIdxMap`.
@@ -765,19 +724,6 @@ impl Spec {
                             enumerants.iter().map(|e| {
                                 (e.value.try_into().unwrap(), (e.enumerant, enumerant_from_raw(e)))
                             }),
-                            // `merge_duplicates` closure:
-                            |(prev_name, prev_enumerant), (new_name, new_enumerant)| {
-                                // Only allow aliases that do not meaningfully differ.
-                                assert!(
-                                    prev_enumerant == new_enumerant,
-                                    "{} variants {} and {} share a value but differ in definition",
-                                    o.kind,
-                                    prev_name,
-                                    new_name,
-                                );
-
-                                (preferred_name_between_dups(prev_name, new_name), new_enumerant)
-                            },
                         );
 
                         // FIXME(eddyb) automate this in `indexed::NamedIdxMap`.
@@ -986,16 +932,6 @@ impl Spec {
 
                 (inst.opcode, (inst.opname, def))
             }),
-            // `merge_duplicates` closure:
-            |(prev_name, prev_def), (new_name, new_def)| {
-                // Only allow aliases that do not meaningfully differ.
-                assert!(
-                    prev_def == new_def,
-                    "instructions {prev_name} and {new_name} share an opcode but differ in definition",
-                );
-
-                (preferred_name_between_dups(prev_name, new_name), new_def)
-            },
         );
 
         // FIXME(eddyb) automate this in `indexed::NamedIdxMap`.
@@ -1105,6 +1041,16 @@ pub mod raw {
         #[serde(default)]
         pub operands: Vec<Operand<'a>>,
 
+        // FIXME(eddyb) the fields below this point are common between this and
+        // `OperandKindEnumerant` (almost as if "Opcode" were an operand kind),
+        // even `(opname, opcode, operands)` fits `(enumerant, value, parameters)`
+        // (except those field names differ), but can't be deduplicated due to
+        // `#[serde(flatten)]` not supporting `#[serde(deny_unknown_fields)]`.
+        #[serde(default)]
+        pub aliases: SmallVec<[&'a str; 1]>,
+
+        // FIXME(eddyb) expose this information in some efficient form, so that
+        // it may be used in e.g. validation.
         #[serde(default)]
         pub extensions: SmallVec<[&'a str; 1]>,
         #[serde(default)]
@@ -1112,6 +1058,8 @@ pub mod raw {
         // HACK(eddyb) some `extinst.*.json` use this form.
         pub capability: Option<&'a str>,
 
+        #[serde(default)]
+        pub provisional: bool,
         pub version: Option<&'a str>,
         #[serde(rename = "lastVersion")]
         pub last_version: Option<&'a str>,
@@ -1168,11 +1116,23 @@ pub mod raw {
         #[serde(default)]
         pub parameters: Vec<Operand<'a>>,
 
+        // FIXME(eddyb) the fields below this point are common between this and
+        // `Instruction` (almost as if "Opcode" were an operand kind),
+        // even `(opname, opcode, operands)` fits `(enumerant, value, parameters)`
+        // (except those field names differ), but can't be deduplicated due to
+        // `#[serde(flatten)]` not supporting `#[serde(deny_unknown_fields)]`.
+        #[serde(default)]
+        pub aliases: SmallVec<[&'a str; 1]>,
+
+        // FIXME(eddyb) expose this information in some efficient form, so that
+        // it may be used in e.g. validation.
         #[serde(default)]
         pub extensions: SmallVec<[&'a str; 1]>,
         #[serde(default)]
         pub capabilities: SmallVec<[&'a str; 1]>,
 
+        #[serde(default)]
+        pub provisional: bool,
         pub version: Option<&'a str>,
         #[serde(rename = "lastVersion")]
         pub last_version: Option<&'a str>,
@@ -1340,10 +1300,7 @@ pub mod indexed {
         }
 
         /// Add a new value, with an index greater than all previous indices.
-        ///
-        /// An exception is made for duplicates, which have to be handled by the
-        /// `merge_duplicates` closure, instead of being outright disallowed.
-        fn insert_in_order(&mut self, idx: u16, value: T, merge_duplicates: impl Fn(T, T) -> T) {
+        fn insert_in_order(&mut self, idx: u16, value: T) {
             let last_idx_plus_one = self.block_starts.len().checked_sub(1).map_or(
                 self.flattened.len(),
                 |last_block_idx| {
@@ -1351,14 +1308,12 @@ pub mod indexed {
                         + (self.flattened.len() - usize::from(self.block_starts[last_block_idx]))
                 },
             );
-            if let Some(last_idx) = last_idx_plus_one.checked_sub(1) {
-                // HACK(eddyb) the condition being `<` instead of `<=` allows
-                // for special handling of duplicates (via `merge_duplicates`).
-                if usize::from(idx) < last_idx {
-                    panic!(
-                        "KhrSegmentedVec::insert_in_order: out of order indices ({idx} after {last_idx})",
-                    );
-                }
+            if let Some(last_idx) = last_idx_plus_one.checked_sub(1)
+                && usize::from(idx) <= last_idx
+            {
+                panic!(
+                    "KhrSegmentedVec::insert_in_order: out of order indices ({idx} after {last_idx})",
+                );
             }
 
             // Reserve new blocks if needed (so `idx_to_segmented` can't fail).
@@ -1380,22 +1335,11 @@ pub mod indexed {
             if needed_slots > self.flattened.len() {
                 self.flattened.resize_with(needed_slots, || None);
             }
-            let slot = &mut self.flattened[slot_idx];
-            if let Some(prev) = slot.take() {
-                *slot = Some(merge_duplicates(prev, value));
-            } else {
-                *slot = Some(value);
-            }
+            assert!(self.flattened[slot_idx].replace(value).is_none());
         }
 
         /// Construct a [`KhrSegmentedVec`] out of an iterator with ordered indices.
-        ///
-        /// An exception is made for duplicates, which have to be handled by the
-        /// `merge_duplicates` closure, instead of being outright disallowed.
-        pub fn from_in_order_iter(
-            it: impl IntoIterator<Item = (u16, T)>,
-            merge_duplicates: impl Fn(T, T) -> T,
-        ) -> Self {
+        pub fn from_in_order_iter(it: impl IntoIterator<Item = (u16, T)>) -> Self {
             let iter = it.into_iter();
 
             let mut this = Self {
@@ -1408,7 +1352,7 @@ pub mod indexed {
             for (idx, value) in iter {
                 // FIXME(eddyb) the check at the start of `insert_in_order` may
                 // be less efficient than if we checked the ordering here instead.
-                this.insert_in_order(idx, value, &merge_duplicates);
+                this.insert_in_order(idx, value);
             }
 
             this
