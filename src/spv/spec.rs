@@ -268,7 +268,7 @@ pub struct InstructionDef {
     pub has_result_id: bool,
 
     pub req_operands: ArrayVec<PackedOperandNameAndKind, 14>,
-    pub opt_operands: ArrayVec<PackedOperandNameAndKind, 2>,
+    pub opt_operands: ArrayVec<PackedOperandNameAndKind, 3>,
     pub rest_operands: Option<RestOperandsUnit>,
 }
 
