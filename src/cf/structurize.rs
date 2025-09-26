@@ -4,7 +4,7 @@
 
 use crate::cf::SelectionKind;
 use crate::cf::unstructured::{
-    ControlFlowGraph, ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder, TraversalState,
+    ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder, TraversalState,
 };
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
@@ -54,6 +54,8 @@ pub struct Structurizer<'a> {
 
     /// Scrutinee value for [`SelectionKind::BoolCond`], for the "else" case.
     const_false: Const,
+
+    func_ret_types: &'a [Type],
 
     func_def_body: &'a mut FuncDefBody,
 
@@ -546,7 +548,12 @@ struct ClaimedRegion {
 }
 
 impl<'a> Structurizer<'a> {
-    pub fn new(cx: &'a Context, func_def_body: &'a mut FuncDefBody) -> Self {
+    pub fn new(cx: &'a Context, func_decl: &'a mut crate::FuncDecl) -> Self {
+        // TODO(eddyb) find a way to change this so it doesn't need to panic.
+        let crate::DeclDef::Present(func_def_body) = &mut func_decl.def else {
+            unreachable!();
+        };
+
         // FIXME(eddyb) SPIR-T should have native booleans itself.
         let wk = &spv::spec::Spec::get().well_known;
         let type_bool = cx.intern(TypeKind::SpvInst {
@@ -614,6 +621,13 @@ impl<'a> Structurizer<'a> {
             const_true,
             const_false,
 
+            func_ret_types: {
+                let is_void = match &cx[func_decl.ret_type].kind {
+                    TypeKind::SpvInst { spv_inst, .. } => spv_inst.opcode == wk.OpTypeVoid,
+                    _ => false,
+                };
+                if is_void { &[][..] } else { std::slice::from_ref(&func_decl.ret_type) }
+            },
             func_def_body,
 
             loop_header_to_exit_targets,
@@ -661,30 +675,16 @@ impl<'a> Structurizer<'a> {
         };
 
         match func_body_deferred_edges {
-            // FIXME(eddyb) also support structured return when the whole body
-            // is divergent, by generating undef constants (needs access to the
-            // whole `FuncDecl`, not just `FuncDefBody`, to get the right types).
+            // FIXME(eddyb) is there a way to do this without returning `undef`s?
             DeferredEdgeBundleSet::Unreachable => {
-                // HACK(eddyb) replace the CFG with one that only contains an
-                // `Unreachable` terminator for the body, comparable to what
-                // `rebuild_cfg_from_unclaimed_region_deferred_edges` would do
-                // in the general case (but special-cased because this is very
-                // close to being structurizable, just needs a bit of plumbing).
-                let mut control_inst_on_exit_from = EntityOrientedDenseMap::new();
-                control_inst_on_exit_from.insert(
-                    self.func_def_body.body,
-                    ControlInst {
-                        attrs: AttrSet::default(),
-                        kind: ControlInstKind::Unreachable,
-                        inputs: [].into_iter().collect(),
-                        targets: [].into_iter().collect(),
-                        target_inputs: FxIndexMap::default(),
-                    },
-                );
-                self.func_def_body.unstructured_cfg = Some(ControlFlowGraph {
-                    control_inst_on_exit_from,
-                    loop_merge_to_loop_header: Default::default(),
-                });
+                let undef_outputs = self
+                    .func_ret_types
+                    .iter()
+                    .map(|&ty| Value::Const(self.const_undef(ty)))
+                    .collect();
+                let body_def = self.func_def_body.at_mut_body().def();
+                body_def.outputs = undef_outputs;
+                self.func_def_body.unstructured_cfg = None;
             }
 
             // Structured return, the function is fully structurized.
