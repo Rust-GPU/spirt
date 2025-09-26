@@ -21,8 +21,9 @@ pub fn structurize_func_cfgs(module: &mut Module) {
     }
 
     for &func in &collector.seen_funcs {
-        if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
-            cf::structurize::Structurizer::new(cx, func_def_body).structurize_func();
+        let func_decl = &mut module.funcs[func];
+        if let DeclDef::Present(_) = func_decl.def {
+            cf::structurize::Structurizer::new(cx, func_decl).structurize_func();
         }
     }
 }
