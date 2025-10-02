@@ -561,9 +561,9 @@ impl<'a> Visitor<'a> for Plan<'a> {
 
     fn visit_const_def(&mut self, ct_def: &'a ConstDef) {
         // HACK(eddyb) the type of a `PtrToGlobalVar` is never printed, skip it.
-        if let ConstKind::PtrToGlobalVar(gv) = ct_def.kind {
+        if let ConstKind::PtrToGlobalVar { global_var, offset: _ } = ct_def.kind {
             self.visit_attr_set_use(ct_def.attrs);
-            self.visit_global_var_use(gv);
+            self.visit_global_var_use(global_var);
         } else {
             ct_def.inner_visit_with(self);
         }
@@ -3202,8 +3202,18 @@ impl Print for ConstDef {
                 ty.print(printer),
                 pretty::join_comma_sep("(", ct.elems().map(|elem| print_scalar(elem, false)), ")"),
             ]),
-            &ConstKind::PtrToGlobalVar(gv) => {
-                pretty::Fragment::new(["&".into(), gv.print(printer)])
+            &ConstKind::PtrToGlobalVar { global_var, offset } => {
+                let ptr = pretty::Fragment::new(["&".into(), global_var.print(printer)]);
+                match offset {
+                    Some(offset) => pretty::Fragment::new([
+                        "(".into(),
+                        ptr,
+                        " + ".into(),
+                        printer.numeric_literal_style().apply(offset.to_string()).into(),
+                        ")".into(),
+                    ]),
+                    None => ptr,
+                }
             }
             &ConstKind::PtrToFunc(func) => pretty::Fragment::new(["&".into(), func.print(printer)]),
 
@@ -4098,7 +4108,7 @@ impl FuncAt<'_, DataInst> {
                         match &printer.cx[ct].kind {
                             ConstKind::Undef
                             | ConstKind::Vector(_)
-                            | ConstKind::PtrToGlobalVar(_)
+                            | ConstKind::PtrToGlobalVar { .. }
                             | ConstKind::PtrToFunc(_)
                             | ConstKind::SpvInst { .. } => {}
 

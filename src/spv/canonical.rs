@@ -416,7 +416,7 @@ impl spv::Inst {
                 ct.elems().map(|elem| cx.intern(elem)).collect(),
             )),
 
-            ConstKind::PtrToGlobalVar(_)
+            ConstKind::PtrToGlobalVar { .. }
             | ConstKind::PtrToFunc(_)
             | ConstKind::SpvInst { .. }
             | ConstKind::SpvStringLiteralForExtInst(_) => None,

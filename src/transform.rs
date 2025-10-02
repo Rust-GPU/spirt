@@ -480,9 +480,9 @@ impl InnerTransform for ConstDef {
                 | ConstKind::Vector(_)
                 | ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged,
 
-                ConstKind::PtrToGlobalVar(gv) => transform!({
-                    gv -> transformer.transform_global_var_use(*gv),
-                } => ConstKind::PtrToGlobalVar(gv)),
+                ConstKind::PtrToGlobalVar { global_var, offset } => transform!({
+                    global_var -> transformer.transform_global_var_use(*global_var),
+                } => ConstKind::PtrToGlobalVar { global_var, offset: *offset }),
 
                 ConstKind::PtrToFunc(func) => transform!({
                     func -> transformer.transform_func_use(*func),

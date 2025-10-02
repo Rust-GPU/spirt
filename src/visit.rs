@@ -351,7 +351,9 @@ impl InnerVisit for ConstDef {
             | ConstKind::Vector(_)
             | ConstKind::SpvStringLiteralForExtInst(_) => {}
 
-            &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
+            &ConstKind::PtrToGlobalVar { global_var, offset: _ } => {
+                visitor.visit_global_var_use(global_var);
+            }
             &ConstKind::PtrToFunc(func) => visitor.visit_func_use(func),
             ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                 let (_spv_inst, const_inputs) = &**spv_inst_and_const_inputs;

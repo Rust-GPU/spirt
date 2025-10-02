@@ -1066,10 +1066,22 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
     fn transform_const_use(&mut self, ct: Const) -> Transformed<Const> {
         // FIXME(eddyb) maybe cache this remap (in `LiftToSpvPtrs`, globally).
         let ct_def = &self.lifter.cx[ct];
-        if let ConstKind::PtrToGlobalVar(gv) = ct_def.kind {
+        if let ConstKind::PtrToGlobalVar { global_var, offset } = ct_def.kind {
+            let mut attrs = ct_def.attrs;
+            let mut ty = ct_def.ty;
+
+            // TODO(eddyb) implement.
+            if let Some(offset) = offset {
+                attrs.push_diag(
+                    &self.lifter.cx,
+                    Diag::bug([format!("NYI: global var immediate offset ({offset})").into()]),
+                );
+            } else {
+                ty = self.global_vars[global_var].type_of_ptr_to;
+            }
             Transformed::Changed(self.lifter.cx.intern(ConstDef {
-                attrs: ct_def.attrs,
-                ty: self.global_vars[gv].type_of_ptr_to,
+                attrs,
+                ty,
                 kind: ct_def.kind.clone(),
             }))
         } else {

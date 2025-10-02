@@ -897,11 +897,53 @@ impl<'a> GatherAccesses<'a> {
             let per_output_accesses = node_to_per_output_accesses.remove(&node).unwrap_or_default();
 
             let node_def = func_def_body.at(node).def();
-            let mut generate_accesses = |this: &mut Self, ptr: Value, new_accesses| {
+            let offset_accesses = |accesses, offset: u32| {
+                let happ = match accesses {
+                    MemAccesses::Handles(_) => {
+                        return Err(AnalysisError(Diag::bug([format!(
+                            "Offset({offset}): cannot offset in handle memory"
+                        )
+                        .into()])));
+                    }
+                    MemAccesses::Data(happ) => happ,
+                };
+
+                // FIXME(eddyb) these should be normalized
+                // (e.g. constant-folded) out of existence,
+                // but while they exist, they should be noops.
+                if offset == 0 {
+                    return Ok(MemAccesses::Data(happ));
+                }
+
+                Ok(MemAccesses::Data(DataHapp {
+                    max_size: happ
+                        .max_size
+                        .map(|max_size| {
+                            offset.checked_add(max_size).ok_or_else(|| {
+                                AnalysisError(Diag::bug([format!(
+                                    "Offset({offset}): size overflow ({offset}+{max_size})"
+                                )
+                                .into()]))
+                            })
+                        })
+                        .transpose()?,
+                    // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
+                    // to represent the one-element case, seems
+                    // quite wasteful when it's likely consumed.
+                    kind: DataHappKind::Disjoint(Rc::new([(offset, happ)].into())),
+                }))
+            };
+            let mut generate_accesses = |this: &mut Self, ptr: Value, mut new_accesses| {
                 let slot = match ptr {
                     Value::Const(ct) => match cx[ct].kind {
-                        ConstKind::PtrToGlobalVar(gv) => {
-                            this.global_var_accesses.entry(gv).or_default()
+                        ConstKind::PtrToGlobalVar { global_var, offset } => {
+                            if let Some(offset) = offset
+                                && let Ok(accesses) = new_accesses
+                            {
+                                new_accesses = offset_accesses(accesses, offset.get());
+                            }
+
+                            this.global_var_accesses.entry(global_var).or_default()
                         }
                         // FIXME(eddyb) attach on the `Const` by replacing
                         // it with a copy that also has an extra attribute,
@@ -1099,51 +1141,21 @@ impl<'a> GatherAccesses<'a> {
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
-                        output_accesses.unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD))).and_then(
-                            |accesses| {
-                                let happ = match accesses {
-                                    MemAccesses::Handles(_) => {
-                                        return Err(AnalysisError(Diag::bug([format!(
-                                            "Offset({offset}): cannot offset in handle memory"
-                                        )
-                                        .into()])));
-                                    }
-                                    MemAccesses::Data(happ) => happ,
-                                };
-                                let offset = u32::try_from(offset).ok().ok_or_else(|| {
-                                    AnalysisError(Diag::bug([format!(
-                                        "Offset({offset}): negative offset"
-                                    )
-                                    .into()]))
-                                })?;
-
-                                // FIXME(eddyb) these should be normalized
-                                // (e.g. constant-folded) out of existence,
-                                // but while they exist, they should be noops.
-                                if offset == 0 {
-                                    return Ok(MemAccesses::Data(happ));
-                                }
-
-                                Ok(MemAccesses::Data(DataHapp {
-                                    max_size: happ
-                                        .max_size
-                                        .map(|max_size| {
-                                            offset.checked_add(max_size).ok_or_else(|| {
-                                                AnalysisError(Diag::bug([format!(
-                                                    "Offset({offset}): size overflow \
-                                                     ({offset}+{max_size})"
-                                                )
-                                                .into()]))
-                                            })
-                                        })
-                                        .transpose()?,
-                                    // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
-                                    // to represent the one-element case, seems
-                                    // quite wasteful when it's likely consumed.
-                                    kind: DataHappKind::Disjoint(Rc::new([(offset, happ)].into())),
-                                }))
-                            },
-                        ),
+                        u32::try_from(offset)
+                            .ok()
+                            .ok_or_else(|| {
+                                AnalysisError(Diag::bug([format!(
+                                    "Offset({offset}): negative offset"
+                                )
+                                .into()]))
+                            })
+                            .and_then(|offset| {
+                                offset_accesses(
+                                    output_accesses
+                                        .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))?,
+                                    offset,
+                                )
+                            }),
                     );
                 }
                 DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {

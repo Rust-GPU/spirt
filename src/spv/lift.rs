@@ -184,7 +184,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             ConstKind::Undef
             | ConstKind::Scalar(_)
             | ConstKind::Vector(_)
-            | ConstKind::PtrToGlobalVar(_)
+            | ConstKind::PtrToGlobalVar { .. }
             | ConstKind::PtrToFunc(_)
             | ConstKind::SpvInst { .. } => {
                 self.visit_const_def(ct_def);
@@ -1296,8 +1296,8 @@ impl LazyInst<'_, '_> {
                     Global::Const(ct) => {
                         let ct_def = &cx[ct];
                         match ct_def.kind {
-                            ConstKind::PtrToGlobalVar(gv) => {
-                                let gv_decl = &module.global_vars[gv];
+                            ConstKind::PtrToGlobalVar { global_var, offset: _ } => {
+                                let gv_decl = &module.global_vars[global_var];
                                 let import = match gv_decl.def {
                                     DeclDef::Imported(import) => Some(import),
                                     DeclDef::Present(_) => None,
@@ -1451,10 +1451,15 @@ impl LazyInst<'_, '_> {
                             unreachable!("should've been handled as canonical")
                         }
 
-                        Err(&ConstKind::PtrToGlobalVar(gv)) => {
+                        Err(&ConstKind::PtrToGlobalVar { global_var, offset }) => {
+                            assert_eq!(
+                                offset, None,
+                                "immediate offsets should be legalized away before lifting"
+                            );
+
                             assert!(ct_def.attrs == AttrSet::default());
 
-                            let gv_decl = &module.global_vars[gv];
+                            let gv_decl = &module.global_vars[global_var];
 
                             assert!(ct_def.ty == gv_decl.type_of_ptr_to);
 
@@ -1715,7 +1720,7 @@ impl Module {
             let ptr_to_global_var = cx.intern(ConstDef {
                 attrs: AttrSet::default(),
                 ty: type_of_ptr_to_global_var,
-                kind: ConstKind::PtrToGlobalVar(gv),
+                kind: ConstKind::PtrToGlobalVar { global_var: gv, offset: None },
             });
             Global::Const(ptr_to_global_var)
         };
