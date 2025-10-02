@@ -225,7 +225,7 @@ impl Transformer for EraseSpvPtrs<'_> {
     fn transform_const_use(&mut self, ct: Const) -> Transformed<Const> {
         // FIXME(eddyb) maybe cache this remap (in `LowerFromSpvPtrs`, globally).
         let ct_def = &self.lowerer.cx[ct];
-        if let ConstKind::PtrToGlobalVar(_) = ct_def.kind {
+        if let ConstKind::PtrToGlobalVar { .. } = ct_def.kind {
             Transformed::Changed(self.lowerer.cx.intern(ConstDef {
                 attrs: ct_def.attrs,
                 ty: self.lowerer.qptr_type(),
