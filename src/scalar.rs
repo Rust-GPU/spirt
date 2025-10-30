@@ -2,6 +2,9 @@
 //!
 //! **Note**: pointers are never scalars (like SPIR-V, but unlike other IRs).
 
+use arrayvec::ArrayVec;
+use itertools::Itertools;
+
 // HACK(eddyb) this could be some `struct` with private fields, but this `enum`
 // is only 2 bytes in size, and has better ergonomics overall.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -20,6 +23,7 @@ impl Type {
     // HACK(eddyb) only common widths, as a convenience, expand as-needed.
     pub const S32: Type = Type::SInt(IntWidth::I32);
     pub const U32: Type = Type::UInt(IntWidth::I32);
+    pub const F16: Type = Type::Float(FloatWidth::F16);
     pub const F32: Type = Type::Float(FloatWidth::F32);
     pub const F64: Type = Type::Float(FloatWidth::F64);
 
@@ -81,6 +85,7 @@ impl IntWidth {
 pub struct FloatWidth(IntWidth);
 
 impl FloatWidth {
+    pub const F16: Self = Self::try_from_bits_unwrap(16);
     pub const F32: Self = Self::try_from_bits_unwrap(32);
     pub const F64: Self = Self::try_from_bits_unwrap(64);
 
@@ -163,6 +168,11 @@ impl Const {
 
     pub const fn bits(&self) -> u128 {
         self.bits
+    }
+
+    // FIXME(eddyb) make this public?
+    fn try_bit_cast_to(&self, ty: Type) -> Option<Const> {
+        (self.ty.bit_width() == ty.bit_width()).then_some(Const { ty, ..*self })
     }
 
     /// Returns `Some(v)` iff `self` is `{S,U}Int` and representable by `v: i128`
@@ -329,6 +339,21 @@ pub enum FloatCmp {
     Ge,
 }
 
+pub enum EvalError {
+    // FIXME(eddyb) provide more detail.
+    OpSignatureMismatch,
+
+    UnsupportedFloatWidth(FloatWidth),
+
+    // FIXME(eddyb) is there a better name for this?
+    FloatException,
+
+    // FIXME(eddyb) not exactly an error, and can be replaced with `undef`.
+    PoisonOutput,
+
+    UndefinedBehavior { cause: &'static str },
+}
+
 impl Op {
     pub fn output_count(self) -> usize {
         match self {
@@ -349,12 +374,44 @@ impl Op {
             Op::FloatBinary(op) => op.name(),
         }
     }
+
+    pub fn try_eval(
+        self,
+        inputs: &[Const],
+        output_types: &[Type],
+    ) -> Result<ArrayVec<Const, 2>, EvalError> {
+        let single_output = match (self, inputs, output_types) {
+            (Op::BoolUnary(op), &[Const { ty: Type::Bool, bits: x @ (0..=1) }], &[Type::Bool]) => {
+                Const::from_bool(op.eval(x != 0))
+            }
+            (
+                Op::BoolBinary(op),
+                &[
+                    Const { ty: Type::Bool, bits: a @ (0..=1) },
+                    Const { ty: Type::Bool, bits: b @ (0..=1) },
+                ],
+                &[Type::Bool],
+            ) => Const::from_bool(op.eval(a != 0, b != 0)),
+            (Op::IntUnary(op), &[x], &[output_type]) => op.try_eval(x, output_type)?,
+            (Op::IntBinary(op), &[a, b], _) => return op.try_eval(a, b, output_types),
+            (Op::FloatUnary(op), &[x], &[output_type]) => op.try_eval(x, output_type)?,
+            (Op::FloatBinary(op), &[a, b], &[output_type]) => op.try_eval(a, b, output_type)?,
+            _ => return Err(EvalError::OpSignatureMismatch),
+        };
+        Ok([single_output].into_iter().collect())
+    }
 }
 
 impl BoolUnOp {
     pub fn name(self) -> &'static str {
         match self {
             BoolUnOp::Not => "bool.not",
+        }
+    }
+
+    pub fn eval(self, x: bool) -> bool {
+        match self {
+            BoolUnOp::Not => !x,
         }
     }
 }
@@ -366,6 +423,15 @@ impl BoolBinOp {
             BoolBinOp::Ne => "bool.ne",
             BoolBinOp::Or => "bool.or",
             BoolBinOp::And => "bool.and",
+        }
+    }
+
+    pub fn eval(self, a: bool, b: bool) -> bool {
+        match self {
+            BoolBinOp::Eq => a == b,
+            BoolBinOp::Ne => a != b,
+            BoolBinOp::Or => a | b,
+            BoolBinOp::And => a & b,
         }
     }
 }
@@ -380,6 +446,37 @@ impl IntUnOp {
             IntUnOp::TruncOrZeroExtend => "u.trunc_or_zext",
             IntUnOp::TruncOrSignExtend => "s.trunc_or_sext",
         }
+    }
+
+    pub fn try_eval(self, x: Const, output_type: Type) -> Result<Const, EvalError> {
+        // FIXME(eddyb) try to dedup these helpers with `IntBinOp`.
+        let int_width = |ty| match ty {
+            Type::UInt(w) | Type::SInt(w) => Ok(w),
+            _ => Err(EvalError::OpSignatureMismatch),
+        };
+        let output_width = int_width(output_type)?;
+
+        let x_width = int_width(x.ty())?;
+        let (x, x_s) =
+            (x.bits(), x.try_bit_cast_to(Type::SInt(x_width)).unwrap().int_as_i128().unwrap());
+
+        let valid_widths = output_width == x_width
+            || matches!(
+                self,
+                IntUnOp::CountOnes | IntUnOp::TruncOrZeroExtend | IntUnOp::TruncOrSignExtend
+            );
+        if !valid_widths {
+            return Err(EvalError::OpSignatureMismatch);
+        }
+
+        let output_bits = match self {
+            IntUnOp::Neg => x_s.wrapping_neg() as u128,
+            IntUnOp::Not => !x,
+            IntUnOp::CountOnes => x.count_ones().into(),
+            IntUnOp::TruncOrZeroExtend => x,
+            IntUnOp::TruncOrSignExtend => x_s as u128,
+        };
+        Ok(Const::from_bits_trunc(output_type, output_bits))
     }
 }
 
@@ -427,6 +524,186 @@ impl IntBinOp {
             IntBinOp::LeS => "s.le",
         }
     }
+
+    pub fn try_eval(
+        self,
+        a: Const,
+        b: Const,
+        output_types: &[Type],
+    ) -> Result<ArrayVec<Const, 2>, EvalError> {
+        let output_type = output_types
+            .iter()
+            .copied()
+            .dedup()
+            .exactly_one()
+            .ok()
+            .filter(|_| output_types.len() == self.output_count())
+            .ok_or(EvalError::OpSignatureMismatch)?;
+
+        // FIXME(eddyb) try to dedup these helpers with `IntUnOp`.
+        let int_width = |ty| match ty {
+            Type::UInt(w) | Type::SInt(w) => Ok(w),
+            _ => Err(EvalError::OpSignatureMismatch),
+        };
+        let output_width = match self {
+            // FIXME(eddyb) should comparisons be handled separately?
+            IntBinOp::Eq
+            | IntBinOp::Ne
+            | IntBinOp::GtU
+            | IntBinOp::GtS
+            | IntBinOp::GeU
+            | IntBinOp::GeS
+            | IntBinOp::LtU
+            | IntBinOp::LtS
+            | IntBinOp::LeU
+            | IntBinOp::LeS => None,
+
+            _ => Some(int_width(output_type)?),
+        };
+
+        let as_u128_i128 = |x: Const| {
+            let x_width = int_width(x.ty())?;
+            Ok((
+                x_width,
+                x.bits(),
+                x.try_bit_cast_to(Type::SInt(x_width)).unwrap().int_as_i128().unwrap(),
+            ))
+        };
+        let (a_width, a, a_s) = as_u128_i128(a)?;
+        let (b_width, b, b_s) = as_u128_i128(b)?;
+
+        let valid_widths = output_width.is_none_or(|w| w == a_width)
+            && (a_width == b_width
+                || matches!(self, IntBinOp::ShrU | IntBinOp::ShrS | IntBinOp::Shl));
+        if !valid_widths {
+            return Err(EvalError::OpSignatureMismatch);
+        }
+
+        let div_ub_err = EvalError::UndefinedBehavior {
+            cause: if b_s == 0 { "division by 0" } else { "signed division overflow" },
+        };
+        let b_as_shift_amount =
+            || u32::try_from(b).ok().filter(|&b| b < a_width.bits()).ok_or(EvalError::PoisonOutput);
+
+        // FIXME(eddyb) replace with `u128::widening_mul` when it stabilizes.
+        fn u128_widening_mul(a: u128, b: u128) -> (u128, u128) {
+            // HACK(eddyb) the code below extracts `lo` and `hi`,
+            // such that `lo + 2¹²⁸hi` is equal to this expansion of `a · b`:
+            // `(al + 2⁶⁴ah) · (bl + 2⁶⁴bh) = al·bl + 2⁶⁴(al·bh + ah·bl) + 2¹²⁸(ah·bh)`
+            let [(al, ah), (bl, bh)] = [a, b].map(|x| (x as u64 as u128, x >> 64));
+            let [[al_bl, al_bh], [ah_bl, ah_bh]] =
+                [al, ah].map(|a| [bl, bh].map(|b| a.checked_mul(b).unwrap()));
+
+            let (mid, mid_carry) = al_bh.overflowing_add(ah_bl);
+            let (lo, lo_carry) = al_bl.overflowing_add(mid << 64);
+            let hi = [ah_bh, mid >> 64, (mid_carry as u128) << 64, lo_carry as u128]
+                .into_iter()
+                .reduce(|a, b| a.checked_add(b).unwrap())
+                .unwrap();
+
+            assert_eq!(lo, a.wrapping_mul(b));
+
+            (lo, hi)
+        }
+
+        // FIXME(eddyb) replace with `i128::widening_mul` when it stabilizes.
+        fn i128_widening_mul(a: i128, b: i128) -> (u128, i128) {
+            // HACK(eddyb) to avoid duplication and signedness subtleties,
+            // the sign is handled on top of the unsigned implementation above.
+            let (abs_lo, abs_hi) = u128_widening_mul(a.unsigned_abs(), b.unsigned_abs());
+            if a.signum() * b.signum() == -1 {
+                // HACK(eddyb) `-x` is equivalent to `(!x).wrapping_add(1)`,
+                // which can be directly applied to a double-width integer.
+                let (lo, lo_carry) = (!abs_lo).overflowing_add(1);
+                (lo, (!abs_hi).wrapping_add(lo_carry as u128) as i128)
+            } else {
+                (abs_lo, abs_hi as i128)
+            }
+        }
+
+        let wide_result = |[lo, hi]: [u128; 2]| {
+            // HACK(eddyb) `lo + 2¹²⁸hi` form a 256-bit result, but the true
+            // result for an N-bit operation will only match those two halves
+            // for N=128, for smaller N both halves can be found in `lo`.
+            let width = output_width.unwrap().bits();
+            let hi = if width == 128 || {
+                // HACK(eddyb) because subtraction overflow is centered around `0`,
+                // and not `2^N`, the 128-bit `hi` is already the correct top half,
+                // and it's not obvious how to otherwise get that correct value,
+                // without this (otherwise quite annoying) special-case.
+                self == IntBinOp::BorrowingSub
+            } {
+                hi
+            } else {
+                lo.checked_shr(width).unwrap()
+            };
+
+            Ok([lo, hi].map(|x| Const::from_bits_trunc(output_type, x)).into_iter().collect())
+        };
+
+        // HACK(eddyb) can't trust `checked_{div,rem}` to handle the "MIN" part
+        // correctly, because `iN::MIN as i128 != i128::MIN` for `N < 128`.
+        if let IntBinOp::DivS | IntBinOp::RemS | IntBinOp::ModS = self
+            && a_s == -1 << (a_width.bits() - 1)
+            && b_s == -1
+        {
+            return Err(div_ub_err);
+        }
+
+        let output_bits = match self {
+            IntBinOp::Add => a.wrapping_add(b),
+            IntBinOp::Sub => a.wrapping_sub(b),
+            IntBinOp::Mul => a.wrapping_mul(b),
+            IntBinOp::DivU => a.checked_div(b).ok_or(div_ub_err)?,
+            IntBinOp::DivS => a_s.checked_div(b_s).ok_or(div_ub_err)? as u128,
+            IntBinOp::ModU => a.checked_rem(b).ok_or(div_ub_err)?,
+            IntBinOp::RemS => a_s.checked_rem(b_s).ok_or(div_ub_err)? as u128,
+            IntBinOp::ModS => {
+                let rem_s = a_s.checked_rem(b_s).ok_or(div_ub_err)?;
+                let mod_s = if rem_s.signum() * b_s.signum() == -1 {
+                    // |b_s| > |rem_s|, so |b_s + rem_s| = |b_s| - |rem_s|, and
+                    // the sum will have sign of `b_s` (as required by SPIR-V).
+                    rem_s.checked_add(b_s).unwrap()
+                } else {
+                    rem_s
+                };
+                mod_s as u128
+            }
+            IntBinOp::ShrU => a.checked_shr(b_as_shift_amount()?).unwrap(),
+            IntBinOp::ShrS => a_s.checked_shr(b_as_shift_amount()?).unwrap() as u128,
+            IntBinOp::Shl => a.checked_shl(b_as_shift_amount()?).unwrap(),
+            IntBinOp::Or => a | b,
+            IntBinOp::Xor => a ^ b,
+            IntBinOp::And => a & b,
+            IntBinOp::CarryingAdd => {
+                let (lo, hi) = a.overflowing_add(b);
+                return wide_result([lo, hi as u128]);
+            }
+            IntBinOp::BorrowingSub => {
+                let (lo, hi) = a.overflowing_sub(b);
+                return wide_result([lo, hi as u128]);
+            }
+            IntBinOp::WideningMulU => {
+                let (lo, hi) = u128_widening_mul(a, b);
+                return wide_result([lo, hi]);
+            }
+            IntBinOp::WideningMulS => {
+                let (lo, hi) = i128_widening_mul(a_s, b_s);
+                return wide_result([lo, hi as u128]);
+            }
+            IntBinOp::Eq => (a == b) as u128,
+            IntBinOp::Ne => (a != b) as u128,
+            IntBinOp::GtU => (a > b) as u128,
+            IntBinOp::GtS => (a_s > b_s) as u128,
+            IntBinOp::GeU => (a >= b) as u128,
+            IntBinOp::GeS => (a_s >= b_s) as u128,
+            IntBinOp::LtU => (a < b) as u128,
+            IntBinOp::LtS => (a_s < b_s) as u128,
+            IntBinOp::LeU => (a <= b) as u128,
+            IntBinOp::LeS => (a_s <= b_s) as u128,
+        };
+        Ok([Const::from_bits_trunc(output_type, output_bits)].into_iter().collect())
+    }
 }
 
 impl FloatUnOp {
@@ -444,6 +721,108 @@ impl FloatUnOp {
             FloatUnOp::Convert => "f.convert",
             FloatUnOp::QuantizeAsF16 => "f.quantize_as_f16",
         }
+    }
+
+    pub fn try_eval(self, x: Const, output_type: Type) -> Result<Const, EvalError> {
+        let float_type = match self {
+            FloatUnOp::Neg
+            | FloatUnOp::IsNan
+            | FloatUnOp::IsInf
+            | FloatUnOp::ToUInt
+            | FloatUnOp::ToSInt
+            | FloatUnOp::Convert => x.ty(),
+            FloatUnOp::FromUInt | FloatUnOp::FromSInt => output_type,
+            FloatUnOp::QuantizeAsF16 => Type::F32,
+        };
+
+        match float_type {
+            Type::F16 => self.try_eval_specialized::<rustc_apfloat::ieee::Half>(x, output_type),
+            Type::F32 => self.try_eval_specialized::<rustc_apfloat::ieee::Single>(x, output_type),
+            Type::F64 => self.try_eval_specialized::<rustc_apfloat::ieee::Double>(x, output_type),
+            Type::Float(w) => Err(EvalError::UnsupportedFloatWidth(w)),
+            _ => Err(EvalError::OpSignatureMismatch),
+        }
+    }
+
+    fn try_eval_specialized<F>(self, x: Const, output_type: Type) -> Result<Const, EvalError>
+    where
+        F: rustc_apfloat::Float
+            + rustc_apfloat::FloatConvert<rustc_apfloat::ieee::Half>
+            + rustc_apfloat::FloatConvert<rustc_apfloat::ieee::Single>
+            + rustc_apfloat::FloatConvert<rustc_apfloat::ieee::Double>,
+        rustc_apfloat::ieee::Half: rustc_apfloat::FloatConvert<F>,
+    {
+        use rustc_apfloat::{Float, FloatConvert, Status, StatusAnd};
+
+        // HACK(eddyb) more convenient conversion helper.
+        fn convert<T: FloatConvert<U>, U: Float>(x: T) -> StatusAnd<U> {
+            x.convert(&mut false)
+        }
+
+        let int_width = |ty| match ty {
+            Type::UInt(w) | Type::SInt(w) => Ok(w),
+            _ => Err(EvalError::OpSignatureMismatch),
+        };
+
+        // FIXME(eddyb) try to dedup these helpers with `FloatBinOp`.
+        let expected_float_type =
+            Type::Float(FloatWidth::try_from_bits(F::BITS.try_into().unwrap()).unwrap());
+        let f_from_const = |x: Const| {
+            if x.ty() != expected_float_type {
+                return Err(EvalError::OpSignatureMismatch);
+            }
+            Ok(F::from_bits(x.bits()))
+        };
+        let const_f = |x: F| Const::from_bits(expected_float_type, x.to_bits());
+        let const_bool = |x: bool| Const::from_bits(Type::Bool, x as u128);
+
+        let status_and_output = match self {
+            FloatUnOp::Neg => Status::OK.and(-f_from_const(x)?).map(const_f),
+            FloatUnOp::IsNan => Status::OK.and(f_from_const(x)?.is_nan()).map(const_bool),
+            FloatUnOp::IsInf => Status::OK.and(f_from_const(x)?.is_infinite()).map(const_bool),
+            FloatUnOp::FromUInt => {
+                F::from_u128(x.int_as_u128().ok_or(EvalError::OpSignatureMismatch)?).map(const_f)
+            }
+            FloatUnOp::FromSInt => {
+                F::from_i128(x.int_as_i128().ok_or(EvalError::OpSignatureMismatch)?).map(const_f)
+            }
+            FloatUnOp::ToUInt => {
+                let width = int_width(output_type)?;
+                f_from_const(x)?
+                    .to_u128(width.bits() as usize)
+                    .map(|r| Const::from_bits(Type::UInt(width), r))
+            }
+            FloatUnOp::ToSInt => {
+                let width = int_width(output_type)?;
+                f_from_const(x)?
+                    .to_i128(width.bits() as usize)
+                    .map(|r| Const::int_try_from_i128(Type::SInt(width), r).unwrap())
+            }
+            FloatUnOp::Convert => {
+                let x = f_from_const(x)?;
+                let status_and_output_bits = match output_type {
+                    Type::F16 => convert::<_, rustc_apfloat::ieee::Half>(x).map(|r| r.to_bits()),
+                    Type::F32 => convert::<_, rustc_apfloat::ieee::Single>(x).map(|r| r.to_bits()),
+                    Type::F64 => convert::<_, rustc_apfloat::ieee::Double>(x).map(|r| r.to_bits()),
+                    Type::Float(w) => return Err(EvalError::UnsupportedFloatWidth(w)),
+                    _ => return Err(EvalError::OpSignatureMismatch),
+                };
+                status_and_output_bits.map(|output_bits| Const::from_bits(output_type, output_bits))
+            }
+            FloatUnOp::QuantizeAsF16 => convert::<_, rustc_apfloat::ieee::Half>(f_from_const(x)?)
+                .map(|x_f16| convert::<_, F>(x_f16).value)
+                .map(const_f),
+        };
+
+        if status_and_output.status.intersects(Status::INVALID_OP | Status::DIV_BY_ZERO) {
+            return Err(EvalError::FloatException);
+        }
+
+        let output = status_and_output.value;
+        if output.ty() != output_type {
+            return Err(EvalError::OpSignatureMismatch);
+        }
+        Ok(output)
     }
 }
 
@@ -468,6 +847,114 @@ impl FloatBinOp {
             FloatBinOp::CmpOrUnord(FloatCmp::Gt) => "f.gt_or_unord",
             FloatBinOp::CmpOrUnord(FloatCmp::Le) => "f.le_or_unord",
             FloatBinOp::CmpOrUnord(FloatCmp::Ge) => "f.ge_or_unord",
+        }
+    }
+
+    pub fn try_eval(self, a: Const, b: Const, output_type: Type) -> Result<Const, EvalError> {
+        if a.ty() != b.ty() {
+            return Err(EvalError::OpSignatureMismatch);
+        }
+
+        match a.ty() {
+            Type::F16 => self.try_eval_specialized::<rustc_apfloat::ieee::Half>(a, b, output_type),
+            Type::F32 => {
+                self.try_eval_specialized::<rustc_apfloat::ieee::Single>(a, b, output_type)
+            }
+            Type::F64 => {
+                self.try_eval_specialized::<rustc_apfloat::ieee::Double>(a, b, output_type)
+            }
+            Type::Float(w) => Err(EvalError::UnsupportedFloatWidth(w)),
+            _ => Err(EvalError::OpSignatureMismatch),
+        }
+    }
+
+    fn try_eval_specialized<F: rustc_apfloat::Float>(
+        self,
+        a: Const,
+        b: Const,
+        output_type: Type,
+    ) -> Result<Const, EvalError> {
+        use rustc_apfloat::Status;
+
+        // FIXME(eddyb) try to dedup these helpers with `FloatBinOp`.
+        let expected_float_type =
+            Type::Float(FloatWidth::try_from_bits(F::BITS.try_into().unwrap()).unwrap());
+        let f_from_const = |x: Const| {
+            if x.ty() != expected_float_type {
+                return Err(EvalError::OpSignatureMismatch);
+            }
+            Ok(F::from_bits(x.bits()))
+        };
+        let const_f = |x: F| Const::from_bits(expected_float_type, x.to_bits());
+        let const_bool = |x: bool| Const::from_bits(Type::Bool, x as u128);
+
+        let status_and_output = match self {
+            FloatBinOp::Add => (f_from_const(a)? + f_from_const(b)?).map(const_f),
+            FloatBinOp::Sub => (f_from_const(a)? - f_from_const(b)?).map(const_f),
+            FloatBinOp::Mul => (f_from_const(a)? * f_from_const(b)?).map(const_f),
+            FloatBinOp::Div => (f_from_const(a)? / f_from_const(b)?).map(const_f),
+            FloatBinOp::Rem => (f_from_const(a)? % f_from_const(b)?).map(const_f),
+            FloatBinOp::Mod => {
+                let (a, b) = (f_from_const(a)?, f_from_const(b)?);
+                (a % b)
+                    .map(|rem| {
+                        if !rem.is_zero() && rem.is_negative() != b.is_negative() {
+                            // |b| > |rem|, so |b + rem| = |b| - |rem|, and the sum
+                            // will have sign of `b` (as required by SPIR-V).
+                            (rem + b).value
+                        } else {
+                            rem
+                        }
+                    })
+                    .map(const_f)
+            }
+            FloatBinOp::Cmp(cmp) => {
+                Status::OK.and(cmp.eval(&f_from_const(a)?, &f_from_const(b)?)).map(const_bool)
+            }
+            // HACK(eddyb) see comment on `FloatBinOp::CmpOrUnord` for an explanation.
+            FloatBinOp::CmpOrUnord(cmp) => Status::OK
+                .and((!cmp).eval(&f_from_const(a)?, &f_from_const(b)?))
+                .map(|r| const_bool(!r)),
+        };
+
+        if status_and_output.status.intersects(Status::INVALID_OP | Status::DIV_BY_ZERO) {
+            return Err(EvalError::FloatException);
+        }
+
+        let output = status_and_output.value;
+        if output.ty() != output_type {
+            return Err(EvalError::OpSignatureMismatch);
+        }
+        Ok(output)
+    }
+}
+
+// HACK(eddyb) see comment on `FloatBinOp::CmpOrUnord` for why this "flipping"
+// is useful - i.e. `FloatBinOp::CmpOrUnord(cmp)` is equivalent to first applying
+// `FloatBinOp::Cmp(!cmp)` then passing its result to `BoolUnOp::Not`.
+impl std::ops::Not for FloatCmp {
+    type Output = FloatCmp;
+    fn not(self) -> FloatCmp {
+        match self {
+            FloatCmp::Eq => FloatCmp::Ne,
+            FloatCmp::Ne => FloatCmp::Eq,
+            FloatCmp::Lt => FloatCmp::Ge,
+            FloatCmp::Gt => FloatCmp::Le,
+            FloatCmp::Le => FloatCmp::Gt,
+            FloatCmp::Ge => FloatCmp::Lt,
+        }
+    }
+}
+
+impl FloatCmp {
+    fn eval<T: PartialOrd>(self, a: &T, b: &T) -> bool {
+        match self {
+            FloatCmp::Eq => *a == *b,
+            FloatCmp::Ne => *a != *b,
+            FloatCmp::Lt => *a < *b,
+            FloatCmp::Gt => *a > *b,
+            FloatCmp::Le => *a <= *b,
+            FloatCmp::Ge => *a >= *b,
         }
     }
 }
