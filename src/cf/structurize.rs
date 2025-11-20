@@ -1127,27 +1127,6 @@ impl<'a> Structurizer<'a> {
                     DeferredEdgeBundleSet::Unreachable
                 }
 
-                ControlInstKind::ExitInvocation(kind) => {
-                    assert_eq!(target_regions.len(), 0);
-
-                    let node = self.func_def_body.nodes.define(
-                        self.cx,
-                        NodeDef {
-                            attrs,
-                            kind: NodeKind::ExitInvocation(kind),
-                            inputs,
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        }
-                        .into(),
-                    );
-                    self.func_def_body.regions[region]
-                        .children
-                        .insert_last(node, &mut self.func_def_body.nodes);
-
-                    DeferredEdgeBundleSet::Unreachable
-                }
-
                 ControlInstKind::Return => {
                     assert_eq!(target_regions.len(), 0);
 
