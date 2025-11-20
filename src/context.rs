@@ -348,17 +348,12 @@ pub struct EntityOrientedDenseMap<K: EntityOrientedMapKey<V>, V> {
 // since the ideal state is one chunk per map, the slow case might never be hit,
 // unless one `EntityOrientedDenseMap` is used with more than one `EntityDefs`,
 // which could still maybe be implemented more efficiently than `FxHashMap`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 enum SmallFxHashMap<K, V> {
+    #[default]
     Empty,
     One(K, V),
     More(FxHashMap<K, V>),
-}
-
-impl<K, V> Default for SmallFxHashMap<K, V> {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 impl<K: Copy + Eq + Hash, V: Default> SmallFxHashMap<K, V> {

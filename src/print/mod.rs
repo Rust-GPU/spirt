@@ -764,8 +764,7 @@ impl DbgScopeDefMap {
                 }
                 merged
             })
-            .map(|merged| merged.rev_scopes)
-            .unwrap_or_default();
+            .map_or_default(|merged| merged.rev_scopes);
         DbgScopeDefMap { top, rev_scopes }
     }
 
@@ -1840,8 +1839,7 @@ impl Printer<'_> {
                 spv::print::Token::Error(s) => self.error_style().apply(s).into(),
                 spv::print::Token::OperandName(s) => self
                     .sanitize_spv_operand_name(s)
-                    .map(|name| self.pretty_named_argument_prefix(name))
-                    .unwrap_or_default(),
+                    .map_or_default(|name| self.pretty_named_argument_prefix(name)),
                 spv::print::Token::Punctuation(s) => s.into(),
                 spv::print::Token::OperandKindNamespacePrefix(s) => {
                     pretty::Fragment::new([
@@ -2254,11 +2252,8 @@ impl Plan<'_> {
             })
             .map(PlanItemOrRoot::PlanItem);
         let root = [PlanItemOrRoot::Root].into_iter();
-        let all_items_and_or_root = Some(all_items)
-            .filter(|_| print_all_items)
-            .into_iter()
-            .flatten()
-            .chain(Some(root).filter(|_| print_root).into_iter().flatten());
+        let all_items_and_or_root = (print_all_items.then_some(all_items).into_iter().flatten())
+            .chain(print_root.then_some(root).into_iter().flatten());
 
         let per_item_versions_with_repeat_count =
             all_items_and_or_root.map(|item_or_root| -> SmallVec<[_; 1]> {
@@ -2275,10 +2270,8 @@ impl Plan<'_> {
                 self.versions
                     .iter()
                     .map(move |version| match item_or_root {
-                        PlanItemOrRoot::PlanItem(item) => version
-                            .item_defs
-                            .get(&item)
-                            .map(|def| {
+                        PlanItemOrRoot::PlanItem(item) => {
+                            version.item_defs.get(&item).map_or_default(|def| {
                                 let prev_plan_item = printer.current_plan_item.replace(Some(item));
                                 let printed_def = def.print(printer);
                                 printer.current_plan_item.set(prev_plan_item);
@@ -2287,7 +2280,7 @@ impl Plan<'_> {
                                     Use::PlanItem(item).print_as_def(printer),
                                 )
                             })
-                            .unwrap_or_default(),
+                        }
                         PlanItemOrRoot::Root => version.root.print(printer),
                     })
                     .dedup_with_count()
@@ -3080,8 +3073,7 @@ impl Print for QPtrMemUsage {
                             sub_usage
                                 .max_size
                                 .and_then(|max_size| offset.checked_add(max_size))
-                                .map(num_lit)
-                                .unwrap_or_default(),
+                                .map_or_default(num_lit),
                             " => ".into(),
                             sub_usage.print(printer),
                         ])
@@ -3095,10 +3087,7 @@ impl Print for QPtrMemUsage {
                 "(".into(),
                 num_lit(0),
                 "..".into(),
-                self.max_size
-                    .map(|max_size| max_size / stride.get())
-                    .map(num_lit)
-                    .unwrap_or_default(),
+                self.max_size.map(|max_size| max_size / stride.get()).map_or_default(num_lit),
                 ") × ".into(),
                 num_lit(stride.get()),
                 " => ".into(),
@@ -3436,14 +3425,12 @@ impl Print for GlobalVarDecl {
                     } else {
                         pretty::Fragment::new([
                             "[".into(),
-                            fixed_count
-                                .map(|count| {
-                                    pretty::Fragment::new([
-                                        printer.numeric_literal_style().apply(count.to_string()),
-                                        " × ".into(),
-                                    ])
-                                })
-                                .unwrap_or_default(),
+                            fixed_count.map_or_default(|count| {
+                                pretty::Fragment::new([
+                                    printer.numeric_literal_style().apply(count.to_string()),
+                                    " × ".into(),
+                                ])
+                            }),
                             handle,
                             "]".into(),
                         ])
@@ -3671,7 +3658,7 @@ impl Print for FuncAt<'_, Region> {
         };
 
         let header = dbg_scope_defs_at(DbgScopeDefPlaceInRegion { before_node: None })
-            .map(|dbg_scope_defs| {
+            .map_or_default(|dbg_scope_defs| {
                 pretty::Fragment::new([
                     dbg_scope_defs,
                     // HACK(eddyb) separate hoisted `DbgScope`s with an empty line.
@@ -3679,8 +3666,7 @@ impl Print for FuncAt<'_, Region> {
                     // for "vertical gap" instead.
                     "\n\n".into(),
                 ])
-            })
-            .unwrap_or_default();
+            });
 
         let body = (self.at(*children).into_iter())
             .map(|func_at_node| {
@@ -4226,9 +4212,7 @@ impl Print for FuncAt<'_, DataInst> {
 
         let def_without_name = pretty::Fragment::new([
             def_without_type,
-            output_type_to_print
-                .map(|ty| printer.pretty_type_ascription_suffix(ty))
-                .unwrap_or_default(),
+            output_type_to_print.map_or_default(|ty| printer.pretty_type_ascription_suffix(ty)),
         ]);
 
         // FIXME(eddyb) this is quite verbose for prepending.
@@ -4238,11 +4222,9 @@ impl Print for FuncAt<'_, DataInst> {
         ]);
 
         AttrsAndDef { attrs, def_without_name }.insert_name_before_def(
-            output_use_to_print_as_lhs
-                .map(|output_use| {
-                    pretty::Fragment::new([output_use.print_as_def(printer), " = ".into()])
-                })
-                .unwrap_or_default(),
+            output_use_to_print_as_lhs.map_or_default(|output_use| {
+                pretty::Fragment::new([output_use.print_as_def(printer), " = ".into()])
+            }),
         )
     }
 }
