@@ -51,11 +51,6 @@ pub enum ControlInstKind {
     /// Leave the current function, optionally returning a value.
     Return,
 
-    /// Leave the current invocation, similar to returning from every function
-    /// call in the stack (up to and including the entry-point), but potentially
-    /// indicating a fatal error as well.
-    ExitInvocation(cf::ExitInvocationKind),
-
     /// Unconditional branch to a single target.
     Branch,
 
