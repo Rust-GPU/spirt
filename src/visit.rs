@@ -521,9 +521,6 @@ impl InnerVisit for cf::unstructured::ControlInst {
         match kind {
             cf::unstructured::ControlInstKind::Unreachable
             | cf::unstructured::ControlInstKind::Return
-            | cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
-                _,
-            ))
             | cf::unstructured::ControlInstKind::Branch
             | cf::unstructured::ControlInstKind::SelectBranch(
                 SelectionKind::BoolCond | SelectionKind::SpvInst(_),

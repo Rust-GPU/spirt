@@ -4293,18 +4293,6 @@ impl Print for cf::unstructured::ControlInst {
                     _ => unreachable!(),
                 }
             }
-            cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
-                spv::Inst { opcode, imms },
-            )) => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0);
-                printer.pretty_spv_inst(
-                    kw_style,
-                    *opcode,
-                    imms,
-                    inputs.iter().map(|v| v.print(printer)),
-                )
-            }
 
             cf::unstructured::ControlInstKind::Branch => {
                 assert_eq!((targets.len(), inputs.len()), (1, 0));

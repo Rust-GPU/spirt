@@ -14,7 +14,6 @@ use crate::{
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -321,7 +320,7 @@ struct Phi {
 struct Terminator<'a> {
     attrs: AttrSet,
 
-    kind: Cow<'a, cf::unstructured::ControlInstKind>,
+    kind: TerminatorKind<'a>,
 
     // FIXME(eddyb) use `Cow` or something, but ideally the "owned" case always
     // has at most one input, so allocating a whole `Vec` for that seems unwise.
@@ -333,6 +332,17 @@ struct Terminator<'a> {
     target_phi_values: FxIndexMap<CfgPoint, &'a [Value]>,
 
     merge: Option<Merge<CfgPoint>>,
+}
+
+enum TerminatorKind<'a> {
+    Unreachable,
+    Return,
+    Branch,
+    SelectBranch(&'a cf::SelectionKind),
+
+    // HACK(eddyb) this is the only case `cf::unstructured::ControlInst` can't
+    // itself represent (as it has been moved to `NodeKind::ExitInvocation`).
+    ExitInvocation(&'a cf::ExitInvocationKind),
 }
 
 #[derive(Copy, Clone)]
@@ -679,7 +689,16 @@ impl<'a> FuncLifting<'a> {
                         } = terminator;
                         Terminator {
                             attrs: *attrs,
-                            kind: Cow::Borrowed(kind),
+                            kind: match kind {
+                                cf::unstructured::ControlInstKind::Unreachable => {
+                                    TerminatorKind::Unreachable
+                                }
+                                cf::unstructured::ControlInstKind::Return => TerminatorKind::Return,
+                                cf::unstructured::ControlInstKind::Branch => TerminatorKind::Branch,
+                                cf::unstructured::ControlInstKind::SelectBranch(kind) => {
+                                    TerminatorKind::SelectBranch(kind)
+                                }
+                            },
                             // FIXME(eddyb) borrow these whenever possible.
                             inputs: inputs.clone(),
                             targets: targets
@@ -699,7 +718,7 @@ impl<'a> FuncLifting<'a> {
                         assert!(region == func_def_body.body);
                         Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cf::unstructured::ControlInstKind::Return),
+                            kind: TerminatorKind::Return,
                             inputs: func_def_body.at_body().def().outputs.clone(),
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
@@ -714,9 +733,7 @@ impl<'a> FuncLifting<'a> {
                     match &node_def.kind {
                         NodeKind::Select(kind) => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cf::unstructured::ControlInstKind::SelectBranch(
-                                kind.clone(),
-                            )),
+                            kind: TerminatorKind::SelectBranch(kind),
                             inputs: [node_def.inputs[0]].into_iter().collect(),
                             targets: node_def
                                 .child_regions
@@ -731,7 +748,7 @@ impl<'a> FuncLifting<'a> {
                             let body = node_def.child_regions[0];
                             Terminator {
                                 attrs: AttrSet::default(),
-                                kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
+                                kind: TerminatorKind::Branch,
                                 inputs: [].into_iter().collect(),
                                 targets: [CfgPoint::RegionEntry(body)].into_iter().collect(),
                                 target_phi_values: FxIndexMap::default(),
@@ -751,9 +768,7 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::ExitInvocation(kind) => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cf::unstructured::ControlInstKind::ExitInvocation(
-                                kind.clone(),
-                            )),
+                            kind: TerminatorKind::ExitInvocation(kind),
                             inputs: node_def.inputs.clone(),
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
@@ -782,7 +797,7 @@ impl<'a> FuncLifting<'a> {
                     match func_def_body.at(parent_node).def().kind {
                         NodeKind::Select { .. } => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
+                            kind: TerminatorKind::Branch,
                             inputs: [].into_iter().collect(),
                             targets: [parent_exit].into_iter().collect(),
                             target_phi_values: region_outputs
@@ -813,7 +828,7 @@ impl<'a> FuncLifting<'a> {
                             if is_infinite_loop {
                                 Terminator {
                                     attrs: AttrSet::default(),
-                                    kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
+                                    kind: TerminatorKind::Branch,
                                     inputs: [].into_iter().collect(),
                                     targets: [backedge].into_iter().collect(),
                                     target_phi_values,
@@ -830,11 +845,7 @@ impl<'a> FuncLifting<'a> {
                                 }
                                 Terminator {
                                     attrs: AttrSet::default(),
-                                    kind: Cow::Owned(
-                                        cf::unstructured::ControlInstKind::SelectBranch(
-                                            SelectionKind::BoolCond,
-                                        ),
-                                    ),
+                                    kind: TerminatorKind::SelectBranch(&SelectionKind::BoolCond),
                                     inputs: [repeat_condition].into_iter().collect(),
                                     targets: [backedge, parent_exit].into_iter().collect(),
                                     target_phi_values,
@@ -863,7 +874,7 @@ impl<'a> FuncLifting<'a> {
                 // `unique_predecessor` helper (just like `unique_successor`).
                 (_, Some(succ_cursor)) => Terminator {
                     attrs: AttrSet::default(),
-                    kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
+                    kind: TerminatorKind::Branch,
                     inputs: [].into_iter().collect(),
                     targets: [succ_cursor.point].into_iter().collect(),
                     target_phi_values: FxIndexMap::default(),
@@ -936,10 +947,8 @@ impl<'a> FuncLifting<'a> {
             // SPIR-V allows their targets to just be the whole merge block
             // (the same one that `OpSelectionMerge` describes).
             let block = &blocks[block_idx];
-            if let (
-                cf::unstructured::ControlInstKind::SelectBranch(_),
-                Some(Merge::Selection(merge_point)),
-            ) = (&*block.terminator.kind, block.terminator.merge)
+            if let (TerminatorKind::SelectBranch(_), Some(Merge::Selection(merge_point))) =
+                (&block.terminator.kind, block.terminator.merge)
             {
                 for target_idx in 0..block.terminator.targets.len() {
                     let block = &blocks[block_idx];
@@ -966,7 +975,7 @@ impl<'a> FuncLifting<'a> {
                         (phis.is_empty()
                             && insts.is_empty()
                             && *attrs == AttrSet::default()
-                            && matches!(**kind, cf::unstructured::ControlInstKind::Branch)
+                            && matches!(kind, TerminatorKind::Branch)
                             && inputs.is_empty()
                             && targets.len() == 1
                             && target_phi_values.is_empty()
@@ -989,7 +998,7 @@ impl<'a> FuncLifting<'a> {
                     &block.terminator;
 
                 (*attrs == AttrSet::default()
-                    && matches!(**kind, cf::unstructured::ControlInstKind::Branch)
+                    && matches!(kind, TerminatorKind::Branch)
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
@@ -1015,7 +1024,7 @@ impl<'a> FuncLifting<'a> {
                             new_terminator,
                             Terminator {
                                 attrs: Default::default(),
-                                kind: Cow::Owned(cf::unstructured::ControlInstKind::Unreachable),
+                                kind: TerminatorKind::Unreachable,
                                 inputs: Default::default(),
                                 targets: Default::default(),
                                 target_phi_values: Default::default(),
@@ -1429,25 +1438,21 @@ impl LazyInst<'_, '_> {
                 ids: [merge_label_id, continue_label_id].into_iter().collect(),
             },
             Self::Terminator { parent_func, terminator } => {
-                let inst = match &*terminator.kind {
-                    cf::unstructured::ControlInstKind::Unreachable => wk.OpUnreachable.into(),
-                    cf::unstructured::ControlInstKind::Return => {
+                let inst = match terminator.kind {
+                    TerminatorKind::Unreachable => wk.OpUnreachable.into(),
+                    TerminatorKind::Return => {
                         if terminator.inputs.is_empty() {
                             wk.OpReturn.into()
                         } else {
                             wk.OpReturnValue.into()
                         }
                     }
-                    cf::unstructured::ControlInstKind::ExitInvocation(
-                        cf::ExitInvocationKind::SpvInst(inst),
-                    )
-                    | cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
-                        inst,
-                    )) => inst.clone(),
+                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst))
+                    | TerminatorKind::SelectBranch(SelectionKind::SpvInst(inst)) => inst.clone(),
 
-                    cf::unstructured::ControlInstKind::Branch => wk.OpBranch.into(),
+                    TerminatorKind::Branch => wk.OpBranch.into(),
 
-                    cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond) => {
+                    TerminatorKind::SelectBranch(SelectionKind::BoolCond) => {
                         wk.OpBranchConditional.into()
                     }
                 };

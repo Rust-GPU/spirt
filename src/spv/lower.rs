@@ -6,8 +6,8 @@ use crate::spv::{self, spec};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, Region,
-    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, VarDecl, print,
+    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, NodeDef,
+    NodeKind, Region, RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, VarDecl, print,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -1491,9 +1491,23 @@ impl Module {
                         assert!(targets.is_empty() && inputs.len() <= 1);
                         cf::unstructured::ControlInstKind::Return
                     } else if targets.is_empty() {
-                        cf::unstructured::ControlInstKind::ExitInvocation(
-                            cf::ExitInvocationKind::SpvInst(raw_inst.without_ids.clone()),
-                        )
+                        let node = func_def_body.nodes.define(
+                            &cx,
+                            NodeDef {
+                                attrs,
+                                kind: NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
+                                    raw_inst.without_ids.clone(),
+                                )),
+                                inputs: mem::take(&mut inputs),
+                                child_regions: [].into_iter().collect(),
+                                outputs: [].into_iter().collect(),
+                            }
+                            .into(),
+                        );
+                        current_block_region_def
+                            .children
+                            .insert_last(node, &mut func_def_body.nodes);
+                        cf::unstructured::ControlInstKind::Unreachable
                     } else if opcode == wk.OpBranch {
                         assert_eq!((targets.len(), inputs.len()), (1, 0));
                         cf::unstructured::ControlInstKind::Branch
