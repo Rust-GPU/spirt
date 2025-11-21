@@ -620,7 +620,12 @@ impl<'a> Visitor<'a> for Plan<'a> {
             for region in cfg.rev_post_order(func_def_body) {
                 if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
                     for edge in &control_inst.targets {
-                        *self.use_counts.entry(Use::RegionLabel(edge.target)).or_default() += 1;
+                        match edge.target {
+                            cf::unstructured::ControlTarget::Region(target) => {
+                                *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
+                            }
+                            cf::unstructured::ControlTarget::Return => {}
+                        }
                     }
                 }
             }
@@ -4265,11 +4270,14 @@ impl Print for cf::unstructured::ControlInst {
 
         let mut targets =
             targets.iter().map(|cf::unstructured::ControlEdge { target, target_inputs }| {
-                let mut target = pretty::Fragment::new([
-                    kw("branch"),
-                    " ".into(),
-                    Use::RegionLabel(*target).print(printer),
-                ]);
+                let mut target = match *target {
+                    cf::unstructured::ControlTarget::Region(target) => pretty::Fragment::new([
+                        kw("branch"),
+                        " ".into(),
+                        Use::RegionLabel(target).print(printer),
+                    ]),
+                    cf::unstructured::ControlTarget::Return => kw("return"),
+                };
                 if !target_inputs.is_empty() {
                     target = pretty::Fragment::new([
                         target,
@@ -4288,15 +4296,6 @@ impl Print for cf::unstructured::ControlInst {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0 && inputs.is_empty());
                 kw("unreachable")
-            }
-            cf::unstructured::ControlInstKind::Return => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0);
-                match inputs[..] {
-                    [] => kw("return"),
-                    [v] => pretty::Fragment::new([kw("return"), " ".into(), v.print(printer)]),
-                    _ => unreachable!(),
-                }
             }
 
             cf::unstructured::ControlInstKind::Branch => {

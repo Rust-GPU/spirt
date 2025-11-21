@@ -520,7 +520,6 @@ impl InnerVisit for cf::unstructured::ControlInst {
         visitor.visit_attr_set_use(*attrs);
         match kind {
             cf::unstructured::ControlInstKind::Unreachable
-            | cf::unstructured::ControlInstKind::Return
             | cf::unstructured::ControlInstKind::Branch
             | cf::unstructured::ControlInstKind::SelectBranch(
                 SelectionKind::BoolCond | SelectionKind::SpvInst(_),

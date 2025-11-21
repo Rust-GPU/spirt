@@ -697,7 +697,6 @@ impl<'a> FuncLifting<'a> {
                                 cf::unstructured::ControlInstKind::Unreachable => {
                                     TerminatorKind::Unreachable
                                 }
-                                cf::unstructured::ControlInstKind::Return => TerminatorKind::Return,
                                 cf::unstructured::ControlInstKind::Branch => TerminatorKind::Branch,
                                 cf::unstructured::ControlInstKind::SelectBranch(kind) => {
                                     TerminatorKind::SelectBranch(kind)
@@ -707,6 +706,7 @@ impl<'a> FuncLifting<'a> {
                             inputs: inputs.clone(),
                             // FIXME(eddyb) try limiting this to repeated target `Region`s
                             // which *also* pass different value inputs.
+                            // NOTE(eddyb) this is also now used for returns.
                             targets: (0..u32::try_from(targets.len()).unwrap())
                                 .map(|edge_idx| CfgPoint::UnstructuredEdge {
                                     source: region,
@@ -731,17 +731,33 @@ impl<'a> FuncLifting<'a> {
                 }
                 (CfgPoint::UnstructuredEdge { source, edge_idx }, None) => {
                     let cfg = func_def_body.unstructured_cfg.as_ref().unwrap();
+                    let cf::unstructured::ControlInst { attrs, kind: _, inputs: _, targets } =
+                        &cfg.control_inst_on_exit_from[source];
                     let cf::unstructured::ControlEdge { target, target_inputs } =
-                        &cfg.control_inst_on_exit_from[source].targets[edge_idx as usize];
-                    Terminator {
-                        attrs: AttrSet::default(),
-                        kind: TerminatorKind::Branch,
-                        inputs: [].into_iter().collect(),
-                        targets: [CfgPoint::RegionEntry(*target)].into_iter().collect(),
-                        target_phi_values: [(CfgPoint::RegionEntry(*target), &target_inputs[..])]
+                        &targets[edge_idx as usize];
+                    match *target {
+                        cf::unstructured::ControlTarget::Region(target) => Terminator {
+                            attrs: *attrs,
+                            kind: TerminatorKind::Branch,
+                            inputs: [].into_iter().collect(),
+                            targets: [CfgPoint::RegionEntry(target)].into_iter().collect(),
+                            target_phi_values: [(
+                                CfgPoint::RegionEntry(target),
+                                &target_inputs[..],
+                            )]
                             .into_iter()
                             .collect(),
-                        merge: None,
+                            merge: None,
+                        },
+                        cf::unstructured::ControlTarget::Return => Terminator {
+                            attrs: *attrs,
+                            kind: TerminatorKind::Return,
+                            // FIXME(eddyb) borrow these whenever possible.
+                            inputs: target_inputs.clone(),
+                            targets: [].into_iter().collect(),
+                            target_phi_values: FxIndexMap::default(),
+                            merge: None,
+                        },
                     }
                 }
 
@@ -917,6 +933,7 @@ impl<'a> FuncLifting<'a> {
 
                     // FIXME(eddyb) try limiting this to repeated target `Region`s
                     // which *also* pass different value inputs.
+                    // NOTE(eddyb) this is also now used for returns.
                     let edge_count = cfg.control_inst_on_exit_from[region].targets.len();
                     for edge_idx in 0..u32::try_from(edge_count).unwrap() {
                         visit_cfg_point(CfgCursor {

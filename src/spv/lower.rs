@@ -1484,12 +1484,26 @@ impl Module {
                         }
                     }
 
+                    // FIXME(eddyb) collect targets in this form to
+                    // begin with (instead of recombining them here).
+                    let mut targets: SmallVec<[_; 4]> = targets
+                        .into_iter()
+                        .map(|target| cf::unstructured::ControlEdge {
+                            target: cf::unstructured::ControlTarget::Region(target),
+                            target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
+                        })
+                        .collect();
+
                     let kind = if opcode == wk.OpUnreachable {
                         assert!(targets.is_empty() && inputs.is_empty());
                         cf::unstructured::ControlInstKind::Unreachable
                     } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
                         assert!(targets.is_empty() && inputs.len() <= 1);
-                        cf::unstructured::ControlInstKind::Return
+                        targets.push(cf::unstructured::ControlEdge {
+                            target: cf::unstructured::ControlTarget::Return,
+                            target_inputs: mem::take(&mut inputs),
+                        });
+                        cf::unstructured::ControlInstKind::Branch
                     } else if targets.is_empty() {
                         let node = func_def_body.nodes.define(
                             &cx,
@@ -1529,23 +1543,7 @@ impl Module {
                         .control_inst_on_exit_from
                         .insert(
                             current_block.region,
-                            cf::unstructured::ControlInst {
-                                attrs,
-                                kind,
-                                inputs,
-                                // FIXME(eddyb) collect targets in this form to
-                                // begin with (instead of recombining them here).
-                                targets: targets
-                                    .into_iter()
-                                    .map(|target| cf::unstructured::ControlEdge {
-                                        target,
-                                        target_inputs: target_inputs
-                                            .get(&target)
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    })
-                                    .collect(),
-                            },
+                            cf::unstructured::ControlInst { attrs, kind, inputs, targets },
                         );
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {

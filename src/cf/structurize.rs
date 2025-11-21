@@ -4,8 +4,8 @@
 
 use crate::cf::SelectionKind;
 use crate::cf::unstructured::{
-    ControlEdge, ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder,
-    TraversalState,
+    ControlEdge, ControlInst, ControlInstKind, ControlTarget, IncomingEdgeCount,
+    LoopFinder, TraversalState,
 };
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
@@ -254,12 +254,14 @@ struct LazyCondDyn {
 
 /// A target for one of the edge bundles in a [`DeferredEdgeBundleSet`], mostly
 /// separate from [`Region`] to allow expressing returns as well.
+//
+// FIXME(eddyb) consider reusing `ControlTarget` for this.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum DeferredTarget {
     Region(Region),
 
     /// Structured "return" out of the function (with `target_inputs` used for
-    /// the function body `output`s, i.e. inputs of [`ControlInstKind::Return`]).
+    /// the function body `output`s).
     Return,
 }
 
@@ -1063,6 +1065,20 @@ impl<'a> Structurizer<'a> {
                 .iter()
                 .cloned()
                 .map(|ControlEdge { target, target_inputs }| {
+                    let target = match target {
+                        ControlTarget::Region(target) => target,
+                        ControlTarget::Return => {
+                            return Err(DeferredEdgeBundleSet::Always {
+                                target: DeferredTarget::Return,
+                                edge_bundle: IncomingEdgeBundle {
+                                    attrs,
+                                    accumulated_count: IncomingEdgeCount::default(),
+                                    target: (),
+                                    target_inputs,
+                                },
+                            });
+                        }
+                    };
                     self.try_claim_edge_bundle(IncomingEdgeBundle {
                         attrs: if targets.len() == 1 { attrs } else { AttrSet::default() },
                         target,
@@ -1127,20 +1143,6 @@ impl<'a> Structurizer<'a> {
                     // - a `Loop` body is not actually possible when divergent
                     //   (as there can be no backedge to form a cyclic CFG)
                     DeferredEdgeBundleSet::Unreachable
-                }
-
-                ControlInstKind::Return => {
-                    assert_eq!(target_regions.len(), 0);
-
-                    DeferredEdgeBundleSet::Always {
-                        target: DeferredTarget::Return,
-                        edge_bundle: IncomingEdgeBundle {
-                            attrs,
-                            accumulated_count: IncomingEdgeCount::default(),
-                            target: (),
-                            target_inputs: inputs,
-                        },
-                    }
                 }
 
                 ControlInstKind::Branch => {
@@ -1807,14 +1809,18 @@ impl<'a> Structurizer<'a> {
         let mut control_source = Some(region);
         loop {
             let taken_then;
-            (taken_then, deferred_edges) =
-                deferred_edges.split_out_matching(|deferred| match deferred.edge_bundle.target {
-                    DeferredTarget::Region(target) => Ok((
-                        deferred.condition,
-                        ControlEdge { target, target_inputs: deferred.edge_bundle.target_inputs },
-                    )),
-                    DeferredTarget::Return => Err(deferred),
-                });
+            (taken_then, deferred_edges) = deferred_edges.split_out_matching(|deferred| {
+                Ok((
+                    deferred.condition,
+                    ControlEdge {
+                        target: match deferred.edge_bundle.target {
+                            DeferredTarget::Region(target) => ControlTarget::Region(target),
+                            DeferredTarget::Return => ControlTarget::Return,
+                        },
+                        target_inputs: deferred.edge_bundle.target_inputs,
+                    },
+                ))
+            });
             let Some((condition, then_edge)) = taken_then else {
                 break;
             };
@@ -1823,26 +1829,25 @@ impl<'a> Structurizer<'a> {
                 // At most one deferral left, so it can be used as the "else"
                 // case, or the branch left unconditional in its absence.
                 DeferredEdgeBundleSet::Unreachable => None,
-                DeferredEdgeBundleSet::Always {
-                    target: DeferredTarget::Region(else_target),
-                    edge_bundle,
-                } => {
+                DeferredEdgeBundleSet::Always { target: else_target, edge_bundle } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
                     Some(ControlEdge {
-                        target: else_target,
+                        target: match else_target {
+                            DeferredTarget::Region(target) => ControlTarget::Region(target),
+                            DeferredTarget::Return => ControlTarget::Return,
+                        },
                         target_inputs: edge_bundle.target_inputs,
                     })
                 }
 
-                // Either more branches, or a deferred return, are needed, so
-                // the "else" case must be a `Region` that itself can
-                // have a `ControlInst` attached to it later on.
-                _ => {
+                // More branches are needed, so the "else" case must be a `Region`
+                // that itself can have a `ControlInst` attached to it later on.
+                DeferredEdgeBundleSet::Choice { .. } => {
                     let new_empty_region =
                         self.func_def_body.regions.define(self.cx, RegionDef::default());
                     control_source = Some(new_empty_region);
                     Some(ControlEdge {
-                        target: new_empty_region,
+                        target: ControlTarget::Region(new_empty_region),
                         target_inputs: [].into_iter().collect(),
                     })
                 }
@@ -1872,36 +1877,19 @@ impl<'a> Structurizer<'a> {
             );
         }
 
-        let deferred_return = match deferred_edges {
-            DeferredEdgeBundleSet::Unreachable => None,
-            DeferredEdgeBundleSet::Always { target: DeferredTarget::Return, edge_bundle } => {
-                Some(edge_bundle.target_inputs)
-            }
-            _ => unreachable!(),
-        };
-
         let final_source = match control_source {
             Some(region) => region,
-            None => {
-                // The loop above handled all the targets, nothing left to do.
-                assert!(deferred_return.is_none());
-                return;
-            }
+            // The loop above handled all the targets, nothing left to do.
+            None => return,
         };
 
-        // Final deferral is either a `Return` (if needed), or an `Unreachable`
-        // (only when truly divergent, i.e. no `deferred_edges`/`deferred_return`).
-        let final_control_inst = {
-            let (kind, inputs) = match deferred_return {
-                Some(return_values) => (ControlInstKind::Return, return_values),
-                None => (ControlInstKind::Unreachable, [].into_iter().collect()),
-            };
-            ControlInst {
-                attrs: AttrSet::default(),
-                kind,
-                inputs,
-                targets: [].into_iter().collect(),
-            }
+        // Final deferral is an `Unreachable` (only when truly divergent,
+        // i.e. no `deferred_edges`).
+        let final_control_inst = ControlInst {
+            attrs: AttrSet::default(),
+            kind: ControlInstKind::Unreachable,
+            inputs: [].into_iter().collect(),
+            targets: [].into_iter().collect(),
         };
         assert!(
             self.func_def_body
