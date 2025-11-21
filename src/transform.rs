@@ -707,7 +707,7 @@ impl InnerInPlaceTransform for VarDecl {
 
 impl InnerInPlaceTransform for cf::unstructured::ControlInst {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
+        let Self { attrs, kind, inputs, targets } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         match kind {
@@ -721,8 +721,8 @@ impl InnerInPlaceTransform for cf::unstructured::ControlInst {
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
         }
-        for inputs in target_inputs.values_mut() {
-            for v in inputs {
+        for cf::unstructured::ControlEdge { target: _, target_inputs } in targets {
+            for v in target_inputs {
                 transformer.transform_value_use(v).apply_to(v);
             }
         }

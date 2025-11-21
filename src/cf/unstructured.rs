@@ -27,15 +27,8 @@ pub struct ControlInst {
     pub inputs: SmallVec<[Value; 2]>,
 
     // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub targets: SmallVec<[Region; 4]>,
-
-    /// `target_inputs[region][input_idx]` is the [`Value`] that
-    /// `VarKind::RegionInput { region, input_idx }` will get on entry,
-    /// where `region` must be appear at least once in `targets` - this is a
-    /// separate map instead of being part of `targets` because it reflects the
-    /// limitations of φ ("phi") nodes, which (unlike "basic block arguments")
-    /// cannot tell apart multiple edges with the same source and destination.
-    pub target_inputs: FxIndexMap<Region, SmallVec<[Value; 2]>>,
+    // FIXME(eddyb) should this be renamed to ("outgoing") `edges`?
+    pub targets: SmallVec<[ControlEdge; 4]>,
 }
 
 #[derive(Clone)]
@@ -56,6 +49,15 @@ pub enum ControlInstKind {
 
     /// Branch to one of several targets, chosen by a single value input.
     SelectBranch(cf::SelectionKind),
+}
+
+#[derive(Clone)]
+pub struct ControlEdge {
+    pub target: Region,
+
+    /// `target` inputs, i.e. `target_inputs[input_idx]` is the [`Value`] that
+    /// `VarKind::RegionInput { region: target, input_idx }` will get on entry.
+    pub target_inputs: SmallVec<[Value; 2]>,
 }
 
 impl ControlFlowGraph {
@@ -159,7 +161,7 @@ impl ControlFlowGraph {
             .get(region)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
-        let targets = control_inst.targets.iter().copied();
+        let targets = control_inst.targets.iter().map(|edge| edge.target);
         let targets = if state.reverse_targets {
             Either::Left(targets.rev())
         } else {
@@ -331,7 +333,7 @@ impl<'a> LoopFinder<'a> {
         let earliest_scc_root = control_inst
             .targets
             .iter()
-            .flat_map(|&target| {
+            .flat_map(|&ControlEdge { target, target_inputs: _ }| {
                 let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
                     self.find_earliest_scc_root_of(target);
                 eventual_cfg_exits |= eventual_cfg_exits_of_target;
@@ -385,7 +387,10 @@ impl<'a> LoopFinder<'a> {
                 self.scc_stack[scc_start..]
                     .iter()
                     .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node].targets.iter().copied()
+                        self.cfg.control_inst_on_exit_from[scc_node]
+                            .targets
+                            .iter()
+                            .map(|edge| edge.target)
                     })
                     .filter(|&target| target_is_exit(target))
                     .collect(),
