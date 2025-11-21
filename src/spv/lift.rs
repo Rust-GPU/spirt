@@ -127,6 +127,11 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 unreachable!("`TypeKind::QPtr` should be legalized away before lifting");
             }
 
+            TypeKind::Thunk => {
+                // HACK(eddyb) unstructured control-flow uses thunks.
+                return;
+            }
+
             TypeKind::SpvInst { .. } => {}
 
             TypeKind::SpvTypeOperand => {
@@ -153,6 +158,10 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         }
         let ct_def = &self.cx[ct];
         match ct_def.kind {
+            ConstKind::Undef if matches!(self.cx[ct_def.ty].kind, TypeKind::Thunk) => {
+                // HACK(eddyb) unstructured control-flow may use `undef` thunks.
+            }
+
             ConstKind::Undef
             | ConstKind::PtrToGlobalVar(_)
             | ConstKind::PtrToFunc(_)
@@ -241,6 +250,8 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         match func_at_node.def().kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {}
 
+            DataInstKind::FuncCall(_) => {}
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::Mem(_) => {
@@ -253,7 +264,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 unreachable!("`DataInstKind::QPtr` should be legalized away before lifting");
             }
 
-            DataInstKind::FuncCall(_) => {}
+            DataInstKind::ThunkBind(_) => {}
 
             DataInstKind::SpvInst(_) => {}
             DataInstKind::SpvExtInst { ext_set, .. } => {
@@ -501,6 +512,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
+                | DataInstKind::ThunkBind(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => {
                     Some(CfgCursor { point: CfgPoint::NodeExit(node), parent: cursor.parent })
@@ -708,9 +720,10 @@ impl<'a> FuncLifting<'a> {
 
             let insts = match point {
                 CfgPoint::NodeEntry(node) => match func_def_body.at(node).def().kind {
-                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
-                        SmallVec::new()
-                    }
+                    NodeKind::Select(_)
+                    | NodeKind::Loop { .. }
+                    | NodeKind::ExitInvocation(_)
+                    | DataInstKind::ThunkBind(_) => SmallVec::new(),
 
                     DataInstKind::FuncCall(_)
                     | DataInstKind::Mem(_)
@@ -730,7 +743,7 @@ impl<'a> FuncLifting<'a> {
                         .as_ref()
                         .and_then(|cfg| cfg.control_inst_on_exit_from.get(region));
                     if let Some(terminator) = unstructured_terminator {
-                        let cf::unstructured::ControlInst { attrs, kind, inputs, targets } =
+                        let cf::unstructured::ControlInst { attrs, kind, inputs, target_thunks } =
                             terminator;
                         Terminator {
                             attrs: *attrs,
@@ -748,7 +761,7 @@ impl<'a> FuncLifting<'a> {
                             // FIXME(eddyb) try limiting this to repeated target `Region`s
                             // which *also* pass different value inputs.
                             // NOTE(eddyb) this is also now used for returns.
-                            targets: (0..u32::try_from(targets.len()).unwrap())
+                            targets: (0..u32::try_from(target_thunks.len()).unwrap())
                                 .map(|edge_idx| CfgPoint::UnstructuredEdge {
                                     source: region,
                                     edge_idx,
@@ -772,11 +785,25 @@ impl<'a> FuncLifting<'a> {
                 }
                 (CfgPoint::UnstructuredEdge { source, edge_idx }, None) => {
                     let cfg = func_def_body.unstructured_cfg.as_ref().unwrap();
-                    let cf::unstructured::ControlInst { attrs, kind: _, inputs: _, targets } =
+                    let cf::unstructured::ControlInst { attrs, kind: _, inputs: _, target_thunks } =
                         &cfg.control_inst_on_exit_from[source];
-                    let cf::unstructured::ControlEdge { target, target_inputs } =
-                        &targets[edge_idx as usize];
-                    match *target {
+
+                    // FIXME(eddyb) deduplicate with `ControlTarget::of_thunk`.
+                    let func = func_def_body.at(());
+                    let (target, target_inputs) = match target_thunks[edge_idx as usize] {
+                        Value::Var(thunk) => match func.at(thunk).decl().kind() {
+                            VarKind::NodeOutput { node, output_idx: 0 } => {
+                                let thunk_node_def = func.at(node).def();
+                                match thunk_node_def.kind {
+                                    NodeKind::ThunkBind(target) => (target, &thunk_node_def.inputs),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        Value::Const(_) => unreachable!(),
+                    };
+                    match target {
                         cf::unstructured::ControlTarget::Region(target) => Terminator {
                             attrs: *attrs,
                             kind: TerminatorKind::Branch,
@@ -853,6 +880,7 @@ impl<'a> FuncLifting<'a> {
                         DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
+                        | DataInstKind::ThunkBind(_)
                         | DataInstKind::SpvInst(_)
                         | DataInstKind::SpvExtInst { .. } => unreachable!(),
                     }
@@ -933,6 +961,7 @@ impl<'a> FuncLifting<'a> {
                         | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
+                        | DataInstKind::ThunkBind(_)
                         | DataInstKind::SpvInst(_)
                         | DataInstKind::SpvExtInst { .. } => unreachable!(),
                     }
@@ -975,7 +1004,7 @@ impl<'a> FuncLifting<'a> {
                     // FIXME(eddyb) try limiting this to repeated target `Region`s
                     // which *also* pass different value inputs.
                     // NOTE(eddyb) this is also now used for returns.
-                    let edge_count = cfg.control_inst_on_exit_from[region].targets.len();
+                    let edge_count = cfg.control_inst_on_exit_from[region].target_thunks.len();
                     for edge_idx in 0..u32::try_from(edge_count).unwrap() {
                         visit_cfg_point(CfgCursor {
                             point: CfgPoint::UnstructuredEdge { source: region, edge_idx },
@@ -1337,8 +1366,11 @@ impl LazyInst<'_, '_> {
 
                     // Not inserted into `globals` while visiting.
                     TypeKind::QPtr
+                    | TypeKind::Thunk
                     | TypeKind::SpvTypeOperand
-                    | TypeKind::SpvStringLiteralForExtInst => unreachable!(),
+                    | TypeKind::SpvStringLiteralForExtInst => {
+                        unreachable!()
+                    }
                 },
                 Global::Const(ct) => {
                     let ct_def = &cx[ct];
@@ -1471,7 +1503,7 @@ impl LazyInst<'_, '_> {
                         unreachable!()
                     }
 
-                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => {
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) | DataInstKind::ThunkBind(_) => {
                         // Disallowed while visiting.
                         unreachable!()
                     }
