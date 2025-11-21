@@ -934,6 +934,7 @@ impl<'a> GatherAccesses<'a> {
                 DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
+                | DataInstKind::ThunkBind(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => {}
             }
@@ -1214,6 +1215,21 @@ impl<'a> GatherAccesses<'a> {
                                 })),
                             }),
                     );
+                }
+
+                DataInstKind::ThunkBind(_) => {
+                    if data_inst_def
+                        .inputs
+                        .iter()
+                        .any(|&v| is_qptr(func_def_body.at(v).type_of(&cx)))
+                    {
+                        accesses_or_err_attrs_to_attach.push((
+                            AttrTarget::Node(node),
+                            Err(AnalysisError(Diag::bug([
+                                "unsupported `thunk.bind` with pointer inputs".into(),
+                            ]))),
+                        ));
+                    }
                 }
 
                 DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {

@@ -1,7 +1,8 @@
 //! Unstructured control-flow graph (CFG) abstractions and utilities.
 
 use crate::{
-    AttrSet, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet, Region, Value, cf,
+    AttrSet, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet, NodeKind, Region, Value,
+    VarKind, cf,
 };
 use itertools::Either;
 use smallvec::SmallVec;
@@ -28,7 +29,7 @@ pub struct ControlInst {
 
     // FIXME(eddyb) change the inline size of this to fit most instructions.
     // FIXME(eddyb) should this be renamed to ("outgoing") `edges`?
-    pub targets: SmallVec<[ControlEdge; 4]>,
+    pub target_thunks: SmallVec<[Value; 4]>,
 }
 
 #[derive(Clone)]
@@ -39,6 +40,8 @@ pub enum ControlInstKind {
     ///
     /// Optimizations can take advantage of this information, to assume that any
     /// necessary preconditions for reaching this point, are never met.
+    //
+    // FIXME(eddyb) turn this into an `undef` thunk.
     Unreachable,
 
     /// Unconditional branch to a single target.
@@ -48,21 +51,36 @@ pub enum ControlInstKind {
     SelectBranch(cf::SelectionKind),
 }
 
-#[derive(Clone)]
-pub struct ControlEdge {
-    pub target: ControlTarget,
-
-    /// `target` inputs, i.e. `target_inputs[input_idx]` is the [`Value`] that
-    /// `VarKind::RegionInput { region: target, input_idx }` will get on entry.
-    pub target_inputs: SmallVec<[Value; 2]>,
-}
-
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ControlTarget {
     Region(Region),
 
     /// Leave the current function (returning `target_inputs`, if any).
+    //
+    // FIXME(eddyb) now that this is used through `NodeKind::ThunkBind`,
+    // it should probably be more like `break` or some kind of "leave scope".
     Return,
+}
+
+impl ControlTarget {
+    // HACK(eddyb) this isn't necessarily the best place, but allows reuse.
+    // FIXME(eddyb) properly distinguish the different failure cases possible,
+    // maybe even avoid panicking entirely?
+    fn of_thunk(func_at_thunk: FuncAt<'_, Value>) -> Self {
+        let thunk = func_at_thunk.position;
+        let func = func_at_thunk.at(());
+
+        match thunk {
+            Value::Var(thunk) => match func.at(thunk).decl().kind() {
+                VarKind::NodeOutput { node, output_idx: 0 } => match func.at(node).def().kind {
+                    NodeKind::ThunkBind(target) => target,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            Value::Const(_) => unreachable!(),
+        }
+    }
 }
 
 impl ControlFlowGraph {
@@ -121,6 +139,7 @@ mod sealed {
         }
     }
 }
+use crate::func_at::FuncAt;
 pub use sealed::IncomingEdgeCount;
 
 pub struct TraversalState<PreVisit: FnMut(Region), PostVisit: FnMut(Region)> {
@@ -144,14 +163,17 @@ impl ControlFlowGraph {
         assert!(std::ptr::eq(func_def_body.unstructured_cfg.as_ref().unwrap(), self));
         assert!(func_at_body.def().outputs.is_empty());
 
-        self.traverse(func_def_body.body, state);
+        self.traverse(func_at_body, state);
     }
 
     fn traverse(
         &self,
-        region: Region,
+        func_at_region: FuncAt<'_, Region>,
         state: &mut TraversalState<impl FnMut(Region), impl FnMut(Region)>,
     ) {
+        let func = func_at_region.at(());
+        let region = func_at_region.position;
+
         // FIXME(eddyb) `EntityOrientedDenseMap` should have an `entry` API.
         if let Some(existing_count) = state.incoming_edge_counts.get_mut(region) {
             *existing_count += IncomingEdgeCount::ONE;
@@ -166,9 +188,11 @@ impl ControlFlowGraph {
             .get(region)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
-        let targets = control_inst.targets.iter().filter_map(|edge| match edge.target {
-            ControlTarget::Region(target) => Some(target),
-            ControlTarget::Return => None,
+        let targets = control_inst.target_thunks.iter().filter_map(|&thunk| {
+            match ControlTarget::of_thunk(func.at(thunk)) {
+                ControlTarget::Region(target) => Some(target),
+                ControlTarget::Return => None,
+            }
         });
         let targets = if state.reverse_targets {
             Either::Left(targets.rev())
@@ -176,7 +200,7 @@ impl ControlFlowGraph {
             Either::Right(targets)
         };
         for target in targets {
-            self.traverse(target, state);
+            self.traverse(func.at(target), state);
         }
 
         (state.post_order_visit)(region);
@@ -208,6 +232,7 @@ impl ControlFlowGraph {
 ///    be misleading with explicit `break`s (moving user code from just before
 ///    the `break` to after the loop), but is less impactful than "maximal loops"
 pub struct LoopFinder<'a> {
+    func: FuncAt<'a, ()>,
     cfg: &'a ControlFlowGraph,
 
     // FIXME(eddyb) this feels a bit inefficient (are many-exit loops rare?).
@@ -272,8 +297,9 @@ impl std::ops::BitOrAssign for EventualCfgExits {
 }
 
 impl<'a> LoopFinder<'a> {
-    pub fn new(cfg: &'a ControlFlowGraph) -> Self {
+    pub fn new(func: FuncAt<'a, ()>, cfg: &'a ControlFlowGraph) -> Self {
         Self {
+            func,
             cfg,
             loop_header_to_exit_targets: FxIndexMap::default(),
             scc_stack: vec![],
@@ -333,20 +359,20 @@ impl<'a> LoopFinder<'a> {
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
         let mut eventual_cfg_exits = EventualCfgExits {
-            may_return_from_func: control_inst
-                .targets
-                .iter()
-                .any(|edge| matches!(edge.target, ControlTarget::Return)),
+            may_return_from_func: control_inst.target_thunks.iter().any(|&thunk| {
+                matches!(ControlTarget::of_thunk(self.func.at(thunk)), ControlTarget::Return)
+            }),
         };
 
         let earliest_scc_root = control_inst
-            .targets
+            .target_thunks
             .iter()
-            .filter_map(|edge| match edge.target {
-                ControlTarget::Region(target) => Some(target),
-                ControlTarget::Return => None,
-            })
-            .flat_map(|target| {
+            .flat_map(|&thunk| {
+                let target = match ControlTarget::of_thunk(self.func.at(thunk)) {
+                    ControlTarget::Region(target) => target,
+                    ControlTarget::Return => return None.into_iter().chain(None),
+                };
+
                 let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
                     self.find_earliest_scc_root_of(target);
                 eventual_cfg_exits |= eventual_cfg_exits_of_target;
@@ -400,12 +426,15 @@ impl<'a> LoopFinder<'a> {
                 self.scc_stack[scc_start..]
                     .iter()
                     .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node].targets.iter().filter_map(
-                            |edge| match edge.target {
-                                ControlTarget::Region(target) => Some(target),
-                                ControlTarget::Return => None,
-                            },
-                        )
+                        self.cfg.control_inst_on_exit_from[scc_node]
+                            .target_thunks
+                            .iter()
+                            .filter_map(|&thunk| {
+                                match ControlTarget::of_thunk(self.func.at(thunk)) {
+                                    ControlTarget::Region(target) => Some(target),
+                                    ControlTarget::Return => None,
+                                }
+                            })
                     })
                     .filter(|&target| target_is_exit(target))
                     .collect(),

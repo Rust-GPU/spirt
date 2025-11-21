@@ -552,6 +552,9 @@ pub enum TypeKind {
     // and kept separately in `VarDecl`, might be a better approach?
     QPtr,
 
+    // TODO(eddyb) reconsider name? add signature? etc.
+    Thunk,
+
     SpvInst {
         spv_inst: spv::Inst,
         // FIXME(eddyb) find a better name.
@@ -906,6 +909,9 @@ pub enum NodeKind {
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
     QPtr(qptr::QPtrOp),
+
+    // TODO(eddyb) document (maybe move into e.g. `cf::ThunkOp`?).
+    ThunkBind(cf::unstructured::ControlTarget),
 
     // FIXME(eddyb) should this have `#[from]`?
     SpvInst(spv::Inst),

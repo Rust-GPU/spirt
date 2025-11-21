@@ -832,6 +832,17 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 new_data_inst_def
             }
 
+            &DataInstKind::ThunkBind(_) => {
+                for &v in &data_inst_def.inputs {
+                    if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
+                        return Err(LiftError(Diag::bug([
+                            "unsupported `thunk.bind` with pointer inputs".into(),
+                        ])));
+                    }
+                }
+                return Ok(Transformed::Unchanged);
+            }
+
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
                 let mut to_spv_ptr_input_adjustments = vec![];
                 let mut from_spv_ptr_output = None;

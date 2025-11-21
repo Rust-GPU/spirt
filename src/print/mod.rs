@@ -613,25 +613,16 @@ impl<'a> Visitor<'a> for Plan<'a> {
         }
     }
 
-    fn visit_func_decl(&mut self, func_decl: &'a FuncDecl) {
-        if let DeclDef::Present(func_def_body) = &func_decl.def
-            && let Some(cfg) = &func_def_body.unstructured_cfg
-        {
-            for region in cfg.rev_post_order(func_def_body) {
-                if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                    for edge in &control_inst.targets {
-                        match edge.target {
-                            cf::unstructured::ControlTarget::Region(target) => {
-                                *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
-                            }
-                            cf::unstructured::ControlTarget::Return => {}
-                        }
-                    }
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
+        if let DataInstKind::ThunkBind(target) = func_at_node.def().kind {
+            match target {
+                cf::unstructured::ControlTarget::Region(target) => {
+                    *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
                 }
+                cf::unstructured::ControlTarget::Return => {}
             }
         }
-
-        func_decl.inner_visit_with(self);
+        func_at_node.inner_visit_with(self);
     }
 
     fn visit_value_use(&mut self, v: &'a Value) {
@@ -1115,9 +1106,9 @@ impl<'a> Printer<'a> {
                                                 || type_and_const_inputs.is_empty()
                                         }
 
-                                        TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {
-                                            true
-                                        }
+                                        TypeKind::QPtr
+                                        | TypeKind::Thunk
+                                        | TypeKind::SpvStringLiteralForExtInst => true,
                                     };
 
                                     ty_def.attrs == AttrSet::default()
@@ -3132,6 +3123,8 @@ impl Print for TypeDef {
                     // FIXME(eddyb) should this be shortened to `qtr`?
                     TypeKind::QPtr => printer.declarative_keyword_style().apply("qptr").into(),
 
+                    TypeKind::Thunk => printer.imperative_keyword_style().apply("thunk").into(),
+
                     TypeKind::SpvInst { spv_inst, type_and_const_inputs } => printer
                         .pretty_spv_inst(
                             printer.spv_op_style(),
@@ -3850,6 +3843,7 @@ impl Print for FuncAt<'_, Node> {
             DataInstKind::FuncCall(_)
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {
                 // FIXME(eddyb) `outputs_header` is wastefully built even in
@@ -4034,6 +4028,29 @@ impl FuncAt<'_, DataInst> {
                     pretty::join_comma_sep("(", [qptr_input].into_iter().chain(extra_inputs), ")"),
                 ])
             }
+
+            &DataInstKind::ThunkBind(target) => pretty::Fragment::new([
+                printer
+                    .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                    .apply("thunk.")
+                    .into(),
+                printer.imperative_keyword_style().apply("bind").into(),
+                pretty::join_comma_sep(
+                    "(",
+                    [
+                        match target {
+                            cf::unstructured::ControlTarget::Region(target) => {
+                                Use::RegionLabel(target).print(printer)
+                            }
+                            cf::unstructured::ControlTarget::Return => {
+                                printer.imperative_keyword_style().apply("return").into()
+                            }
+                        },
+                        pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+                    ],
+                    ")",
+                ),
+            ]),
 
             DataInstKind::SpvInst(inst) => printer.pretty_spv_inst(
                 printer.spv_op_style(),
@@ -4261,35 +4278,14 @@ impl FuncAt<'_, DataInst> {
 impl Print for cf::unstructured::ControlInst {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let Self { attrs, kind, inputs, targets } = self;
+        let Self { attrs, kind, inputs, target_thunks } = self;
 
         let attrs = attrs.print(printer);
 
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
 
-        let mut targets =
-            targets.iter().map(|cf::unstructured::ControlEdge { target, target_inputs }| {
-                let mut target = match *target {
-                    cf::unstructured::ControlTarget::Region(target) => pretty::Fragment::new([
-                        kw("branch"),
-                        " ".into(),
-                        Use::RegionLabel(target).print(printer),
-                    ]),
-                    cf::unstructured::ControlTarget::Return => kw("return"),
-                };
-                if !target_inputs.is_empty() {
-                    target = pretty::Fragment::new([
-                        target,
-                        pretty::join_comma_sep(
-                            "(",
-                            target_inputs.iter().map(|v| v.print(printer)),
-                            ")",
-                        ),
-                    ]);
-                }
-                target
-            });
+        let mut targets = target_thunks.iter().map(|v| v.print(printer));
 
         let def = match kind {
             cf::unstructured::ControlInstKind::Unreachable => {

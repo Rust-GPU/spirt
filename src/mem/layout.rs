@@ -213,6 +213,9 @@ impl<'a> LayoutCache<'a> {
                     ["`layout_of(qptr)` (already lowered?)".into()],
                 )));
             }
+            TypeKind::Thunk => {
+                return Err(LayoutError(Diag::bug(["`layout_of(thunk)`".into()])));
+            }
             TypeKind::SpvInst { spv_inst, type_and_const_inputs } => {
                 (spv_inst, type_and_const_inputs)
             }

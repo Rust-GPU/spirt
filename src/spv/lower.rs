@@ -1484,27 +1484,63 @@ impl Module {
                         }
                     }
 
+                    let mut build_thunk = |target, target_inputs| {
+                        let thunk_node = func_def_body.nodes.define(
+                            &cx,
+                            NodeDef {
+                                attrs: AttrSet::default(),
+                                kind: NodeKind::ThunkBind(target),
+                                inputs: target_inputs,
+                                child_regions: [].into_iter().collect(),
+                                outputs: [].into_iter().collect(),
+                            }
+                            .into(),
+                        );
+                        current_block_region_def
+                            .children
+                            .insert_last(thunk_node, &mut func_def_body.nodes);
+
+                        // FIXME(eddyb) cache this.
+                        let thunk_ty = cx.intern(TypeKind::Thunk);
+
+                        let thunk_var = func_def_body.vars.define(
+                            &cx,
+                            VarDecl {
+                                attrs: AttrSet::default(),
+                                ty: thunk_ty,
+
+                                def_parent: Either::Right(thunk_node),
+                                def_idx: 0,
+                            },
+                        );
+                        func_def_body.nodes[thunk_node].outputs.push(thunk_var);
+
+                        Value::Var(thunk_var)
+                    };
+
                     // FIXME(eddyb) collect targets in this form to
                     // begin with (instead of recombining them here).
-                    let mut targets: SmallVec<[_; 4]> = targets
+                    let mut target_thunks: SmallVec<[_; 4]> = targets
                         .into_iter()
-                        .map(|target| cf::unstructured::ControlEdge {
-                            target: cf::unstructured::ControlTarget::Region(target),
-                            target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
+                        .map(|target| {
+                            build_thunk(
+                                cf::unstructured::ControlTarget::Region(target),
+                                target_inputs.get(&target).cloned().unwrap_or_default(),
+                            )
                         })
                         .collect();
 
                     let kind = if opcode == wk.OpUnreachable {
-                        assert!(targets.is_empty() && inputs.is_empty());
+                        assert!(target_thunks.is_empty() && inputs.is_empty());
                         cf::unstructured::ControlInstKind::Unreachable
                     } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
-                        assert!(targets.is_empty() && inputs.len() <= 1);
-                        targets.push(cf::unstructured::ControlEdge {
-                            target: cf::unstructured::ControlTarget::Return,
-                            target_inputs: mem::take(&mut inputs),
-                        });
+                        assert!(target_thunks.is_empty() && inputs.len() <= 1);
+                        target_thunks.push(build_thunk(
+                            cf::unstructured::ControlTarget::Return,
+                            mem::take(&mut inputs),
+                        ));
                         cf::unstructured::ControlInstKind::Branch
-                    } else if targets.is_empty() {
+                    } else if target_thunks.is_empty() {
                         let node = func_def_body.nodes.define(
                             &cx,
                             NodeDef {
@@ -1523,10 +1559,10 @@ impl Module {
                             .insert_last(node, &mut func_def_body.nodes);
                         cf::unstructured::ControlInstKind::Unreachable
                     } else if opcode == wk.OpBranch {
-                        assert_eq!((targets.len(), inputs.len()), (1, 0));
+                        assert_eq!((target_thunks.len(), inputs.len()), (1, 0));
                         cf::unstructured::ControlInstKind::Branch
                     } else if opcode == wk.OpBranchConditional {
-                        assert_eq!((targets.len(), inputs.len()), (2, 1));
+                        assert_eq!((target_thunks.len(), inputs.len()), (2, 1));
                         cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
                     } else if opcode == wk.OpSwitch {
                         cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
@@ -1543,7 +1579,7 @@ impl Module {
                         .control_inst_on_exit_from
                         .insert(
                             current_block.region,
-                            cf::unstructured::ControlInst { attrs, kind, inputs, targets },
+                            cf::unstructured::ControlInst { attrs, kind, inputs, target_thunks },
                         );
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {
