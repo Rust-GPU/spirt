@@ -331,7 +331,10 @@ impl InnerVisit for TypeDef {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            TypeKind::QPtr | TypeKind::SpvTypeOperand | TypeKind::SpvStringLiteralForExtInst => {}
+            TypeKind::QPtr
+            | TypeKind::Thunk
+            | TypeKind::SpvTypeOperand
+            | TypeKind::SpvStringLiteralForExtInst => {}
 
             TypeKind::SpvInst { spv_inst: _, type_and_const_inputs } => {
                 for &ty_or_ct in type_and_const_inputs {
@@ -495,6 +498,7 @@ impl<'a> FuncAt<'a, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. },
             )
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}
         }
@@ -527,7 +531,7 @@ impl InnerVisit for VarDecl {
 
 impl InnerVisit for cf::unstructured::ControlInst {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, targets } = self;
+        let Self { attrs, kind, inputs, target_thunks } = self;
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
@@ -540,10 +544,8 @@ impl InnerVisit for cf::unstructured::ControlInst {
         for v in inputs {
             visitor.visit_value_use(v);
         }
-        for cf::unstructured::ControlEdge { target: _, target_inputs } in targets {
-            for v in target_inputs {
-                visitor.visit_value_use(v);
-            }
+        for v in target_thunks {
+            visitor.visit_value_use(v);
         }
     }
 }

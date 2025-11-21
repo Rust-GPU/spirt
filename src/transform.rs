@@ -459,6 +459,7 @@ impl InnerTransform for TypeDef {
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
                 TypeKind::QPtr
+                | TypeKind::Thunk
                 | TypeKind::SpvTypeOperand
                 | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
@@ -667,6 +668,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. },
             )
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}
         }
@@ -707,7 +709,7 @@ impl InnerInPlaceTransform for VarDecl {
 
 impl InnerInPlaceTransform for cf::unstructured::ControlInst {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, kind, inputs, targets } = self;
+        let Self { attrs, kind, inputs, target_thunks } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         match kind {
@@ -720,10 +722,8 @@ impl InnerInPlaceTransform for cf::unstructured::ControlInst {
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
         }
-        for cf::unstructured::ControlEdge { target: _, target_inputs } in targets {
-            for v in target_inputs {
-                transformer.transform_value_use(v).apply_to(v);
-            }
+        for v in target_thunks {
+            transformer.transform_value_use(v).apply_to(v);
         }
     }
 }

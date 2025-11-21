@@ -637,7 +637,8 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             | NodeKind::ExitInvocation(_)
             | DataInstKind::FuncCall(_)
             | DataInstKind::Mem(_)
-            | DataInstKind::QPtr(_) => return,
+            | DataInstKind::QPtr(_)
+            | DataInstKind::ThunkBind(_) => return,
 
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
         }

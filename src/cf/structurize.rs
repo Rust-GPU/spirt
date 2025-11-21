@@ -4,9 +4,9 @@
 
 use crate::cf::SelectionKind;
 use crate::cf::unstructured::{
-    ControlEdge, ControlInst, ControlInstKind, ControlTarget, IncomingEdgeCount,
-    LoopFinder, TraversalState,
+    ControlInst, ControlInstKind, ControlTarget, IncomingEdgeCount, LoopFinder, TraversalState,
 };
+use crate::func_at::FuncAtMut;
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
@@ -589,8 +589,8 @@ impl<'a> Structurizer<'a> {
                 .unstructured_cfg
                 .as_ref()
                 .map(|cfg| {
-                    let loop_header_to_exit_targets =
-                        LoopFinder::new(cfg).find_all_loops_starting_at(func_def_body.body);
+                    let loop_header_to_exit_targets = LoopFinder::new(func_def_body.at(()), cfg)
+                        .find_all_loops_starting_at(func_def_body.body);
 
                     let mut state = TraversalState {
                         incoming_edge_counts: EntityOrientedDenseMap::new(),
@@ -1059,12 +1059,38 @@ impl<'a> Structurizer<'a> {
         // always appending `Node`s (including the children of entire
         // `ClaimedRegion`s) to `region`'s definition itself.
         let mut deferred_edges = {
-            let ControlInst { attrs, kind, inputs, targets } = control_inst_on_exit;
+            let ControlInst { attrs, kind, inputs, target_thunks } = control_inst_on_exit;
 
-            let target_regions: SmallVec<[_; 8]> = targets
+            let target_regions: SmallVec<[_; 8]> = target_thunks
                 .iter()
-                .cloned()
-                .map(|ControlEdge { target, target_inputs }| {
+                .map(|&thunk| {
+                    let (target, target_inputs) = match thunk {
+                        Value::Var(thunk) => match self.func_def_body.at(thunk).decl().kind() {
+                            VarKind::NodeOutput { node, output_idx: 0 } => {
+                                let thunk_node_def = self.func_def_body.at_mut(node).def();
+                                let target = match thunk_node_def.kind {
+                                    NodeKind::ThunkBind(target) => target,
+                                    _ => unreachable!(),
+                                };
+
+                                // NOTE(eddyb) this can only occur if the thunk
+                                // is used more than once (which is illegal).
+                                assert!(thunk_node_def.outputs[..] == [thunk]);
+                                thunk_node_def.outputs.clear();
+
+                                let target_inputs = mem::take(&mut thunk_node_def.inputs);
+
+                                self.func_def_body.regions[region]
+                                    .children
+                                    .remove(node, &mut self.func_def_body.nodes);
+
+                                (target, target_inputs)
+                            }
+                            _ => unreachable!(),
+                        },
+                        Value::Const(_) => unreachable!(),
+                    };
+
                     let target = match target {
                         ControlTarget::Region(target) => target,
                         ControlTarget::Return => {
@@ -1080,7 +1106,7 @@ impl<'a> Structurizer<'a> {
                         }
                     };
                     self.try_claim_edge_bundle(IncomingEdgeBundle {
-                        attrs: if targets.len() == 1 { attrs } else { AttrSet::default() },
+                        attrs: if target_thunks.len() == 1 { attrs } else { AttrSet::default() },
                         target,
                         accumulated_count: IncomingEdgeCount::ONE,
                         target_inputs,
@@ -1805,6 +1831,46 @@ impl<'a> Structurizer<'a> {
              after it takes `structurize_region_state`"
         );
 
+        let cx = self.cx;
+
+        let thunk_ty = cx.intern(TypeKind::Thunk);
+        let build_thunk = |func_at_region: FuncAtMut<'_, Region>, target, target_inputs| {
+            let region = func_at_region.position;
+            let func = func_at_region.at(());
+
+            let target = match target {
+                DeferredTarget::Region(target) => ControlTarget::Region(target),
+                DeferredTarget::Return => ControlTarget::Return,
+            };
+
+            let thunk_node = func.nodes.define(
+                cx,
+                NodeDef {
+                    attrs: AttrSet::default(),
+                    kind: NodeKind::ThunkBind(target),
+                    inputs: target_inputs,
+                    child_regions: [].into_iter().collect(),
+                    outputs: [].into_iter().collect(),
+                }
+                .into(),
+            );
+            func.regions[region].children.insert_last(thunk_node, func.nodes);
+
+            let thunk_var = func.vars.define(
+                cx,
+                VarDecl {
+                    attrs: AttrSet::default(),
+                    ty: thunk_ty,
+
+                    def_parent: Either::Right(thunk_node),
+                    def_idx: 0,
+                },
+            );
+            func.nodes[thunk_node].outputs.push(thunk_var);
+
+            Value::Var(thunk_var)
+        };
+
         // Build a chain of conditional branches to apply deferred edges.
         let mut control_source = Some(region);
         loop {
@@ -1812,13 +1878,11 @@ impl<'a> Structurizer<'a> {
             (taken_then, deferred_edges) = deferred_edges.split_out_matching(|deferred| {
                 Ok((
                     deferred.condition,
-                    ControlEdge {
-                        target: match deferred.edge_bundle.target {
-                            DeferredTarget::Region(target) => ControlTarget::Region(target),
-                            DeferredTarget::Return => ControlTarget::Return,
-                        },
-                        target_inputs: deferred.edge_bundle.target_inputs,
-                    },
+                    build_thunk(
+                        self.func_def_body.at_mut(control_source.unwrap()),
+                        deferred.edge_bundle.target,
+                        deferred.edge_bundle.target_inputs,
+                    ),
                 ))
             });
             let Some((condition, then_edge)) = taken_then else {
@@ -1831,25 +1895,24 @@ impl<'a> Structurizer<'a> {
                 DeferredEdgeBundleSet::Unreachable => None,
                 DeferredEdgeBundleSet::Always { target: else_target, edge_bundle } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
-                    Some(ControlEdge {
-                        target: match else_target {
-                            DeferredTarget::Region(target) => ControlTarget::Region(target),
-                            DeferredTarget::Return => ControlTarget::Return,
-                        },
-                        target_inputs: edge_bundle.target_inputs,
-                    })
+                    Some(build_thunk(
+                        self.func_def_body.at_mut(branch_source),
+                        else_target,
+                        edge_bundle.target_inputs,
+                    ))
                 }
 
                 // More branches are needed, so the "else" case must be a `Region`
                 // that itself can have a `ControlInst` attached to it later on.
                 DeferredEdgeBundleSet::Choice { .. } => {
                     let new_empty_region =
-                        self.func_def_body.regions.define(self.cx, RegionDef::default());
+                        self.func_def_body.regions.define(cx, RegionDef::default());
                     control_source = Some(new_empty_region);
-                    Some(ControlEdge {
-                        target: ControlTarget::Region(new_empty_region),
-                        target_inputs: [].into_iter().collect(),
-                    })
+                    Some(build_thunk(
+                        self.func_def_body.at_mut(branch_source),
+                        DeferredTarget::Region(new_empty_region),
+                        [].into_iter().collect(),
+                    ))
                 }
             };
 
@@ -1864,7 +1927,7 @@ impl<'a> Structurizer<'a> {
                     ControlInstKind::Branch
                 },
                 inputs: condition.into_iter().collect(),
-                targets: [then_edge].into_iter().chain(else_edge).collect(),
+                target_thunks: [then_edge].into_iter().chain(else_edge).collect(),
             };
             assert!(
                 self.func_def_body
@@ -1889,7 +1952,7 @@ impl<'a> Structurizer<'a> {
             attrs: AttrSet::default(),
             kind: ControlInstKind::Unreachable,
             inputs: [].into_iter().collect(),
-            targets: [].into_iter().collect(),
+            target_thunks: [].into_iter().collect(),
         };
         assert!(
             self.func_def_body
