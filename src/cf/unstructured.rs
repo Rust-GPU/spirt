@@ -41,9 +41,6 @@ pub enum ControlInstKind {
     /// necessary preconditions for reaching this point, are never met.
     Unreachable,
 
-    /// Leave the current function, optionally returning a value.
-    Return,
-
     /// Unconditional branch to a single target.
     Branch,
 
@@ -53,11 +50,19 @@ pub enum ControlInstKind {
 
 #[derive(Clone)]
 pub struct ControlEdge {
-    pub target: Region,
+    pub target: ControlTarget,
 
     /// `target` inputs, i.e. `target_inputs[input_idx]` is the [`Value`] that
     /// `VarKind::RegionInput { region: target, input_idx }` will get on entry.
     pub target_inputs: SmallVec<[Value; 2]>,
+}
+
+#[derive(Copy, Clone)]
+pub enum ControlTarget {
+    Region(Region),
+
+    /// Leave the current function (returning `target_inputs`, if any).
+    Return,
 }
 
 impl ControlFlowGraph {
@@ -161,7 +166,10 @@ impl ControlFlowGraph {
             .get(region)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
-        let targets = control_inst.targets.iter().map(|edge| edge.target);
+        let targets = control_inst.targets.iter().filter_map(|edge| match edge.target {
+            ControlTarget::Region(target) => Some(target),
+            ControlTarget::Return => None,
+        });
         let targets = if state.reverse_targets {
             Either::Left(targets.rev())
         } else {
@@ -309,7 +317,7 @@ impl<'a> LoopFinder<'a> {
                     // `Complete` state until the loop header itself is complete,
                     // and the monotonic nature of `EventualCfgExits` means that
                     // the loop header will still get to see the complete picture.
-                    (Some(scc_stack_idx), EventualCfgExits::default())
+                    (Some(scc_stack_idx), EventualCfgExits { may_return_from_func: false })
                 }
                 SccState::Complete(eventual_cfg_exits) => (None, eventual_cfg_exits),
             };
@@ -324,16 +332,21 @@ impl<'a> LoopFinder<'a> {
             .get(node)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
-        let mut eventual_cfg_exits = EventualCfgExits::default();
-
-        if let ControlInstKind::Return = control_inst.kind {
-            eventual_cfg_exits.may_return_from_func = true;
-        }
+        let mut eventual_cfg_exits = EventualCfgExits {
+            may_return_from_func: control_inst
+                .targets
+                .iter()
+                .any(|edge| matches!(edge.target, ControlTarget::Return)),
+        };
 
         let earliest_scc_root = control_inst
             .targets
             .iter()
-            .flat_map(|&ControlEdge { target, target_inputs: _ }| {
+            .filter_map(|edge| match edge.target {
+                ControlTarget::Region(target) => Some(target),
+                ControlTarget::Return => None,
+            })
+            .flat_map(|target| {
                 let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
                     self.find_earliest_scc_root_of(target);
                 eventual_cfg_exits |= eventual_cfg_exits_of_target;
@@ -387,10 +400,12 @@ impl<'a> LoopFinder<'a> {
                 self.scc_stack[scc_start..]
                     .iter()
                     .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node]
-                            .targets
-                            .iter()
-                            .map(|edge| edge.target)
+                        self.cfg.control_inst_on_exit_from[scc_node].targets.iter().filter_map(
+                            |edge| match edge.target {
+                                ControlTarget::Region(target) => Some(target),
+                                ControlTarget::Return => None,
+                            },
+                        )
                     })
                     .filter(|&target| target_is_exit(target))
                     .collect(),
