@@ -619,8 +619,8 @@ impl<'a> Visitor<'a> for Plan<'a> {
         {
             for region in cfg.rev_post_order(func_def_body) {
                 if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                    for &target in &control_inst.targets {
-                        *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
+                    for edge in &control_inst.targets {
+                        *self.use_counts.entry(Use::RegionLabel(edge.target)).or_default() += 1;
                     }
                 }
             }
@@ -4256,27 +4256,32 @@ impl FuncAt<'_, DataInst> {
 impl Print for cf::unstructured::ControlInst {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let Self { attrs, kind, inputs, targets, target_inputs } = self;
+        let Self { attrs, kind, inputs, targets } = self;
 
         let attrs = attrs.print(printer);
 
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
 
-        let mut targets = targets.iter().map(|&target_region| {
-            let mut target = pretty::Fragment::new([
-                kw("branch"),
-                " ".into(),
-                Use::RegionLabel(target_region).print(printer),
-            ]);
-            if let Some(inputs) = target_inputs.get(&target_region) {
-                target = pretty::Fragment::new([
-                    target,
-                    pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+        let mut targets =
+            targets.iter().map(|cf::unstructured::ControlEdge { target, target_inputs }| {
+                let mut target = pretty::Fragment::new([
+                    kw("branch"),
+                    " ".into(),
+                    Use::RegionLabel(*target).print(printer),
                 ]);
-            }
-            target
-        });
+                if !target_inputs.is_empty() {
+                    target = pretty::Fragment::new([
+                        target,
+                        pretty::join_comma_sep(
+                            "(",
+                            target_inputs.iter().map(|v| v.print(printer)),
+                            ")",
+                        ),
+                    ]);
+                }
+                target
+            });
 
         let def = match kind {
             cf::unstructured::ControlInstKind::Unreachable => {

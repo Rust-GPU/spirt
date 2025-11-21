@@ -288,6 +288,11 @@ enum CfgPoint {
 
     NodeEntry(Node),
     NodeExit(Node),
+
+    // HACK(eddyb) this is only needed to recover φ ("phi") semantics for
+    // unstructured CFG edges, while letting SPIR-T use "BB args" semantics
+    // (i.e. potentially different values for the same target `Region`).
+    UnstructuredEdge { source: Region, edge_idx: u32 },
 }
 
 struct BlockLifting<'a> {
@@ -441,6 +446,10 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                     CfgCursor { point: CfgPoint::NodeExit(parent_node), parent: parent.parent }
                 }
             }),
+            CfgPoint::UnstructuredEdge { .. } => {
+                assert!(cursor.parent.is_none());
+                None
+            }
 
             // Entering a `Node` depends entirely on the `NodeKind`.
             CfgPoint::NodeEntry(node) => match self.at(node).def().kind {
@@ -593,7 +602,7 @@ impl<'a> FuncLifting<'a> {
                             .collect::<Result<_, _>>()?
                     }
                 }
-                CfgPoint::RegionExit(_) => SmallVec::new(),
+                CfgPoint::RegionExit(_) | CfgPoint::UnstructuredEdge { .. } => SmallVec::new(),
 
                 CfgPoint::NodeEntry(node) => {
                     let node_def = func_def_body.at(node).def();
@@ -680,13 +689,8 @@ impl<'a> FuncLifting<'a> {
                         .as_ref()
                         .and_then(|cfg| cfg.control_inst_on_exit_from.get(region));
                     if let Some(terminator) = unstructured_terminator {
-                        let cf::unstructured::ControlInst {
-                            attrs,
-                            kind,
-                            inputs,
-                            targets,
-                            target_inputs,
-                        } = terminator;
+                        let cf::unstructured::ControlInst { attrs, kind, inputs, targets } =
+                            terminator;
                         Terminator {
                             attrs: *attrs,
                             kind: match kind {
@@ -701,16 +705,15 @@ impl<'a> FuncLifting<'a> {
                             },
                             // FIXME(eddyb) borrow these whenever possible.
                             inputs: inputs.clone(),
-                            targets: targets
-                                .iter()
-                                .map(|&target| CfgPoint::RegionEntry(target))
-                                .collect(),
-                            target_phi_values: target_inputs
-                                .iter()
-                                .map(|(&target, target_inputs)| {
-                                    (CfgPoint::RegionEntry(target), &target_inputs[..])
+                            // FIXME(eddyb) try limiting this to repeated target `Region`s
+                            // which *also* pass different value inputs.
+                            targets: (0..u32::try_from(targets.len()).unwrap())
+                                .map(|edge_idx| CfgPoint::UnstructuredEdge {
+                                    source: region,
+                                    edge_idx,
                                 })
                                 .collect(),
+                            target_phi_values: FxIndexMap::default(),
                             merge: None,
                         }
                     } else {
@@ -724,6 +727,21 @@ impl<'a> FuncLifting<'a> {
                             target_phi_values: FxIndexMap::default(),
                             merge: None,
                         }
+                    }
+                }
+                (CfgPoint::UnstructuredEdge { source, edge_idx }, None) => {
+                    let cfg = func_def_body.unstructured_cfg.as_ref().unwrap();
+                    let cf::unstructured::ControlEdge { target, target_inputs } =
+                        &cfg.control_inst_on_exit_from[source].targets[edge_idx as usize];
+                    Terminator {
+                        attrs: AttrSet::default(),
+                        kind: TerminatorKind::Branch,
+                        inputs: [].into_iter().collect(),
+                        targets: [CfgPoint::RegionEntry(*target)].into_iter().collect(),
+                        target_phi_values: [(CfgPoint::RegionEntry(*target), &target_inputs[..])]
+                            .into_iter()
+                            .collect(),
+                        merge: None,
                     }
                 }
 
@@ -896,6 +914,16 @@ impl<'a> FuncLifting<'a> {
             Some(cfg) => {
                 for region in cfg.rev_post_order(func_def_body) {
                     func_def_body.at(region).rev_post_order_try_for_each(&mut visit_cfg_point)?;
+
+                    // FIXME(eddyb) try limiting this to repeated target `Region`s
+                    // which *also* pass different value inputs.
+                    let edge_count = cfg.control_inst_on_exit_from[region].targets.len();
+                    for edge_idx in 0..u32::try_from(edge_count).unwrap() {
+                        visit_cfg_point(CfgCursor {
+                            point: CfgPoint::UnstructuredEdge { source: region, edge_idx },
+                            parent: None,
+                        })?;
+                    }
                 }
             }
         }

@@ -1465,7 +1465,7 @@ impl Module {
                     // Split the operands into value inputs (e.g. a branch's
                     // condition or an `OpSwitch`'s selector) and target blocks.
                     let mut inputs = SmallVec::new();
-                    let mut targets = SmallVec::new();
+                    let mut targets = SmallVec::<[_; 4]>::new();
                     for &id in ids {
                         match lookup_global_or_local_id_for_data_or_control_inst_input(id)? {
                             LocalIdDef::Value(v) => {
@@ -1533,8 +1533,18 @@ impl Module {
                                 attrs,
                                 kind,
                                 inputs,
-                                targets,
-                                target_inputs,
+                                // FIXME(eddyb) collect targets in this form to
+                                // begin with (instead of recombining them here).
+                                targets: targets
+                                    .into_iter()
+                                    .map(|target| cf::unstructured::ControlEdge {
+                                        target,
+                                        target_inputs: target_inputs
+                                            .get(&target)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    })
+                                    .collect(),
                             },
                         );
                 } else if opcode == wk.OpPhi {

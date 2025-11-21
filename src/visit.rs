@@ -515,7 +515,7 @@ impl InnerVisit for VarDecl {
 
 impl InnerVisit for cf::unstructured::ControlInst {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
+        let Self { attrs, kind, inputs, targets } = self;
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
@@ -529,8 +529,8 @@ impl InnerVisit for cf::unstructured::ControlInst {
         for v in inputs {
             visitor.visit_value_use(v);
         }
-        for inputs in target_inputs.values() {
-            for v in inputs {
+        for cf::unstructured::ControlEdge { target: _, target_inputs } in targets {
+            for v in target_inputs {
                 visitor.visit_value_use(v);
             }
         }
