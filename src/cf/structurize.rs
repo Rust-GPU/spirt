@@ -4,7 +4,8 @@
 
 use crate::cf::SelectionKind;
 use crate::cf::unstructured::{
-    ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder, TraversalState,
+    ControlEdge, ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder,
+    TraversalState,
 };
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
@@ -1056,16 +1057,17 @@ impl<'a> Structurizer<'a> {
         // always appending `Node`s (including the children of entire
         // `ClaimedRegion`s) to `region`'s definition itself.
         let mut deferred_edges = {
-            let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
+            let ControlInst { attrs, kind, inputs, targets } = control_inst_on_exit;
 
             let target_regions: SmallVec<[_; 8]> = targets
                 .iter()
-                .map(|&target| {
+                .cloned()
+                .map(|ControlEdge { target, target_inputs }| {
                     self.try_claim_edge_bundle(IncomingEdgeBundle {
                         attrs: if targets.len() == 1 { attrs } else { AttrSet::default() },
                         target,
                         accumulated_count: IncomingEdgeCount::ONE,
-                        target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
+                        target_inputs,
                     })
                     .map_err(|edge_bundle| {
                         // HACK(eddyb) special-case "shared `unreachable`" to
@@ -1807,16 +1809,17 @@ impl<'a> Structurizer<'a> {
             let taken_then;
             (taken_then, deferred_edges) =
                 deferred_edges.split_out_matching(|deferred| match deferred.edge_bundle.target {
-                    DeferredTarget::Region(target) => {
-                        Ok((deferred.condition, (target, deferred.edge_bundle.target_inputs)))
-                    }
+                    DeferredTarget::Region(target) => Ok((
+                        deferred.condition,
+                        ControlEdge { target, target_inputs: deferred.edge_bundle.target_inputs },
+                    )),
                     DeferredTarget::Return => Err(deferred),
                 });
-            let Some((condition, then_target_and_inputs)) = taken_then else {
+            let Some((condition, then_edge)) = taken_then else {
                 break;
             };
             let branch_source = control_source.take().unwrap();
-            let else_target_and_inputs = match deferred_edges {
+            let else_edge = match deferred_edges {
                 // At most one deferral left, so it can be used as the "else"
                 // case, or the branch left unconditional in its absence.
                 DeferredEdgeBundleSet::Unreachable => None,
@@ -1825,7 +1828,10 @@ impl<'a> Structurizer<'a> {
                     edge_bundle,
                 } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
-                    Some((else_target, edge_bundle.target_inputs))
+                    Some(ControlEdge {
+                        target: else_target,
+                        target_inputs: edge_bundle.target_inputs,
+                    })
                 }
 
                 // Either more branches, or a deferred return, are needed, so
@@ -1835,12 +1841,15 @@ impl<'a> Structurizer<'a> {
                     let new_empty_region =
                         self.func_def_body.regions.define(self.cx, RegionDef::default());
                     control_source = Some(new_empty_region);
-                    Some((new_empty_region, [].into_iter().collect()))
+                    Some(ControlEdge {
+                        target: new_empty_region,
+                        target_inputs: [].into_iter().collect(),
+                    })
                 }
             };
 
             let condition = Some(condition)
-                .filter(|_| else_target_and_inputs.is_some())
+                .filter(|_| else_edge.is_some())
                 .map(|cond| self.materialize_lazy_cond(&cond));
             let branch_control_inst = ControlInst {
                 attrs: AttrSet::default(),
@@ -1850,16 +1859,7 @@ impl<'a> Structurizer<'a> {
                     ControlInstKind::Branch
                 },
                 inputs: condition.into_iter().collect(),
-                targets: [&then_target_and_inputs]
-                    .into_iter()
-                    .chain(&else_target_and_inputs)
-                    .map(|&(target, _)| target)
-                    .collect(),
-                target_inputs: [then_target_and_inputs]
-                    .into_iter()
-                    .chain(else_target_and_inputs)
-                    .filter(|(_, inputs)| !inputs.is_empty())
-                    .collect(),
+                targets: [then_edge].into_iter().chain(else_edge).collect(),
             };
             assert!(
                 self.func_def_body
@@ -1901,7 +1901,6 @@ impl<'a> Structurizer<'a> {
                 kind,
                 inputs,
                 targets: [].into_iter().collect(),
-                target_inputs: FxIndexMap::default(),
             }
         };
         assert!(
