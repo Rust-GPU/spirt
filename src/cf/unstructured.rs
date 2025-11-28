@@ -1,8 +1,8 @@
 //! Unstructured control-flow graph (CFG) abstractions and utilities.
 
 use crate::{
-    AttrSet, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet, NodeKind, Region, Value,
-    VarKind, cf,
+    AttrSet, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet,
+    NodeKind, Region, Value, Var, VarKind, cf,
 };
 use itertools::Either;
 use smallvec::SmallVec;
@@ -34,16 +34,6 @@ pub struct ControlInst {
 
 #[derive(Clone)]
 pub enum ControlInstKind {
-    /// Reaching this point in the control-flow is undefined behavior, e.g.:
-    /// * a `SelectBranch` case that's known to be impossible
-    /// * after a function call, where the function never returns
-    ///
-    /// Optimizations can take advantage of this information, to assume that any
-    /// necessary preconditions for reaching this point, are never met.
-    //
-    // FIXME(eddyb) turn this into an `undef` thunk.
-    Unreachable,
-
     /// Unconditional branch to a single target.
     Branch,
 
@@ -62,23 +52,34 @@ pub enum ControlTarget {
     Return,
 }
 
+// HACK(eddyb) marker type for an `undef` thunk.
+struct Unreachable;
+
 impl ControlTarget {
     // HACK(eddyb) this isn't necessarily the best place, but allows reuse.
     // FIXME(eddyb) properly distinguish the different failure cases possible,
     // maybe even avoid panicking entirely?
-    fn of_thunk(func_at_thunk: FuncAt<'_, Value>) -> Self {
-        let thunk = func_at_thunk.position;
-        let func = func_at_thunk.at(());
-
-        match thunk {
-            Value::Var(thunk) => match func.at(thunk).decl().kind() {
-                VarKind::NodeOutput { node, output_idx: 0 } => match func.at(node).def().kind {
-                    NodeKind::ThunkBind(target) => target,
-                    _ => unreachable!(),
-                },
+    fn of_thunk(cx: &Context, func_at_thunk: FuncAt<'_, Value>) -> Result<Self, Unreachable> {
+        match func_at_thunk.position {
+            Value::Var(thunk) => Ok(ControlTarget::of_thunk_var(func_at_thunk.at(thunk))),
+            Value::Const(ct) => match cx[ct].kind {
+                ConstKind::Undef => Err(Unreachable),
                 _ => unreachable!(),
             },
-            Value::Const(_) => unreachable!(),
+        }
+    }
+
+    // HACK(eddyb) this is the `Value::Var` case from `of_thunk`, separated so
+    // that traversal doesn't need to have access to the `Context`.
+    fn of_thunk_var(func_at_thunk: FuncAt<'_, Var>) -> Self {
+        match func_at_thunk.decl().kind() {
+            VarKind::NodeOutput { node, output_idx: 0 } => {
+                match func_at_thunk.at(node).def().kind {
+                    NodeKind::ThunkBind(target) => target,
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -188,11 +189,12 @@ impl ControlFlowGraph {
             .get(region)
             .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
 
-        let targets = control_inst.target_thunks.iter().filter_map(|&thunk| {
-            match ControlTarget::of_thunk(func.at(thunk)) {
+        let targets = control_inst.target_thunks.iter().filter_map(|&thunk| match thunk {
+            Value::Var(thunk) => match ControlTarget::of_thunk_var(func.at(thunk)) {
                 ControlTarget::Region(target) => Some(target),
                 ControlTarget::Return => None,
-            }
+            },
+            Value::Const(_) => None,
         });
         let targets = if state.reverse_targets {
             Either::Left(targets.rev())
@@ -232,6 +234,7 @@ impl ControlFlowGraph {
 ///    be misleading with explicit `break`s (moving user code from just before
 ///    the `break` to after the loop), but is less impactful than "maximal loops"
 pub struct LoopFinder<'a> {
+    cx: &'a Context,
     func: FuncAt<'a, ()>,
     cfg: &'a ControlFlowGraph,
 
@@ -297,8 +300,9 @@ impl std::ops::BitOrAssign for EventualCfgExits {
 }
 
 impl<'a> LoopFinder<'a> {
-    pub fn new(func: FuncAt<'a, ()>, cfg: &'a ControlFlowGraph) -> Self {
+    pub fn new(cx: &'a Context, func: FuncAt<'a, ()>, cfg: &'a ControlFlowGraph) -> Self {
         Self {
+            cx,
             func,
             cfg,
             loop_header_to_exit_targets: FxIndexMap::default(),
@@ -360,7 +364,10 @@ impl<'a> LoopFinder<'a> {
 
         let mut eventual_cfg_exits = EventualCfgExits {
             may_return_from_func: control_inst.target_thunks.iter().any(|&thunk| {
-                matches!(ControlTarget::of_thunk(self.func.at(thunk)), ControlTarget::Return)
+                matches!(
+                    ControlTarget::of_thunk(self.cx, self.func.at(thunk)),
+                    Ok(ControlTarget::Return)
+                )
             }),
         };
 
@@ -368,9 +375,11 @@ impl<'a> LoopFinder<'a> {
             .target_thunks
             .iter()
             .flat_map(|&thunk| {
-                let target = match ControlTarget::of_thunk(self.func.at(thunk)) {
-                    ControlTarget::Region(target) => target,
-                    ControlTarget::Return => return None.into_iter().chain(None),
+                let target = match ControlTarget::of_thunk(self.cx, self.func.at(thunk)) {
+                    Ok(ControlTarget::Region(target)) => target,
+                    Ok(ControlTarget::Return) | Err(Unreachable) => {
+                        return None.into_iter().chain(None);
+                    }
                 };
 
                 let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
@@ -430,9 +439,9 @@ impl<'a> LoopFinder<'a> {
                             .target_thunks
                             .iter()
                             .filter_map(|&thunk| {
-                                match ControlTarget::of_thunk(self.func.at(thunk)) {
-                                    ControlTarget::Region(target) => Some(target),
-                                    ControlTarget::Return => None,
+                                match ControlTarget::of_thunk(self.cx, self.func.at(thunk)) {
+                                    Ok(ControlTarget::Region(target)) => Some(target),
+                                    Ok(ControlTarget::Return) | Err(Unreachable) => None,
                                 }
                             })
                     })
