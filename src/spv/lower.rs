@@ -1484,6 +1484,9 @@ impl Module {
                         }
                     }
 
+                    // FIXME(eddyb) cache this.
+                    let thunk_ty = cx.intern(TypeKind::Thunk);
+
                     let mut build_thunk = |target, target_inputs| {
                         let thunk_node = func_def_body.nodes.define(
                             &cx,
@@ -1499,9 +1502,6 @@ impl Module {
                         current_block_region_def
                             .children
                             .insert_last(thunk_node, &mut func_def_body.nodes);
-
-                        // FIXME(eddyb) cache this.
-                        let thunk_ty = cx.intern(TypeKind::Thunk);
 
                         let thunk_var = func_def_body.vars.define(
                             &cx,
@@ -1532,7 +1532,13 @@ impl Module {
 
                     let kind = if opcode == wk.OpUnreachable {
                         assert!(target_thunks.is_empty() && inputs.is_empty());
-                        cf::unstructured::ControlInstKind::Unreachable
+                        // FIXME(eddyb) cache this.
+                        target_thunks.push(Value::Const(cx.intern(ConstDef {
+                            attrs: AttrSet::default(),
+                            ty: thunk_ty,
+                            kind: ConstKind::Undef,
+                        })));
+                        cf::unstructured::ControlInstKind::Branch
                     } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
                         assert!(target_thunks.is_empty() && inputs.len() <= 1);
                         target_thunks.push(build_thunk(
@@ -1557,7 +1563,13 @@ impl Module {
                         current_block_region_def
                             .children
                             .insert_last(node, &mut func_def_body.nodes);
-                        cf::unstructured::ControlInstKind::Unreachable
+                        // FIXME(eddyb) cache this.
+                        target_thunks.push(Value::Const(cx.intern(ConstDef {
+                            attrs: AttrSet::default(),
+                            ty: thunk_ty,
+                            kind: ConstKind::Undef,
+                        })));
+                        cf::unstructured::ControlInstKind::Branch
                     } else if opcode == wk.OpBranch {
                         assert_eq!((target_thunks.len(), inputs.len()), (1, 0));
                         cf::unstructured::ControlInstKind::Branch

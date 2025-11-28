@@ -707,9 +707,6 @@ impl<'a> FuncLifting<'a> {
                         Terminator {
                             attrs: *attrs,
                             kind: match kind {
-                                cf::unstructured::ControlInstKind::Unreachable => {
-                                    TerminatorKind::Unreachable
-                                }
                                 cf::unstructured::ControlInstKind::Branch => TerminatorKind::Branch,
                                 cf::unstructured::ControlInstKind::SelectBranch(kind) => {
                                     TerminatorKind::SelectBranch(kind)
@@ -747,6 +744,9 @@ impl<'a> FuncLifting<'a> {
                     let cf::unstructured::ControlInst { attrs, kind: _, inputs: _, target_thunks } =
                         &cfg.control_inst_on_exit_from[source];
 
+                    // HACK(eddyb) marker type for an `undef` thunk.
+                    struct Unreachable;
+
                     // FIXME(eddyb) deduplicate with `ControlTarget::of_thunk`.
                     let func = func_def_body.at(());
                     let (target, target_inputs) = match target_thunks[edge_idx as usize] {
@@ -754,37 +754,46 @@ impl<'a> FuncLifting<'a> {
                             VarKind::NodeOutput { node, output_idx: 0 } => {
                                 let thunk_node_def = func.at(node).def();
                                 match thunk_node_def.kind {
-                                    NodeKind::ThunkBind(target) => (target, &thunk_node_def.inputs),
+                                    NodeKind::ThunkBind(target) => {
+                                        (Ok(target), &thunk_node_def.inputs[..])
+                                    }
                                     _ => unreachable!(),
                                 }
                             }
                             _ => unreachable!(),
                         },
-                        Value::Const(_) => unreachable!(),
+                        Value::Const(ct) => match cx[ct].kind {
+                            ConstKind::Undef => (Err(Unreachable), &[][..]),
+                            _ => unreachable!(),
+                        },
+                    };
+                    let target = match target {
+                        Ok(cf::unstructured::ControlTarget::Region(target)) => Ok(target),
+                        Ok(cf::unstructured::ControlTarget::Return) => Err(TerminatorKind::Return),
+                        Err(Unreachable) => Err(TerminatorKind::Unreachable),
                     };
                     match target {
-                        cf::unstructured::ControlTarget::Region(target) => Terminator {
+                        Ok(target) => Terminator {
                             attrs: *attrs,
                             kind: TerminatorKind::Branch,
                             inputs: [].into_iter().collect(),
                             targets: [CfgPoint::RegionEntry(target)].into_iter().collect(),
-                            target_phi_values: [(
-                                CfgPoint::RegionEntry(target),
-                                &target_inputs[..],
-                            )]
-                            .into_iter()
-                            .collect(),
+                            target_phi_values: [(CfgPoint::RegionEntry(target), target_inputs)]
+                                .into_iter()
+                                .collect(),
                             merge: None,
                         },
-                        cf::unstructured::ControlTarget::Return => Terminator {
-                            attrs: *attrs,
-                            kind: TerminatorKind::Return,
-                            // FIXME(eddyb) borrow these whenever possible.
-                            inputs: target_inputs.clone(),
-                            targets: [].into_iter().collect(),
-                            target_phi_values: FxIndexMap::default(),
-                            merge: None,
-                        },
+                        Err(terminator_kind) => {
+                            Terminator {
+                                attrs: *attrs,
+                                kind: terminator_kind,
+                                // FIXME(eddyb) borrow these whenever possible.
+                                inputs: target_inputs.iter().copied().collect(),
+                                targets: [].into_iter().collect(),
+                                target_phi_values: FxIndexMap::default(),
+                                merge: None,
+                            }
+                        }
                     }
                 }
 

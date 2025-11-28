@@ -4283,17 +4283,10 @@ impl Print for cf::unstructured::ControlInst {
         let attrs = attrs.print(printer);
 
         let kw_style = printer.imperative_keyword_style();
-        let kw = |kw| kw_style.apply(kw).into();
 
         let mut targets = target_thunks.iter().map(|v| v.print(printer));
 
         let def = match kind {
-            cf::unstructured::ControlInstKind::Unreachable => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0 && inputs.is_empty());
-                kw("unreachable")
-            }
-
             cf::unstructured::ControlInstKind::Branch => {
                 assert_eq!((targets.len(), inputs.len()), (1, 0));
                 targets.next().unwrap()
