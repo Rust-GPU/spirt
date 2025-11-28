@@ -589,8 +589,9 @@ impl<'a> Structurizer<'a> {
                 .unstructured_cfg
                 .as_ref()
                 .map(|cfg| {
-                    let loop_header_to_exit_targets = LoopFinder::new(func_def_body.at(()), cfg)
-                        .find_all_loops_starting_at(func_def_body.body);
+                    let loop_header_to_exit_targets =
+                        LoopFinder::new(cx, func_def_body.at(()), cfg)
+                            .find_all_loops_starting_at(func_def_body.body);
 
                     let mut state = TraversalState {
                         incoming_edge_counts: EntityOrientedDenseMap::new(),
@@ -1088,7 +1089,10 @@ impl<'a> Structurizer<'a> {
                             }
                             _ => unreachable!(),
                         },
-                        Value::Const(_) => unreachable!(),
+                        Value::Const(ct) => match self.cx[ct].kind {
+                            ConstKind::Undef => return Err(DeferredEdgeBundleSet::Unreachable),
+                            _ => unreachable!(),
+                        },
                     };
 
                     let target = match target {
@@ -1145,33 +1149,10 @@ impl<'a> Structurizer<'a> {
                 .collect();
 
             match kind {
-                ControlInstKind::Unreachable => {
+                ControlInstKind::Branch => {
                     // FIXME(eddyb) this loses `attrs`.
                     let _ = attrs;
 
-                    assert_eq!((inputs.len(), target_regions.len()), (0, 0));
-
-                    // FIXME(eddyb) this may result in lost optimizations over
-                    // actually encoding it in `Node`/`Region`
-                    // (e.g. a new `NodeKind`, or replacing region `outputs`),
-                    // but it's simpler to handle it like this.
-                    //
-                    // NOTE(eddyb) actually, this encoding is lossless *during*
-                    // structurization, and a divergent region can only end up as:
-                    // - the function body, where it implies the function can
-                    //   never actually return: not fully structurized currently
-                    //   (but only for a silly reason, and is entirely fixable)
-                    // - a `Select` case, where it implies that case never merges
-                    //   back into the `Select` node, and potentially that the
-                    //   case can never be taken: this is where a structured
-                    //   encoding can be introduced, by pruning unreachable
-                    //   cases, and potentially even introducing `assume`s
-                    // - a `Loop` body is not actually possible when divergent
-                    //   (as there can be no backedge to form a cyclic CFG)
-                    DeferredEdgeBundleSet::Unreachable
-                }
-
-                ControlInstKind::Branch => {
                     assert_eq!(inputs.len(), 0);
 
                     self.append_maybe_claimed_region(
@@ -1834,7 +1815,7 @@ impl<'a> Structurizer<'a> {
         let cx = self.cx;
 
         let thunk_ty = cx.intern(TypeKind::Thunk);
-        let build_thunk = |func_at_region: FuncAtMut<'_, Region>, target, target_inputs| {
+        let build_thunk = |func_at_region: FuncAtMut<'_, Region>, (target, target_inputs)| {
             let region = func_at_region.position;
             let func = func_at_region.at(());
 
@@ -1878,16 +1859,13 @@ impl<'a> Structurizer<'a> {
             (taken_then, deferred_edges) = deferred_edges.split_out_matching(|deferred| {
                 Ok((
                     deferred.condition,
-                    build_thunk(
-                        self.func_def_body.at_mut(control_source.unwrap()),
-                        deferred.edge_bundle.target,
-                        deferred.edge_bundle.target_inputs,
-                    ),
+                    (deferred.edge_bundle.target, deferred.edge_bundle.target_inputs),
                 ))
             });
             let Some((condition, then_edge)) = taken_then else {
                 break;
             };
+
             let branch_source = control_source.take().unwrap();
             let else_edge = match deferred_edges {
                 // At most one deferral left, so it can be used as the "else"
@@ -1895,11 +1873,7 @@ impl<'a> Structurizer<'a> {
                 DeferredEdgeBundleSet::Unreachable => None,
                 DeferredEdgeBundleSet::Always { target: else_target, edge_bundle } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
-                    Some(build_thunk(
-                        self.func_def_body.at_mut(branch_source),
-                        else_target,
-                        edge_bundle.target_inputs,
-                    ))
+                    Some((else_target, edge_bundle.target_inputs))
                 }
 
                 // More branches are needed, so the "else" case must be a `Region`
@@ -1908,11 +1882,7 @@ impl<'a> Structurizer<'a> {
                     let new_empty_region =
                         self.func_def_body.regions.define(cx, RegionDef::default());
                     control_source = Some(new_empty_region);
-                    Some(build_thunk(
-                        self.func_def_body.at_mut(branch_source),
-                        DeferredTarget::Region(new_empty_region),
-                        [].into_iter().collect(),
-                    ))
+                    Some((DeferredTarget::Region(new_empty_region), [].into_iter().collect()))
                 }
             };
 
@@ -1927,7 +1897,11 @@ impl<'a> Structurizer<'a> {
                     ControlInstKind::Branch
                 },
                 inputs: condition.into_iter().collect(),
-                target_thunks: [then_edge].into_iter().chain(else_edge).collect(),
+                target_thunks: [then_edge]
+                    .into_iter()
+                    .chain(else_edge)
+                    .map(|edge| build_thunk(self.func_def_body.at_mut(branch_source), edge))
+                    .collect(),
             };
             assert!(
                 self.func_def_body
@@ -1946,13 +1920,21 @@ impl<'a> Structurizer<'a> {
             None => return,
         };
 
-        // Final deferral is an `Unreachable` (only when truly divergent,
+        // Final deferral is unreachable (only when truly divergent,
         // i.e. no `deferred_edges`).
+        // FIXME(eddyb) this should probably be special-cased at the start of
+        // this function, instead of here at the end.
         let final_control_inst = ControlInst {
             attrs: AttrSet::default(),
-            kind: ControlInstKind::Unreachable,
+            kind: ControlInstKind::Branch,
             inputs: [].into_iter().collect(),
-            target_thunks: [].into_iter().collect(),
+            target_thunks: [Value::Const(cx.intern(ConstDef {
+                attrs: AttrSet::default(),
+                ty: thunk_ty,
+                kind: ConstKind::Undef,
+            }))]
+            .into_iter()
+            .collect(),
         };
         assert!(
             self.func_def_body
