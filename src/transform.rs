@@ -582,8 +582,8 @@ impl InnerInPlaceTransform for FuncDefBody {
                     transformer.in_place_transform_region_def(self.at_mut(region));
 
                     let cfg = self.unstructured_cfg.as_mut().unwrap();
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get_mut(region) {
-                        control_inst.inner_in_place_transform_with(transformer);
+                    if let Some(thunk) = cfg.target_thunk_on_exit_from.get_mut(region) {
+                        transformer.transform_value_use(thunk).apply_to(thunk);
                     }
                 }
             }
@@ -677,26 +677,6 @@ impl InnerInPlaceTransform for VarDecl {
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         transformer.transform_type_use(*ty).apply_to(ty);
-    }
-}
-
-impl InnerInPlaceTransform for cf::unstructured::ControlInst {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, kind, inputs, target_thunks } = self;
-
-        transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        match kind {
-            cf::unstructured::ControlInstKind::Branch
-            | cf::unstructured::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
-        }
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
-        for v in target_thunks {
-            transformer.transform_value_use(v).apply_to(v);
-        }
     }
 }
 

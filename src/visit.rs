@@ -427,8 +427,8 @@ impl InnerVisit for FuncDefBody {
                 for region in cfg.rev_post_order(self) {
                     visitor.visit_region_def(self.at(region));
 
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        control_inst.inner_visit_with(visitor);
+                    if let Some(thunk) = cfg.target_thunk_on_exit_from.get(region) {
+                        visitor.visit_value_use(thunk);
                     }
                 }
             }
@@ -511,26 +511,6 @@ impl InnerVisit for VarDecl {
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
-    }
-}
-
-impl InnerVisit for cf::unstructured::ControlInst {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, target_thunks } = self;
-
-        visitor.visit_attr_set_use(*attrs);
-        match kind {
-            cf::unstructured::ControlInstKind::Branch
-            | cf::unstructured::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
-        }
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        for v in target_thunks {
-            visitor.visit_value_use(v);
-        }
     }
 }
 

@@ -8,8 +8,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
     FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node,
-    NodeKind, OrdAssertEq, Region, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl,
-    VarKind,
+    NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeDef, TypeKind, TypeOrConst, Value, Var,
+    VarDecl, VarKind,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -283,8 +283,8 @@ struct FuncLifting<'a> {
 /// What determines the values for [`VarKind::RegionInput`]s, for a specific
 /// region (effectively the subset of "region parents" that support inputs).
 ///
-/// Note that this is not used when a [`cf::unstructured::ControlInst`] has `target_inputs`,
-/// and the target [`Region`] itself has phis for its `inputs`.
+/// Note that this is not used when an unstructured `thunk` carries input values
+/// for its target [`Region`] (which would itself have phis for its `inputs`).
 enum RegionInputsSource {
     FuncParams,
     LoopHeaderPhis(Node),
@@ -303,7 +303,8 @@ enum CfgPoint {
     // HACK(eddyb) this is only needed to recover φ ("phi") semantics for
     // unstructured CFG edges, while letting SPIR-T use "BB args" semantics
     // (i.e. potentially different values for the same target `Region`).
-    UnstructuredEdge { source: Region, edge_idx: u32 },
+    // NOTE(eddyb) this is much more relied upon after all `thunk` refactors.
+    UnstructuredEdge(cf::unstructured::ControlEdge),
 }
 
 struct BlockLifting<'a> {
@@ -325,7 +326,7 @@ struct Phi {
     default_value: Option<Value>,
 }
 
-/// Similar to [`cf::unstructured::ControlInst`], except:
+/// Similar to unstructured `thunk`s, except:
 /// * `targets` use [`CfgPoint`]s instead of [`Region`]s, to be able to
 ///   reach any of the SPIR-V blocks being created during lifting
 /// * φ ("phi") values can be provided for targets regardless of "which side" of
@@ -356,8 +357,8 @@ enum TerminatorKind<'a> {
     Branch,
     SelectBranch(&'a cf::SelectionKind),
 
-    // HACK(eddyb) this is the only case `cf::unstructured::ControlInst` can't
-    // itself represent (as it has been moved to `NodeKind::ExitInvocation`).
+    // HACK(eddyb) this is the only case the unstructured CFG doesn't represent
+    // using `thunk`s (as it has been moved to `NodeKind::ExitInvocation`).
     ExitInvocation(&'a cf::ExitInvocationKind),
 }
 
@@ -439,11 +440,32 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
     /// chain within structured control-flow (i.e. no branching to child regions).
     fn unique_successor(self) -> Option<CfgCursor<'p>> {
         let cursor = self.position;
+
+        // HACK(eddyb) this skips past any tailing `thunk`-producing node, and
+        // goes straight to the `RegionExit` instead.
+        let filter_out_tail_thunk = |node| {
+            let node_def = &self.nodes[node];
+            let is_last_node = node_def.next_in_list().is_none();
+            let is_tail_thunk = is_last_node
+                && match node_def.kind {
+                    NodeKind::ThunkBind(_) => true,
+                    NodeKind::Select(_) => node_def.child_regions.iter().all(|&case| {
+                        self.at(case).at_children().into_iter().exactly_one().is_ok_and(
+                            |case_node| matches!(case_node.def().kind, NodeKind::ThunkBind(_)),
+                        )
+                    }),
+                    _ => false,
+                };
+            (!is_tail_thunk).then_some(node)
+        };
+
         match cursor.point {
             // Entering a `Region` enters its first `Node` child,
             // or exits the region right away (if it has no children).
             CfgPoint::RegionEntry(region) => Some(CfgCursor {
-                point: match self.at(region).def().children.iter().first {
+                point: match (self.at(region).def().children.iter().first)
+                    .and_then(filter_out_tail_thunk)
+                {
                     Some(first_child) => CfgPoint::NodeEntry(first_child),
                     None => CfgPoint::RegionExit(region),
                 },
@@ -480,7 +502,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
 
             // Exiting a `Node` chains to a sibling/parent.
             CfgPoint::NodeExit(node) => {
-                Some(match self.nodes[node].next_in_list() {
+                Some(match self.nodes[node].next_in_list().and_then(filter_out_tail_thunk) {
                     // Enter the next sibling in the `Region`, if one exists.
                     Some(next_node) => {
                         CfgCursor { point: CfgPoint::NodeEntry(next_node), parent: cursor.parent }
@@ -679,16 +701,17 @@ impl<'a> FuncLifting<'a> {
 
             let insts = match point {
                 CfgPoint::NodeEntry(node) => match func_def_body.at(node).def().kind {
-                    NodeKind::Select(_)
-                    | NodeKind::Loop { .. }
-                    | NodeKind::ExitInvocation(_)
-                    | DataInstKind::ThunkBind(_) => SmallVec::new(),
+                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                        SmallVec::new()
+                    }
 
                     DataInstKind::FuncCall(_)
                     | DataInstKind::Mem(_)
                     | DataInstKind::QPtr(_)
                     | DataInstKind::SpvInst(_)
                     | DataInstKind::SpvExtInst { .. } => [node].into_iter().collect(),
+
+                    DataInstKind::ThunkBind(_) => unreachable!(),
                 },
                 _ => SmallVec::new(),
             };
@@ -697,31 +720,47 @@ impl<'a> FuncLifting<'a> {
             let terminator = match (point, func_def_body.at(point_cursor).unique_successor()) {
                 // Exiting a `Region` w/o a structured parent.
                 (CfgPoint::RegionExit(region), None) => {
-                    let unstructured_terminator = func_def_body
+                    let unstructured_cfg_thunk = func_def_body
                         .unstructured_cfg
                         .as_ref()
-                        .and_then(|cfg| cfg.control_inst_on_exit_from.get(region));
-                    if let Some(terminator) = unstructured_terminator {
-                        let cf::unstructured::ControlInst { attrs, kind, inputs, target_thunks } =
-                            terminator;
-                        Terminator {
-                            attrs: *attrs,
-                            kind: match kind {
-                                cf::unstructured::ControlInstKind::Branch => TerminatorKind::Branch,
-                                cf::unstructured::ControlInstKind::SelectBranch(kind) => {
-                                    TerminatorKind::SelectBranch(kind)
+                        .and_then(|cfg| Some((cfg, *cfg.target_thunk_on_exit_from.get(region)?)));
+                    if let Some((cfg, thunk)) = unstructured_cfg_thunk {
+                        // FIXME(eddyb) this partially overlaps with
+                        // `ControlFlowGraph::edges_from_thunk_tailed_region`.
+                        let thunk_node_def = match thunk {
+                            Value::Var(thunk) => match func_def_body.at(thunk).decl().kind() {
+                                VarKind::NodeOutput { node, output_idx: 0 } => {
+                                    Ok(func_def_body.at(node).def())
                                 }
+                                _ => unreachable!(),
                             },
-                            // FIXME(eddyb) borrow these whenever possible.
-                            inputs: inputs.clone(),
+                            Value::Const(ct) => Err(ct),
+                        };
+                        let (kind, inputs) = match thunk_node_def {
+                            Ok(NodeDef { kind: NodeKind::ThunkBind(_), .. }) | Err(_) => {
+                                (TerminatorKind::Branch, [].into_iter().collect())
+                            }
+                            Ok(NodeDef { kind: NodeKind::Select(kind), inputs, .. }) => {
+                                (
+                                    TerminatorKind::SelectBranch(kind),
+                                    // FIXME(eddyb) borrow these whenever possible.
+                                    inputs.clone(),
+                                )
+                            }
+                            Ok(_) => unreachable!(),
+                        };
+
+                        Terminator {
+                            attrs: thunk_node_def.map(|def| def.attrs).unwrap_or_default(),
+                            kind,
+                            inputs,
                             // FIXME(eddyb) try limiting this to repeated target `Region`s
                             // which *also* pass different value inputs.
-                            // NOTE(eddyb) this is also now used for returns.
-                            targets: (0..u32::try_from(target_thunks.len()).unwrap())
-                                .map(|edge_idx| CfgPoint::UnstructuredEdge {
-                                    source: region,
-                                    edge_idx,
-                                })
+                            // NOTE(eddyb) this is much more relied upon,
+                            // after all `thunk` refactors.
+                            targets: cfg
+                                .edges_from(func_def_body.at(region))
+                                .map(CfgPoint::UnstructuredEdge)
                                 .collect(),
                             target_phi_values: FxIndexMap::default(),
                             merge: None,
@@ -739,42 +778,22 @@ impl<'a> FuncLifting<'a> {
                         }
                     }
                 }
-                (CfgPoint::UnstructuredEdge { source, edge_idx }, None) => {
+                (CfgPoint::UnstructuredEdge(edge), None) => {
                     let cfg = func_def_body.unstructured_cfg.as_ref().unwrap();
-                    let cf::unstructured::ControlInst { attrs, kind: _, inputs: _, target_thunks } =
-                        &cfg.control_inst_on_exit_from[source];
+                    let (attrs, target, target_inputs) =
+                        cfg.edge_attrs_target_and_inputs(func_def_body.at(edge));
 
-                    // HACK(eddyb) marker type for an `undef` thunk.
-                    struct Unreachable;
-
-                    // FIXME(eddyb) deduplicate with `ControlTarget::of_thunk`.
-                    let func = func_def_body.at(());
-                    let (target, target_inputs) = match target_thunks[edge_idx as usize] {
-                        Value::Var(thunk) => match func.at(thunk).decl().kind() {
-                            VarKind::NodeOutput { node, output_idx: 0 } => {
-                                let thunk_node_def = func.at(node).def();
-                                match thunk_node_def.kind {
-                                    NodeKind::ThunkBind(target) => {
-                                        (Ok(target), &thunk_node_def.inputs[..])
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            }
-                            _ => unreachable!(),
-                        },
-                        Value::Const(ct) => match cx[ct].kind {
-                            ConstKind::Undef => (Err(Unreachable), &[][..]),
-                            _ => unreachable!(),
-                        },
-                    };
                     let target = match target {
                         Ok(cf::unstructured::ControlTarget::Region(target)) => Ok(target),
                         Ok(cf::unstructured::ControlTarget::Return) => Err(TerminatorKind::Return),
-                        Err(Unreachable) => Err(TerminatorKind::Unreachable),
+                        Err(ct) => match cx[ct].kind {
+                            ConstKind::Undef => Err(TerminatorKind::Unreachable),
+                            _ => unreachable!(),
+                        },
                     };
                     match target {
                         Ok(target) => Terminator {
-                            attrs: *attrs,
+                            attrs,
                             kind: TerminatorKind::Branch,
                             inputs: [].into_iter().collect(),
                             targets: [CfgPoint::RegionEntry(target)].into_iter().collect(),
@@ -785,7 +804,7 @@ impl<'a> FuncLifting<'a> {
                         },
                         Err(terminator_kind) => {
                             Terminator {
-                                attrs: *attrs,
+                                attrs,
                                 kind: terminator_kind,
                                 // FIXME(eddyb) borrow these whenever possible.
                                 inputs: target_inputs.iter().copied().collect(),
@@ -971,11 +990,11 @@ impl<'a> FuncLifting<'a> {
 
                     // FIXME(eddyb) try limiting this to repeated target `Region`s
                     // which *also* pass different value inputs.
-                    // NOTE(eddyb) this is also now used for returns.
-                    let edge_count = cfg.control_inst_on_exit_from[region].target_thunks.len();
-                    for edge_idx in 0..u32::try_from(edge_count).unwrap() {
+                    // NOTE(eddyb) this is much more relied upon,
+                    // after all `thunk` refactors.
+                    for edge in cfg.edges_from(func_def_body.at(region)) {
                         visit_cfg_point(CfgCursor {
-                            point: CfgPoint::UnstructuredEdge { source: region, edge_idx },
+                            point: CfgPoint::UnstructuredEdge(edge),
                             parent: None,
                         })?;
                     }

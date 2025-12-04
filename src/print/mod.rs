@@ -787,13 +787,8 @@ impl DbgScopeDefPlacer<'_> {
             None => self.scopes_used_in_region(func_def_body.at_body()),
             Some(cfg) => DbgScopeDefMap::merge_unordered(
                 DbgScopeDefPlace::top_of(func_def_body.at_body()),
-                cfg.rev_post_order(func_def_body).map(|region| {
-                    let mut scopes = self.scopes_used_in_region(func_def_body.at(region));
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        scopes.prepend_attrs(self.cx, control_inst.attrs);
-                    }
-                    scopes
-                }),
+                cfg.rev_post_order(func_def_body)
+                    .map(|region| self.scopes_used_in_region(func_def_body.at(region))),
             ),
         }
     }
@@ -3565,7 +3560,7 @@ impl Print for FuncDecl {
                                 label_header,
                                 pretty::Node::IndentedBlock(vec![def.at(region).print(printer)])
                                     .into(),
-                                cfg.control_inst_on_exit_from[region].print(printer),
+                                cfg.target_thunk_on_exit_from[region].print(printer),
                             ])
                         })
                         .intersperse({
@@ -4272,33 +4267,6 @@ impl FuncAt<'_, DataInst> {
                 })
                 .unwrap_or_default(),
         )
-    }
-}
-
-impl Print for cf::unstructured::ControlInst {
-    type Output = pretty::Fragment;
-    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let Self { attrs, kind, inputs, target_thunks } = self;
-
-        let attrs = attrs.print(printer);
-
-        let kw_style = printer.imperative_keyword_style();
-
-        let mut targets = target_thunks.iter().map(|v| v.print(printer));
-
-        let def = match kind {
-            cf::unstructured::ControlInstKind::Branch => {
-                assert_eq!((targets.len(), inputs.len()), (1, 0));
-                targets.next().unwrap()
-            }
-
-            cf::unstructured::ControlInstKind::SelectBranch(kind) => {
-                assert_eq!(inputs.len(), 1);
-                kind.print_with_scrutinee_and_cases(printer, kw_style, inputs[0], targets)
-            }
-        };
-
-        pretty::Fragment::new([attrs, def])
     }
 }
 
