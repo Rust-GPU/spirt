@@ -1065,27 +1065,12 @@ impl<'a> Structurizer<'a> {
             edge_source_region: Region,
             thunk_binding_region: Region,
         ) -> Result<ClaimedRegion, DeferredEdgeBundleSet> {
-            let thunk = if edge_source_region == thunk_binding_region {
-                // FIXME(eddyb) make the thunk an actual region output instead.
-                this.func_def_body
-                    .unstructured_cfg
-                    .as_mut()
-                    .unwrap()
-                    .target_thunk_on_exit_from
-                    .remove(edge_source_region)
-                    .expect(
-                        // FIXME(eddyb) this only really makes sense
-                        "cfg::Structurizer::structurize_region: missing \
-                         `target_thunk_on_exit_from` \
-                         (CFG wasn't unstructured in the first place?)",
-                    )
-            } else {
+            let thunk =
                 mem::take(&mut this.func_def_body.at_mut(thunk_binding_region).def().outputs)
                     .into_iter()
                     .exactly_one()
                     .ok()
-                    .unwrap()
-            };
+                    .unwrap();
 
             let thunk_node = match thunk {
                 Value::Var(thunk) => match this.func_def_body.at(thunk).decl().kind() {
@@ -1974,15 +1959,7 @@ impl<'a> Structurizer<'a> {
                 build_thunk(self.func_def_body.at_mut(branch_source), then_edge)
             };
 
-            assert!(
-                self.func_def_body
-                    .unstructured_cfg
-                    .as_mut()
-                    .unwrap()
-                    .target_thunk_on_exit_from
-                    .insert(branch_source, thunk)
-                    .is_none()
-            );
+            self.func_def_body.regions[branch_source].outputs = [thunk].into_iter().collect();
         }
 
         let final_source = match control_source {
@@ -2000,15 +1977,7 @@ impl<'a> Structurizer<'a> {
             ty: thunk_ty,
             kind: ConstKind::Undef,
         }));
-        assert!(
-            self.func_def_body
-                .unstructured_cfg
-                .as_mut()
-                .unwrap()
-                .target_thunk_on_exit_from
-                .insert(final_source, final_thunk)
-                .is_none()
-        );
+        self.func_def_body.regions[final_source].outputs = [final_thunk].into_iter().collect();
     }
 
     /// Create an undefined constant (as a placeholder where a value needs to be

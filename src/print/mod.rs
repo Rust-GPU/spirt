@@ -3543,24 +3543,23 @@ impl Print for FuncDecl {
                                     pretty::Fragment::default()
                                 };
 
-                                // FIXME(eddyb) `:` as used here for C-like "label syntax"
-                                // interferes (in theory) with `e: T` "type ascription syntax".
                                 pretty::Fragment::new([
                                     pretty::Node::ForceLineSeparation.into(),
                                     label.print_as_def(printer),
                                     label_inputs,
-                                    ":".into(),
-                                    pretty::Node::ForceLineSeparation.into(),
                                 ])
+                            } else if region == def.body {
+                                printer.imperative_keyword_style().apply("entry").into()
                             } else {
-                                pretty::Fragment::default()
+                                printer.error_style().apply("/* undefined label */_").into()
                             };
 
                             pretty::Fragment::new([
                                 label_header,
+                                " {".into(),
                                 pretty::Node::IndentedBlock(vec![def.at(region).print(printer)])
                                     .into(),
-                                cfg.target_thunk_on_exit_from[region].print(printer),
+                                "}".into(),
                             ])
                         })
                         .intersperse({

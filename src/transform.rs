@@ -580,11 +580,6 @@ impl InnerInPlaceTransform for FuncDefBody {
 
                 for region in rpo {
                     transformer.in_place_transform_region_def(self.at_mut(region));
-
-                    let cfg = self.unstructured_cfg.as_mut().unwrap();
-                    if let Some(thunk) = cfg.target_thunk_on_exit_from.get_mut(region) {
-                        transformer.transform_value_use(thunk).apply_to(thunk);
-                    }
                 }
             }
         }

@@ -426,10 +426,6 @@ impl InnerVisit for FuncDefBody {
             Some(cfg) => {
                 for region in cfg.rev_post_order(self) {
                     visitor.visit_region_def(self.at(region));
-
-                    if let Some(thunk) = cfg.target_thunk_on_exit_from.get(region) {
-                        visitor.visit_value_use(thunk);
-                    }
                 }
             }
         }

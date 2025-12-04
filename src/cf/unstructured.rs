@@ -49,10 +49,11 @@ use smallvec::SmallVec;
 //      of the child regions, and therefore any side-effect, more than once etc.)
 #[derive(Clone, Default)]
 pub struct ControlFlowGraph {
-    pub target_thunk_on_exit_from: EntityOrientedDenseMap<Region, Value>,
-
     // HACK(eddyb) this currently only comes from `OpLoopMerge`, and cannot be
     // inferred (because implies too strong of an ownership/uniqueness notion).
+    //
+    // FIXME(eddyb) this is the only reason for `ControlFlowGraph` to still
+    // exist in this state, and should be replaced with one of the ideas above.
     pub loop_merge_to_loop_header: FxIndexMap<Region, Region>,
 }
 
@@ -132,15 +133,8 @@ impl ControlFlowGraph {
         let func = func_at_edge_source.at(());
         let edge_source_region = func_at_edge_source.position;
 
-        let thunk = if edge_source_region == thunk_binding_region {
-            // FIXME(eddyb) make the thunk an actual region output instead.
-            *self.target_thunk_on_exit_from.get(edge_source_region).expect(
-                "cf::unstructured: missing `target_thunk_on_exit_from`, \
-                 despite having left structured control-flow",
-            )
-        } else {
-            func.at(thunk_binding_region).def().outputs.iter().copied().exactly_one().ok().unwrap()
-        };
+        let thunk =
+            func.at(thunk_binding_region).def().outputs.iter().copied().exactly_one().ok().unwrap();
 
         let thunk_node = match thunk {
             Value::Var(thunk) => match func.at(thunk).decl().kind() {
@@ -188,22 +182,15 @@ impl ControlFlowGraph {
         let func = func_at_edge.at(());
         let edge = func_at_edge.position;
 
-        let thunk = if edge.source_region == edge.thunk_binding_region {
-            // FIXME(eddyb) make the thunk an actual region output instead.
-            *self.target_thunk_on_exit_from.get(edge.thunk_binding_region).expect(
-                "cf::unstructured: missing `target_thunk_on_exit_from`, \
-                     despite having left structured control-flow",
-            )
-        } else {
-            func.at(edge.thunk_binding_region)
-                .def()
-                .outputs
-                .iter()
-                .copied()
-                .exactly_one()
-                .ok()
-                .unwrap()
-        };
+        let thunk = func
+            .at(edge.thunk_binding_region)
+            .def()
+            .outputs
+            .iter()
+            .copied()
+            .exactly_one()
+            .ok()
+            .unwrap();
 
         match thunk {
             Value::Var(thunk) => match func.at(thunk).decl().kind() {
@@ -271,7 +258,6 @@ impl ControlFlowGraph {
 
         // Quick sanity check that this is the right CFG for `func_def_body`.
         assert!(std::ptr::eq(func_def_body.unstructured_cfg.as_ref().unwrap(), self));
-        assert!(func_at_body.def().outputs.is_empty());
 
         self.traverse(func_at_body, state);
     }

@@ -1623,12 +1623,8 @@ impl Module {
 
                     assert_eq!(inputs.len(), 0);
 
-                    func_def_body
-                        .unstructured_cfg
-                        .as_mut()
-                        .unwrap()
-                        .target_thunk_on_exit_from
-                        .insert(current_block.region, target_thunk);
+                    func_def_body.regions[current_block.region].outputs =
+                        [target_thunk].into_iter().collect();
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {
                         return Err(invalid(

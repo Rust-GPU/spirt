@@ -720,10 +720,21 @@ impl<'a> FuncLifting<'a> {
             let terminator = match (point, func_def_body.at(point_cursor).unique_successor()) {
                 // Exiting a `Region` w/o a structured parent.
                 (CfgPoint::RegionExit(region), None) => {
-                    let unstructured_cfg_thunk = func_def_body
-                        .unstructured_cfg
-                        .as_ref()
-                        .and_then(|cfg| Some((cfg, *cfg.target_thunk_on_exit_from.get(region)?)));
+                    let unstructured_cfg_thunk =
+                        func_def_body.unstructured_cfg.as_ref().map(|cfg| {
+                            (
+                                cfg,
+                                func_def_body
+                                    .at(region)
+                                    .def()
+                                    .outputs
+                                    .iter()
+                                    .copied()
+                                    .exactly_one()
+                                    .ok()
+                                    .unwrap(),
+                            )
+                        });
                     if let Some((cfg, thunk)) = unstructured_cfg_thunk {
                         // FIXME(eddyb) this partially overlaps with
                         // `ControlFlowGraph::edges_from_thunk_tailed_region`.
