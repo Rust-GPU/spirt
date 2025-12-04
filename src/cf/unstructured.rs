@@ -1,44 +1,59 @@
 //! Unstructured control-flow graph (CFG) abstractions and utilities.
 
+use crate::func_at::FuncAt;
 use crate::{
-    AttrSet, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap, FxIndexSet,
-    NodeKind, Region, Value, Var, VarKind, cf,
+    AttrSet, Const, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap,
+    FxIndexSet, NodeKind, Region, Value, VarKind,
 };
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
 
-/// The control-flow graph (CFG) of a function, as control-flow instructions
-/// ([`ControlInst`]s) attached to [`Region`]s, as an "action on exit", i.e.
-/// "terminator" (while intra-region control-flow is strictly structured).
+/// The control-flow graph (CFG) of a function, as control-flow edges (`thunk`s)
+/// attached to [`Region`]s, as an "action on exit" (similar to "terminator"s),
+/// while intra-region control-flow is strictly structured.
+//
+// FIXME(eddyb) update docs above (or remove `ControlFlowGraph` entirely).
+//
+// FIXME(eddyb) treat "loop `break`s" (branches to the "loop merge" block)
+// as Rust-like "`break` out of labeled block" for a block around the loop,
+// e.g. `loop { ... break; ... }` -> `'label: { loop { ... break 'label; ... } }`,
+// and encode the "labeled block" aspect using a node for "executing a CFG",
+// with a `thunk` output type whenever the loop body has control-flow edges
+// to the outside of the loop (and they're not to the "loop merge" block),
+// such as `break`-ing out of an enclosing `switch`, or even `return`ing.
+//
+// FIXME(eddyb) the above approach could also be extended to encode other
+// kinds of "merges" (`OpSelectionMerge`, or even the "continue" of a loop)
+// as well (same "break out of labeled block" idea, really), and inside-out
+// structurization should then preserve all possible SPIR-V merge hierarchies
+// (even if structured SPIR-T lacks e.g. `switch` fallthru, it should always
+// correctly reconverge, thanks to structurization never duplicating regions).
+//
+// FIXME(eddyb) in the end, it seems like there is a need for *both*:
+// 1. `thunk` `switch`ing (a new `SelectionKind` variant?)
+//    - structurization (and similar transforms) can be seen as replacing
+//      `thunk` with boolean/integer target encodings, along the "target inputs",
+//      as plain values region can output, and `if`-`else`/`switch` for dispatch
+// 2. `thunk` `loop`ing (new node or some kind of modified `NodeKind::Loop`?)
+//    - can be seen as taking the fixpoint of a `thunk -> thunk` region,
+//      which, in the fully unstructured CFG case, would consist of a single node
+//      (specifically a "`thunk` `switch`" dispatching all regions in the CFG,
+//      which makes it feel wasteful, but there has to be a way to distinguish
+//      between single-step and "until `break`-ing out")
+//    - maybe this can be done using the `thunk` `switch` node, with extra modes
+//      in e.g. its `SelectionKind` variant(s), such as "has a default case" and
+//      "`loop`-`switch` until `break" (although there is an unique hazard with
+//      reusing `NodeKind::Select` while having regions with different signatures,
+//      in that passes might assume matching signatures, and also any kind of
+//      looping control-flow has to account for the potential to execute any
+//      of the child regions, and therefore any side-effect, more than once etc.)
 #[derive(Clone, Default)]
 pub struct ControlFlowGraph {
-    pub control_inst_on_exit_from: EntityOrientedDenseMap<Region, ControlInst>,
+    pub target_thunk_on_exit_from: EntityOrientedDenseMap<Region, Value>,
 
     // HACK(eddyb) this currently only comes from `OpLoopMerge`, and cannot be
     // inferred (because implies too strong of an ownership/uniqueness notion).
     pub loop_merge_to_loop_header: FxIndexMap<Region, Region>,
-}
-
-#[derive(Clone)]
-pub struct ControlInst {
-    pub attrs: AttrSet,
-
-    pub kind: ControlInstKind,
-
-    pub inputs: SmallVec<[Value; 2]>,
-
-    // FIXME(eddyb) change the inline size of this to fit most instructions.
-    // FIXME(eddyb) should this be renamed to ("outgoing") `edges`?
-    pub target_thunks: SmallVec<[Value; 4]>,
-}
-
-#[derive(Clone)]
-pub enum ControlInstKind {
-    /// Unconditional branch to a single target.
-    Branch,
-
-    /// Branch to one of several targets, chosen by a single value input.
-    SelectBranch(cf::SelectionKind),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -49,39 +64,27 @@ pub enum ControlTarget {
     //
     // FIXME(eddyb) now that this is used through `NodeKind::ThunkBind`,
     // it should probably be more like `break` or some kind of "leave scope".
+    // FIXME(eddyb) one way to encode this unambiguously, even when dealing
+    // with e.g. multiple nested CFGs (such as the "execute a CFG" node idea),
+    // is to pick a region as the function-scoped "exit" (or "postdominator"),
+    // and in the worst-case it would only serve to output its own inputs
+    // (alternatively, non-trivial exits from "execute a CFG" can use `thunk`
+    // wrapping, so in the case of e.g. `return`ing from inside N nested loops,
+    // one wrap N `break`-like thunks, with each of the N levels being unwrapped
+    // by leaving the loops etc. - but that still technically has the ambiguity,
+    // and would result in the nested encoding showing up in the final structured
+    // result, so e.g. even if integers are used, N of them would be neeeded).
     Return,
 }
 
-// HACK(eddyb) marker type for an `undef` thunk.
-struct Unreachable;
+// HACK(eddyb) this is only public so it can be shared with `spv::lift`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct ControlEdge {
+    pub source_region: Region,
 
-impl ControlTarget {
-    // HACK(eddyb) this isn't necessarily the best place, but allows reuse.
-    // FIXME(eddyb) properly distinguish the different failure cases possible,
-    // maybe even avoid panicking entirely?
-    fn of_thunk(cx: &Context, func_at_thunk: FuncAt<'_, Value>) -> Result<Self, Unreachable> {
-        match func_at_thunk.position {
-            Value::Var(thunk) => Ok(ControlTarget::of_thunk_var(func_at_thunk.at(thunk))),
-            Value::Const(ct) => match cx[ct].kind {
-                ConstKind::Undef => Err(Unreachable),
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    // HACK(eddyb) this is the `Value::Var` case from `of_thunk`, separated so
-    // that traversal doesn't need to have access to the `Context`.
-    fn of_thunk_var(func_at_thunk: FuncAt<'_, Var>) -> Self {
-        match func_at_thunk.decl().kind() {
-            VarKind::NodeOutput { node, output_idx: 0 } => {
-                match func_at_thunk.at(node).def().kind {
-                    NodeKind::ThunkBind(target) => target,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
+    // HACK(eddyb) this is the minimal amount of information needed to look up
+    // the thunk, given access to the function (including `ControlFlowGraph`).
+    pub thunk_binding_region: Region,
 }
 
 impl ControlFlowGraph {
@@ -110,6 +113,113 @@ impl ControlFlowGraph {
             },
         );
         post_order.into_iter().rev()
+    }
+
+    pub fn edges_from<'a>(
+        &'a self,
+        func_at_edge_source: FuncAt<'a, Region>,
+    ) -> impl DoubleEndedIterator<Item = ControlEdge> + ExactSizeIterator + Clone + 'a {
+        self.edges_from_thunk_tailed_region(func_at_edge_source, func_at_edge_source.position)
+    }
+
+    // FIXME(eddyb) properly distinguish the different failure cases possible,
+    // maybe even avoid panicking entirely?
+    fn edges_from_thunk_tailed_region<'a>(
+        &'a self,
+        func_at_edge_source: FuncAt<'a, Region>,
+        thunk_binding_region: Region,
+    ) -> impl DoubleEndedIterator<Item = ControlEdge> + ExactSizeIterator + Clone + 'a {
+        let func = func_at_edge_source.at(());
+        let edge_source_region = func_at_edge_source.position;
+
+        let thunk = if edge_source_region == thunk_binding_region {
+            // FIXME(eddyb) make the thunk an actual region output instead.
+            *self.target_thunk_on_exit_from.get(edge_source_region).expect(
+                "cf::unstructured: missing `target_thunk_on_exit_from`, \
+                 despite having left structured control-flow",
+            )
+        } else {
+            func.at(thunk_binding_region).def().outputs.iter().copied().exactly_one().ok().unwrap()
+        };
+
+        let thunk_node = match thunk {
+            Value::Var(thunk) => match func.at(thunk).decl().kind() {
+                VarKind::NodeOutput { node, output_idx: 0 } => node,
+                _ => unreachable!(),
+            },
+            Value::Const(_) => {
+                return Either::Left(
+                    [ControlEdge { source_region: edge_source_region, thunk_binding_region }]
+                        .into_iter(),
+                );
+            }
+        };
+
+        let thunk_binding_region_children = func.at(thunk_binding_region).def().children.iter();
+        assert!(thunk_binding_region_children.last == Some(thunk_node));
+        if edge_source_region != thunk_binding_region {
+            assert!(thunk_binding_region_children.first == thunk_binding_region_children.last);
+        }
+
+        let thunk_node_def = func.at(thunk_node).def();
+        match thunk_node_def.kind {
+            NodeKind::ThunkBind(_) => Either::Left(
+                [ControlEdge { source_region: edge_source_region, thunk_binding_region }]
+                    .into_iter(),
+            ),
+            NodeKind::Select(_) => {
+                assert!(edge_source_region == thunk_binding_region);
+
+                Either::Right(thunk_node_def.child_regions.iter().map(move |&case| {
+                    self.edges_from_thunk_tailed_region(func_at_edge_source, case)
+                        .exactly_one()
+                        .ok()
+                        .unwrap()
+                }))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn edge_attrs_target_and_inputs<'a>(
+        &self,
+        func_at_edge: FuncAt<'a, ControlEdge>,
+    ) -> (AttrSet, Result<ControlTarget, Const>, &'a [Value]) {
+        let func = func_at_edge.at(());
+        let edge = func_at_edge.position;
+
+        let thunk = if edge.source_region == edge.thunk_binding_region {
+            // FIXME(eddyb) make the thunk an actual region output instead.
+            *self.target_thunk_on_exit_from.get(edge.thunk_binding_region).expect(
+                "cf::unstructured: missing `target_thunk_on_exit_from`, \
+                     despite having left structured control-flow",
+            )
+        } else {
+            func.at(edge.thunk_binding_region)
+                .def()
+                .outputs
+                .iter()
+                .copied()
+                .exactly_one()
+                .ok()
+                .unwrap()
+        };
+
+        match thunk {
+            Value::Var(thunk) => match func.at(thunk).decl().kind() {
+                VarKind::NodeOutput { node, output_idx: 0 } => {
+                    let thunk_node_def = func.at(node).def();
+                    match thunk_node_def.kind {
+                        NodeKind::ThunkBind(target) => {
+                            (thunk_node_def.attrs, Ok(target), &thunk_node_def.inputs)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            },
+            Value::Const(ct) => (AttrSet::default(), Err(ct), &[]),
+        }
     }
 }
 
@@ -140,7 +250,6 @@ mod sealed {
         }
     }
 }
-use crate::func_at::FuncAt;
 pub use sealed::IncomingEdgeCount;
 
 pub struct TraversalState<PreVisit: FnMut(Region), PostVisit: FnMut(Region)> {
@@ -184,17 +293,11 @@ impl ControlFlowGraph {
 
         (state.pre_order_visit)(region);
 
-        let control_inst = self
-            .control_inst_on_exit_from
-            .get(region)
-            .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
+        let targets = self.targets_of(func_at_region);
 
-        let targets = control_inst.target_thunks.iter().filter_map(|&thunk| match thunk {
-            Value::Var(thunk) => match ControlTarget::of_thunk_var(func.at(thunk)) {
-                ControlTarget::Region(target) => Some(target),
-                ControlTarget::Return => None,
-            },
-            Value::Const(_) => None,
+        let targets = targets.filter_map(|target| match target {
+            Ok(ControlTarget::Region(target)) => Some(target),
+            Ok(ControlTarget::Return) | Err(_) => None,
         });
         let targets = if state.reverse_targets {
             Either::Left(targets.rev())
@@ -206,6 +309,15 @@ impl ControlFlowGraph {
         }
 
         (state.post_order_visit)(region);
+    }
+
+    fn targets_of<'a>(
+        &'a self,
+        func_at_edge_source: FuncAt<'a, Region>,
+    ) -> impl DoubleEndedIterator<Item = Result<ControlTarget, Const>> + Clone + 'a {
+        let func = func_at_edge_source.at(());
+        self.edges_from(func_at_edge_source)
+            .map(move |edge| self.edge_attrs_target_and_inputs(func.at(edge)).1)
     }
 }
 
@@ -299,6 +411,10 @@ impl std::ops::BitOrAssign for EventualCfgExits {
     }
 }
 
+// HACK(eddyb) marker type for an `undef` thunk.
+#[derive(Copy, Clone)]
+struct Unreachable;
+
 impl<'a> LoopFinder<'a> {
     pub fn new(cx: &'a Context, func: FuncAt<'a, ()>, cfg: &'a ControlFlowGraph) -> Self {
         Self {
@@ -356,26 +472,17 @@ impl<'a> LoopFinder<'a> {
         self.scc_stack.push(node);
         *state_entry = Some(SccState::Pending(scc_stack_idx));
 
-        let control_inst = self
-            .cfg
-            .control_inst_on_exit_from
-            .get(node)
-            .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
+        let targets = self.targets_of(node);
 
         let mut eventual_cfg_exits = EventualCfgExits {
-            may_return_from_func: control_inst.target_thunks.iter().any(|&thunk| {
-                matches!(
-                    ControlTarget::of_thunk(self.cx, self.func.at(thunk)),
-                    Ok(ControlTarget::Return)
-                )
-            }),
+            may_return_from_func: targets
+                .clone()
+                .any(|target| matches!(target, Ok(ControlTarget::Return))),
         };
 
-        let earliest_scc_root = control_inst
-            .target_thunks
-            .iter()
-            .flat_map(|&thunk| {
-                let target = match ControlTarget::of_thunk(self.cx, self.func.at(thunk)) {
+        let earliest_scc_root = targets
+            .flat_map(|target| {
+                let target = match target {
                     Ok(ControlTarget::Region(target)) => target,
                     Ok(ControlTarget::Return) | Err(Unreachable) => {
                         return None.into_iter().chain(None);
@@ -435,15 +542,10 @@ impl<'a> LoopFinder<'a> {
                 self.scc_stack[scc_start..]
                     .iter()
                     .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node]
-                            .target_thunks
-                            .iter()
-                            .filter_map(|&thunk| {
-                                match ControlTarget::of_thunk(self.cx, self.func.at(thunk)) {
-                                    Ok(ControlTarget::Region(target)) => Some(target),
-                                    Ok(ControlTarget::Return) | Err(Unreachable) => None,
-                                }
-                            })
+                        self.targets_of(scc_node).filter_map(|target| match target {
+                            Ok(ControlTarget::Region(target)) => Some(target),
+                            Ok(ControlTarget::Return) | Err(Unreachable) => None,
+                        })
                     })
                     .filter(|&target| target_is_exit(target))
                     .collect(),
@@ -478,5 +580,19 @@ impl<'a> LoopFinder<'a> {
         }
 
         (earliest_scc_root, eventual_cfg_exits)
+    }
+
+    fn targets_of(
+        &self,
+        region: Region,
+    ) -> impl Iterator<Item = Result<ControlTarget, Unreachable>> + Clone + 'a {
+        let cx = self.cx;
+
+        self.cfg.targets_of(self.func.at(region)).map(|edge| {
+            edge.map_err(|ct| match cx[ct].kind {
+                ConstKind::Undef => Unreachable,
+                _ => unreachable!(),
+            })
+        })
     }
 }
