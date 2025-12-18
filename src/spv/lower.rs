@@ -9,6 +9,7 @@ use crate::{
     Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
     TypeKind, TypeOrConst, Value, cfg, print,
 };
+use itertools::Itertools as _;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +23,9 @@ enum IdDef {
     Type(Type),
     Const(Const),
 
+    // HACK(eddyb) for illegal cycles caused by global initializers.
+    PtrToGlobalVarForwardRef(Const),
+
     Func(Func),
 
     SpvExtInstImport(InternedStr),
@@ -34,7 +38,7 @@ impl IdDef {
             // FIXME(eddyb) print these with some kind of "maximum depth",
             // instead of just describing the kind of definition.
             IdDef::Type(_) => "a type".into(),
-            IdDef::Const(_) => "a constant".into(),
+            IdDef::Const(_) | IdDef::PtrToGlobalVarForwardRef(_) => "a constant".into(),
 
             IdDef::Func(_) => "a function".into(),
 
@@ -122,6 +126,52 @@ impl Module {
         // HACK(eddyb) used to quickly check whether an `OpVariable` is global.
         let storage_class_function_imm = spv::Imm::Short(wk.StorageClass, wk.Function);
 
+        // HACK(eddyb) used as the `GlobalVarDecl` for an `IdDef::PtrToGlobalVarForwardRef`.
+        let dummy_decl_for_global_var_forward_ref =
+            |spv_inst: &spv::InstWithIds, type_of_ptr_to| {
+                assert!(spv_inst.opcode == wk.OpVariable);
+
+                let storage_class = match spv_inst.imms[..] {
+                    [spv::Imm::Short(kind, storage_class)] => {
+                        assert_eq!(kind, wk.StorageClass);
+                        storage_class
+                    }
+                    _ => unreachable!(),
+                };
+
+                GlobalVarDecl {
+                    attrs: {
+                        let mut attrs = AttrSet::default();
+                        attrs.push_diag(
+                            &cx,
+                            Diag::err([
+                                "global ID used as forward reference but never defined".into()
+                            ]),
+                        );
+                        attrs
+                    },
+                    type_of_ptr_to,
+                    shape: None,
+                    addr_space: AddrSpace::SpvStorageClass(storage_class),
+                    def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
+                }
+            };
+        // HACK(eddyb) no `PartialEq` on `GlobalVarDecl`.
+        let assert_is_dummy_decl_for_global_var_forward_ref =
+            |decl: &GlobalVarDecl, spv_inst: &spv::InstWithIds| {
+                let dummy_decl =
+                    dummy_decl_for_global_var_forward_ref(spv_inst, decl.type_of_ptr_to);
+                let [expected, found] = [&dummy_decl, decl].map(
+                    |GlobalVarDecl { attrs, type_of_ptr_to, shape, addr_space, def }| {
+                        let DeclDef::Imported(import) = def else {
+                            unreachable!();
+                        };
+                        (attrs, type_of_ptr_to, shape, addr_space, import)
+                    },
+                );
+                assert!(expected == found);
+            };
+
         let mut module = {
             let [magic, version, generator_magic, id_bound, reserved_inst_schema] = parser.header;
 
@@ -201,7 +251,7 @@ impl Module {
         let mut pending_func_bodies = vec![];
         let mut current_func_body = None;
 
-        let mut spv_insts = parser.peekable();
+        let mut spv_insts = parser.multipeek();
         while let Some(mut inst) = spv_insts.next().transpose()? {
             let opcode = inst.opcode;
 
@@ -464,6 +514,7 @@ impl Module {
                         // Absorb all following `OpSourceContinued` into `contents`.
                         while let Some(Ok(cont_inst)) = spv_insts.peek() {
                             if cont_inst.opcode != wk.OpSourceContinued {
+                                spv_insts.reset_peek();
                                 break;
                             }
                             let cont_inst = spv_insts.next().unwrap().unwrap();
@@ -627,8 +678,10 @@ impl Module {
                     .map(|&id| match id_defs.get(&id) {
                         Some(&IdDef::Type(ty)) => Ok(TypeOrConst::Type(ty)),
                         Some(&IdDef::Const(ct)) => Ok(TypeOrConst::Const(ct)),
+                        None | Some(IdDef::PtrToGlobalVarForwardRef(_)) => {
+                            Err(format!("a forward reference to %{id}"))
+                        }
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
                     })
                     .map(|result| {
                         result.map_err(|descr| {
@@ -651,9 +704,44 @@ impl Module {
                     .iter()
                     .map(|&id| match id_defs.get(&id) {
                         Some(&IdDef::Type(ty)) => Ok(spv_type_operand_as_const(ty)),
-                        Some(&IdDef::Const(ct)) => Ok(ct),
+                        Some(&IdDef::Const(ct) | &IdDef::PtrToGlobalVarForwardRef(ct)) => Ok(ct),
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
+                        None => {
+                            // HACK(eddyb) search for a matching `OpVariable`
+                            // later on, just in case this is a cycle caused
+                            // by the initializer value of a global.
+                            let mut found = None;
+                            while let Some(Ok(later_inst)) = spv_insts.peek() {
+                                if later_inst.opcode == wk.OpFunction {
+                                    break;
+                                }
+                                if later_inst.opcode == wk.OpVariable
+                                    && later_inst.result_id == Some(id)
+                                    && let Some(&IdDef::Type(ty)) =
+                                        id_defs.get(&later_inst.result_type_id.unwrap())
+                                {
+                                    let global_var = module.global_vars.define(
+                                        &cx,
+                                        dummy_decl_for_global_var_forward_ref(later_inst, ty),
+                                    );
+                                    let ptr_to_global_var = cx.intern(ConstDef {
+                                        attrs: AttrSet::default(),
+                                        ty,
+                                        kind: ConstKind::PtrToGlobalVar(global_var),
+                                    });
+                                    id_defs.insert(
+                                        id,
+                                        IdDef::PtrToGlobalVarForwardRef(ptr_to_global_var),
+                                    );
+                                    found = Some(ptr_to_global_var);
+                                    break;
+                                }
+                            }
+
+                            let ct =
+                                found.ok_or_else(|| format!("a forward reference to %{id}"))?;
+                            Ok(ct)
+                        }
                     })
                     .map(|result| {
                         result.map_err(|descr| {
@@ -702,8 +790,10 @@ impl Module {
                 let initializer = initializer
                     .map(|id| match id_defs.get(&id) {
                         Some(&IdDef::Const(ct)) => Ok(ct),
+                        None | Some(IdDef::PtrToGlobalVarForwardRef(_)) => {
+                            Err(format!("a forward reference to %{id}"))
+                        }
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
                     })
                     .transpose()
                     .map_err(|descr| {
@@ -725,22 +815,48 @@ impl Module {
                     None => DeclDef::Present(GlobalVarDefBody { initializer }),
                 };
 
-                let global_var = module.global_vars.define(
-                    &cx,
-                    GlobalVarDecl {
-                        attrs: mem::take(&mut attrs),
-                        type_of_ptr_to: type_of_ptr_to_global_var,
-                        shape: None,
-                        addr_space: AddrSpace::SpvStorageClass(storage_class),
-                        def,
-                    },
-                );
-                let ptr_to_global_var = cx.intern(ConstDef {
-                    attrs: AttrSet::default(),
-                    ty: type_of_ptr_to_global_var,
-                    kind: ConstKind::PtrToGlobalVar(global_var),
-                });
-                id_defs.insert(global_var_id, IdDef::Const(ptr_to_global_var));
+                let decl = GlobalVarDecl {
+                    attrs: mem::take(&mut attrs),
+                    type_of_ptr_to: type_of_ptr_to_global_var,
+                    shape: None,
+                    addr_space: AddrSpace::SpvStorageClass(storage_class),
+                    def,
+                };
+
+                {
+                    use std::collections::hash_map::Entry;
+
+                    match id_defs.entry(global_var_id) {
+                        Entry::Occupied(mut entry) => match entry.get() {
+                            &IdDef::PtrToGlobalVarForwardRef(ct) => {
+                                let ConstKind::PtrToGlobalVar(global_var) = cx[ct].kind else {
+                                    unreachable!();
+                                };
+                                let decl_slot = &mut module.global_vars[global_var];
+                                assert_is_dummy_decl_for_global_var_forward_ref(decl_slot, &inst);
+                                *decl_slot = decl;
+
+                                entry.insert(IdDef::Const(ct));
+                            }
+                            id_def => {
+                                return Err(invalid(&format!(
+                                    "invalid redefinition of {} as a new global",
+                                    id_def.descr(&cx)
+                                )));
+                            }
+                        },
+                        Entry::Vacant(entry) => {
+                            let ptr_to_global_var = cx.intern(ConstDef {
+                                attrs: AttrSet::default(),
+                                ty: type_of_ptr_to_global_var,
+                                kind: ConstKind::PtrToGlobalVar(
+                                    module.global_vars.define(&cx, decl),
+                                ),
+                            });
+                            entry.insert(IdDef::Const(ptr_to_global_var));
+                        }
+                    }
+                }
 
                 Seq::TypeConstOrGlobalVar
             } else if opcode == wk.OpFunction {
@@ -1230,7 +1346,7 @@ impl Module {
                             "unsupported use of {} outside `OpExtInst`",
                             id_def.descr(&cx),
                         ))),
-                        None => local_id_defs
+                        None | Some(IdDef::PtrToGlobalVarForwardRef(_)) => local_id_defs
                             .get(&id)
                             .copied()
                             .ok_or_else(|| invalid(&format!("undefined ID %{id}",))),
