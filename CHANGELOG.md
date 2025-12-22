@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.3.1] - 2025-12-22
+
 ## [0.3.0] - 2023-07-25
 
 ### Added ⭐
@@ -102,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pretty-printer with (styled and hyperlinked) HTML output.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/EmbarkStudios/spirt/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/rust-gpu/spirt/compare/0.3.1...HEAD
+[0.3.1]: https://github.com/EmbarkStudios/spirt/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/EmbarkStudios/spirt/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/EmbarkStudios/spirt/compare/0.1.0...0.2.0
 <!-- HACK(eddyb) `0.0.0` doesn't exist as a "tag before the initial commit", but
