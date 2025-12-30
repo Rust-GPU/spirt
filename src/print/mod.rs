@@ -3755,9 +3755,8 @@ impl Print for FuncAt<'_, Node> {
                 inputs[0],
                 child_regions.iter().map(|&case| self.at(case).print(printer)),
             ),
+            // TODO(eddyb) rethink loop printing with (output-side) hermeticity.
             NodeKind::Loop { repeat_condition } => {
-                assert!(outputs.is_empty());
-
                 let initial_inputs = inputs;
                 let body = child_regions[0];
                 let inputs = &self.at(body).def().inputs;
