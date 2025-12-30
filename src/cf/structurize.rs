@@ -236,18 +236,17 @@ enum LazyCond {
     False,
     True,
 
-    Merge(Rc<LazyCondMerge>),
+    Dyn(Rc<LazyCondDyn>),
 }
 
-enum LazyCondMerge {
-    Select {
-        node: Node,
-        // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
-        // `LazyCond::{Undef,False,True}`, and that could more efficiently be
-        // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Merge`
-        // means that this is more compact than it would otherwise be.
-        per_case_conds: SmallVec<[LazyCond; 4]>,
-    },
+struct LazyCondDyn {
+    node: Node,
+
+    // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
+    // `LazyCond::{Undef,False,True}`, and that could more efficiently be
+    // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Dyn`
+    // means that this is more compact than it would otherwise be.
+    per_child_region_conds: SmallVec<[LazyCond; 4]>,
 }
 
 /// A target for one of the edge bundles in a [`DeferredEdgeBundleSet`], mostly
@@ -268,7 +267,7 @@ enum DeferredTarget {
 /// that exactly one [`DeferredEdgeBundle`] condition must be `true` at any
 /// given time (the only non-trivial case, [`DeferredEdgeBundleSet::Choice`],
 /// satisfies it because it's only used for merging `Select` cases, and so
-/// all the conditions will end up using disjoint [`LazyCond::Merge`]s).
+/// all the conditions will end up using disjoint [`LazyCond::Dyn`]s).
 enum DeferredEdgeBundleSet {
     Unreachable,
 
@@ -798,6 +797,10 @@ impl<'a> Structurizer<'a> {
             // the loop body itself was originally.
             // NOTE(eddyb) both input declarations and the child `Loop` node are
             // added later down below, after the `Loop` node is created.
+            //
+            // TODO(eddyb) does the above comment even make sense? output-side
+            // hermetic loops are now implemented, but the wrapper is for the
+            // input side, instead.
             let wrapper_region = self.func_def_body.regions.define(self.cx, RegionDef::default());
 
             // Any loop body region inputs, which must receive values from both
@@ -808,6 +811,9 @@ impl<'a> Structurizer<'a> {
             // FIXME(eddyb) `Loop` `Node`s should be changed to be hermetic
             // and have the loop state be output from the whole node itself,
             // for any outside uses of values defined within the loop body.
+            //
+            // TODO(eddyb) update above comment (and other comments elsewhere!)
+            // for the actual implementation of hermetic loops.
             let body_def = &mut self.func_def_body.regions[body];
             let original_body_input_vars = mem::take(&mut body_def.inputs);
             assert!(body_def.outputs.is_empty());
@@ -877,13 +883,107 @@ impl<'a> Structurizer<'a> {
                     // FIXME(eddyb) could it be possible to synthesize attrs
                     // from `ControlInst`s' attrs and/or `OpLoopMerge`'s?
                     attrs: AttrSet::default(),
-                    kind: NodeKind::Loop { repeat_condition },
+                    kind: NodeKind::Loop {
+                        // TODO(eddyb) make this a regular body output (first one?).
+                        repeat_condition,
+                    },
                     inputs: initial_inputs,
                     child_regions: [body].into_iter().collect(),
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
             );
+
+            // HACK(eddyb) create matching `loop_node` output `Var`s, for all the
+            // "loop state" (body inputs->outputs etc.).
+            // FIXME(eddyb) could these be decoupled somehow?
+            self.func_def_body.nodes[loop_node].outputs = self.func_def_body.regions[body]
+                .inputs
+                .iter()
+                .map(|&input_var| {
+                    // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                    let input_var_decl = self.func_def_body.vars[input_var].clone();
+                    self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl { def_parent: Either::Right(loop_node), ..input_var_decl },
+                    )
+                })
+                .collect();
+
+            // TODO(eddyb) WIP hermetic loops (output-side).
+            match &mut deferred_edges {
+                DeferredEdgeBundleSet::Unreachable | DeferredEdgeBundleSet::Always { .. } => {}
+                DeferredEdgeBundleSet::Choice { target_to_deferred } => {
+                    for deferred in target_to_deferred.values_mut() {
+                        match deferred.condition {
+                            LazyCond::Undef | LazyCond::False | LazyCond::True => {}
+
+                            LazyCond::Dyn(_) => {
+                                deferred.condition = LazyCond::Dyn(Rc::new(LazyCondDyn {
+                                    node: loop_node,
+                                    per_child_region_conds: [deferred.condition.clone()]
+                                        .into_iter()
+                                        .collect(),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            let all_deferred_edge_inputs = deferred_edges
+                .iter_targets_with_edge_bundle_mut()
+                .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs);
+            for v in all_deferred_edge_inputs {
+                VarReplacer(&self.var_replacements).transform_value_use(v).apply_to(v);
+
+                let var = match v {
+                    Value::Const(_) => continue,
+                    Value::Var(var) => var,
+                };
+
+                // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                let var_decl = self.func_def_body.vars[*var].clone();
+
+                if var_decl.def_parent == Either::Left(wrapper_region) {
+                    continue;
+                }
+
+                // FIXME(eddyb) reuse loop outputs for repeats of the same `var`,
+                // instead of introducing new ones for every single occurence.
+
+                let undef_of_var_ty = self.const_undef(var_decl.ty);
+
+                let body_def = &mut self.func_def_body.regions[body];
+
+                let next_loop_var_idx = body_def.inputs.len();
+                body_def.inputs.push(self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        def_parent: Either::Left(body),
+                        def_idx: next_loop_var_idx.try_into().unwrap(),
+                        ..var_decl.clone()
+                    },
+                ));
+
+                assert_eq!(body_def.outputs.len(), next_loop_var_idx);
+                body_def.outputs.push(Value::Var(*var));
+
+                let loop_node_def = &mut self.func_def_body.nodes[loop_node];
+
+                assert_eq!(loop_node_def.inputs.len(), next_loop_var_idx);
+                loop_node_def.inputs.push(Value::Const(undef_of_var_ty));
+
+                assert_eq!(loop_node_def.outputs.len(), next_loop_var_idx);
+                *var = self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        def_parent: Either::Right(loop_node),
+                        def_idx: next_loop_var_idx.try_into().unwrap(),
+                        ..var_decl.clone()
+                    },
+                );
+                loop_node_def.outputs.push(*var);
+            }
 
             self.func_def_body.regions[wrapper_region]
                 .children
@@ -1539,9 +1639,9 @@ impl<'a> Structurizer<'a> {
             {
                 LazyCond::True
             } else {
-                LazyCond::Merge(Rc::new(LazyCondMerge::Select {
+                LazyCond::Dyn(Rc::new(LazyCondDyn {
                     node: get_or_define_select_node(self, &cases),
-                    per_case_conds: per_case_conds.cloned().collect(),
+                    per_child_region_conds: per_case_conds.cloned().collect(),
                 }))
             };
 
@@ -1594,50 +1694,44 @@ impl<'a> Structurizer<'a> {
             LazyCond::False => Value::Const(self.const_false),
             LazyCond::True => Value::Const(self.const_true),
 
-            // `LazyCond::Merge` was only created in the first place if a merge
+            // `LazyCond::Dyn` was only created in the first place if a merge
             // was actually necessary, so there shouldn't be simplifications to
             // do here (i.e. the value provided is if `materialize_lazy_cond`
             // never gets called because the target has become unconditional).
             //
             // FIXME(eddyb) there is still an `if cond { true } else { false }`
-            // special-case (repalcing with just `cond`), that cannot be expressed
+            // special-case (replacing with just `cond`), that cannot be expressed
             // currently in `LazyCond` itself (but maybe it should be).
-            LazyCond::Merge(merge) => {
-                let LazyCondMerge::Select { node, ref per_case_conds } = **merge;
+            LazyCond::Dyn(merge) => {
+                let LazyCondDyn { node, ref per_child_region_conds } = **merge;
 
                 // HACK(eddyb) this won't actually allocate most of the time,
                 // and avoids complications later below, when mutating the cases.
-                let per_case_conds: SmallVec<[_; 8]> = per_case_conds
+                let per_child_region_conds: SmallVec<[_; 8]> = per_child_region_conds
                     .into_iter()
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
                 let NodeDef { attrs: _, kind, inputs, child_regions, outputs: output_vars } =
                     &mut *self.func_def_body.nodes[node];
-                let cases = match kind {
-                    NodeKind::Select(kind) => {
-                        assert_eq!(child_regions.len(), per_case_conds.len());
 
-                        if let SelectionKind::BoolCond = kind {
-                            let cond = inputs[0];
+                assert_eq!(child_regions.len(), per_child_region_conds.len());
 
-                            let [val_false, val_true] =
-                                [self.const_false, self.const_true].map(Value::Const);
-                            if per_case_conds[..] == [val_true, val_false] {
-                                return cond;
-                            } else if per_case_conds[..] == [val_false, val_true] {
-                                // FIXME(eddyb) this could also be special-cased,
-                                // at least when called from the topmost level,
-                                // where which side is `false`/`true` doesn't
-                                // matter (or we could even generate `!cond`?).
-                                let _not_cond = cond;
-                            }
-                        }
+                if let NodeKind::Select(SelectionKind::BoolCond) = kind {
+                    let cond = inputs[0];
 
-                        child_regions
+                    let [val_false, val_true] =
+                        [self.const_false, self.const_true].map(Value::Const);
+                    if per_child_region_conds[..] == [val_true, val_false] {
+                        return cond;
+                    } else if per_child_region_conds[..] == [val_false, val_true] {
+                        // FIXME(eddyb) this could also be special-cased,
+                        // at least when called from the topmost level,
+                        // where which side is `false`/`true` doesn't
+                        // matter (or we could even generate `!cond`?).
+                        let _not_cond = cond;
                     }
-                    _ => unreachable!(),
-                };
+                }
 
                 let output_var = self.func_def_body.vars.define(
                     self.cx,
@@ -1650,10 +1744,30 @@ impl<'a> Structurizer<'a> {
                 );
                 output_vars.push(output_var);
 
-                for (&case, cond) in cases.iter().zip_eq(per_case_conds) {
+                for (&case, cond) in child_regions.iter().zip_eq(per_child_region_conds) {
                     let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
                     outputs.push(cond);
                     assert_eq!(outputs.len(), output_vars.len());
+                }
+
+                // `Loop`s outputs have to have matching loop body inputs
+                // (and also initial loop inputs).
+                if let NodeKind::Loop { .. } = kind {
+                    let body = child_regions[0];
+                    let input_vars = &mut self.func_def_body.regions[body].inputs;
+                    let input_var = self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl {
+                            attrs: AttrSet::default(),
+                            ty: self.type_bool,
+                            def_parent: Either::Left(body),
+                            def_idx: input_vars.len().try_into().unwrap(),
+                        },
+                    );
+                    input_vars.push(input_var);
+
+                    let initial_input = Value::Const(self.const_undef(self.type_bool));
+                    self.func_def_body.nodes[node].inputs.push(initial_input);
                 }
 
                 Value::Var(output_var)
