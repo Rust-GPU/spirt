@@ -1047,7 +1047,13 @@ impl Module {
                         }
 
                         if let Some(id) = result_id {
-                            def_map.add_def(current_block, id, result_type.unwrap());
+                            // HACK(eddyb) ignore entry block defs, to avoid them
+                            // being passed around the CFG (this could be done
+                            // for every single "region", if they are computed,
+                            // approximately *but accurately*, from the CFG).
+                            if current_block != func_def_body.body {
+                                def_map.add_def(current_block, id, result_type.unwrap());
+                            }
                         }
                     }
                 }
