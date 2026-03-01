@@ -180,14 +180,22 @@ fn find_bad_loop_continue_shortcut_shape(blocks: &[Block]) -> bool {
 
 #[test]
 fn no_loop_continue_shortcut_shape_after_lift() {
-    let fixtures: [(&str, &[u8]); 2] = [
+    let fixtures: [(&str, &[u8]); 4] = [
         (
             "loop-continue-shortcut.repro",
             include_bytes!("data/loop-continue-shortcut.repro.spvbin"),
         ),
         (
+            "loop-continue-shortcut-pretest-len.repro",
+            include_bytes!("data/loop-continue-shortcut-pretest-len.repro.spvbin"),
+        ),
+        (
             "loop-continue-shortcut-nested.repro",
             include_bytes!("data/loop-continue-shortcut-nested.repro.spvbin"),
+        ),
+        (
+            "loop-continue-shortcut-nested-len.repro",
+            include_bytes!("data/loop-continue-shortcut-nested-len.repro.spvbin"),
         ),
     ];
 
@@ -207,10 +215,25 @@ fn no_loop_continue_shortcut_shape_after_lift() {
 
 #[test]
 fn detector_does_not_trigger_on_non_loop_fixture() {
-    let blocks = lifted_blocks_from_spv_fixture(include_bytes!("data/basic.frag.glsl.dbg.spvbin"));
+    let fixtures: [(&str, &[u8]); 3] = [
+        ("basic.frag.glsl.dbg", include_bytes!("data/basic.frag.glsl.dbg.spvbin")),
+        (
+            "loop-continue-shortcut-control-posttest",
+            include_bytes!("data/loop-continue-shortcut-control-posttest.spvbin"),
+        ),
+        (
+            "loop-continue-shortcut-control-noloop",
+            include_bytes!("data/loop-continue-shortcut-control-noloop.spvbin"),
+        ),
+    ];
 
-    assert!(
-        !find_bad_loop_continue_shortcut_shape(&blocks),
-        "detector matched a non-loop fixture unexpectedly"
-    );
+    let mut offenders = Vec::new();
+    for (name, spv_bytes) in fixtures {
+        let blocks = lifted_blocks_from_spv_fixture(spv_bytes);
+        if find_bad_loop_continue_shortcut_shape(&blocks) {
+            offenders.push(name);
+        }
+    }
+
+    assert!(offenders.is_empty(), "detector matched control fixtures unexpectedly: {offenders:?}");
 }
