@@ -8,13 +8,9 @@ struct Block {
     insts: Vec<spv::InstWithIds>,
 }
 
-fn lifted_blocks_from_fixture() -> Vec<Block> {
+fn lifted_blocks_from_spv_fixture(spv_bytes: &[u8]) -> Vec<Block> {
     let cx = Rc::new(spirt::Context::new());
-    let mut module = spirt::Module::lower_from_spv_bytes(
-        cx,
-        include_bytes!("data/control_flow_mem2reg_undef_rust.spvbin").to_vec(),
-    )
-    .unwrap();
+    let mut module = spirt::Module::lower_from_spv_bytes(cx, spv_bytes.to_vec()).unwrap();
 
     spirt::passes::link::minimize_exports(&mut module, |export_key| {
         matches!(export_key, spirt::ExportKey::SpvEntryPoint { .. })
@@ -184,10 +180,37 @@ fn find_bad_loop_continue_shortcut_shape(blocks: &[Block]) -> bool {
 
 #[test]
 fn no_loop_continue_shortcut_shape_after_lift() {
-    let blocks = lifted_blocks_from_fixture();
+    let fixtures: [(&str, &[u8]); 2] = [
+        (
+            "loop-continue-shortcut.repro",
+            include_bytes!("data/loop-continue-shortcut.repro.spvbin"),
+        ),
+        (
+            "loop-continue-shortcut-nested.repro",
+            include_bytes!("data/loop-continue-shortcut-nested.repro.spvbin"),
+        ),
+    ];
+
+    let mut offenders = Vec::new();
+    for (name, spv_bytes) in fixtures {
+        let blocks = lifted_blocks_from_spv_fixture(spv_bytes);
+        if find_bad_loop_continue_shortcut_shape(&blocks) {
+            offenders.push(name);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "found loop-continue shortcut shape that can mis-handle loop edge values in fixtures: {offenders:?}"
+    );
+}
+
+#[test]
+fn detector_does_not_trigger_on_non_loop_fixture() {
+    let blocks = lifted_blocks_from_spv_fixture(include_bytes!("data/basic.frag.glsl.dbg.spvbin"));
 
     assert!(
         !find_bad_loop_continue_shortcut_shape(&blocks),
-        "found loop-continue shortcut shape that triggers control_flow_mem2reg_undef miscompile"
+        "detector matched a non-loop fixture unexpectedly"
     );
 }
