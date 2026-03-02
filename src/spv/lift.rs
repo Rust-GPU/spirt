@@ -595,10 +595,10 @@ impl<'a> FuncLifting<'a> {
         match continue_cond {
             Value::DataInstOutput(_) => None,
 
-            Value::ControlNodeOutput { control_node, output_idx } => {
-                let control_node_def = func_def_body.at(control_node).def();
-                let ControlNodeKind::Select { kind: SelectionKind::BoolCond, scrutinee, cases } =
-                    &control_node_def.kind
+            Value::NodeOutput { node, output_idx } => {
+                let node_def = func_def_body.at(node).def();
+                let NodeKind::Select { kind: SelectionKind::BoolCond, scrutinee, cases } =
+                    &node_def.kind
                 else {
                     return None;
                 };
