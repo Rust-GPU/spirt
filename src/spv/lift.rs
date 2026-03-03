@@ -593,8 +593,6 @@ impl<'a> FuncLifting<'a> {
 
         let wk = &spec::Spec::get().well_known;
         match continue_cond {
-            Value::DataInstOutput(_) => None,
-
             Value::NodeOutput { node, output_idx } => {
                 let node_def = func_def_body.at(node).def();
                 let NodeKind::Select { kind: SelectionKind::BoolCond, scrutinee, cases } =
