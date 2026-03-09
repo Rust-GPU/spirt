@@ -192,6 +192,8 @@ def_spv_spec_with_extra_well_known! {
 pub fn run_from_file(in_file_path: PathBuf, out_file_path: Option<PathBuf>) {
     let wk = &SpvSpecWithExtras::get().well_known;
 
+    let debug = DebugOptions::from_env();
+
     fn eprint_duration<R>(f: impl FnOnce() -> R) -> R {
         let start = std::time::Instant::now();
         let r = f();
@@ -203,14 +205,30 @@ pub fn run_from_file(in_file_path: PathBuf, out_file_path: Option<PathBuf>) {
         Module::lower_from_spv_file(Rc::new(Context::new()), &in_file_path).unwrap()
     });
     eprintln!("Module::lower_from_spv_file({})", in_file_path.display());
+
+    let cx = module.cx();
+
     eprint_duration(|| spirt::passes::legalize::structurize_func_cfgs(&mut module));
     eprintln!("legalize::structurize_func_cfgs");
 
-    let mut interpreter = Interpreter::new(
-        &module,
-        DebugOptions::from_env(),
-        &spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE,
-    );
+    if debug.hermetically_sealed_regions {
+        eprint_duration(|| {
+            use spirt::visit;
+
+            // FIXME(eddyb) reuse this collection work in some kind of "pass manager".
+            let visit::AllUses { funcs, .. } = visit::AllUses::from_module(&module);
+
+            for &func in &funcs {
+                if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
+                    spirt::cf::hermetic::seal(&cx, func_def_body.at_mut_body());
+                }
+            }
+        });
+        eprintln!("cf::hermetic::seal");
+    }
+
+    let mut interpreter =
+        Interpreter::new(&module, debug, &spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE);
 
     let print_exec_model = |exec_model| {
         spv::print::operand_from_imms([spv::Imm::Short(wk.ExecutionModel, exec_model)])
@@ -927,6 +945,7 @@ pub struct DebugOptions {
     trace_slow: bool,
 
     drop_vals_on_region_exit: bool,
+    hermetically_sealed_regions: bool,
 
     // HACK(eddyb) this is only used by e.g. infinite loop detection.
     transiently_trace_all: bool,
@@ -946,6 +965,7 @@ impl DebugOptions {
                         "trace-all" => debug.trace_all = true,
                         "trace-slow" => debug.trace_slow = true,
                         "drop-vals-on-region-exit" => debug.drop_vals_on_region_exit = true,
+                        "hermetically-sealed-regions" => debug.hermetically_sealed_regions = true,
                         _ => panic!("unknown `SPIRTI_DEBUG` option `{opt}`"),
                     }
                 }
@@ -1632,6 +1652,12 @@ impl<'a> Interpreter<'a> {
                     SelectionKind::Switch { case_consts } => case_consts,
                 };
 
+                let case_inputs = if self.debug.hermetically_sealed_regions {
+                    inputs
+                } else {
+                    [].into_iter().collect()
+                };
+
                 let mut already_handled =
                     DynScalar(scalar::Type::Bool, DynScalarData::Bool(DynData::Uniform(false)));
                 let mut partial_outputs = None;
@@ -1681,8 +1707,7 @@ impl<'a> Interpreter<'a> {
                     let outer_tangle = self.tangle.clone();
                     self.tangle = (self.tangle.clone(), case_taken_data.clone()).map(|x, y| x & y);
 
-                    let case_outputs =
-                        self.eval_region(func_at_node.at(case), [].into_iter().collect());
+                    let case_outputs = self.eval_region(func_at_node.at(case), case_inputs.clone());
 
                     self.tangle = outer_tangle;
 
