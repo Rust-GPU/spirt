@@ -211,13 +211,15 @@ pub fn run_from_file(in_file_path: PathBuf, out_file_path: Option<PathBuf>) {
     eprint_duration(|| spirt::passes::legalize::structurize_func_cfgs(&mut module));
     eprintln!("legalize::structurize_func_cfgs");
 
+    let mut per_func_sched = EntityOrientedDenseMap::default();
+
     if debug.hermetically_sealed_regions {
+        use spirt::visit;
+
+        // FIXME(eddyb) reuse this collection work in some kind of "pass manager".
+        let visit::AllUses { funcs, .. } = visit::AllUses::from_module(&module);
+
         eprint_duration(|| {
-            use spirt::visit;
-
-            // FIXME(eddyb) reuse this collection work in some kind of "pass manager".
-            let visit::AllUses { funcs, .. } = visit::AllUses::from_module(&module);
-
             for &func in &funcs {
                 if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
                     spirt::cf::hermetic::seal(&cx, func_def_body.at_mut_body());
@@ -225,10 +227,26 @@ pub fn run_from_file(in_file_path: PathBuf, out_file_path: Option<PathBuf>) {
             }
         });
         eprintln!("cf::hermetic::seal");
+
+        if debug.drop_vals_on_live_range_end {
+            eprint_duration(|| {
+                for &func in &funcs {
+                    if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
+                        per_func_sched
+                            .insert(func, spirt::sched::Schedule::compute(func_def_body.at_body()));
+                    }
+                }
+            });
+            eprintln!("sched::Schedule::compute");
+        }
     }
 
-    let mut interpreter =
-        Interpreter::new(&module, debug, &spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE);
+    let mut interpreter = Interpreter::new(
+        &module,
+        &per_func_sched,
+        debug,
+        &spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE,
+    );
 
     let print_exec_model = |exec_model| {
         spv::print::operand_from_imms([spv::Imm::Short(wk.ExecutionModel, exec_model)])
@@ -930,7 +948,9 @@ impl MemState {
 }
 
 #[derive(Default)]
-struct CallFrame {
+struct CallFrame<'a> {
+    sched: Option<&'a spirt::sched::Schedule>,
+
     var_values: EntityOrientedDenseMap<Var, DynVal>,
 
     dealloc_on_exit: Vec<AllocId>,
@@ -946,6 +966,7 @@ pub struct DebugOptions {
 
     drop_vals_on_region_exit: bool,
     hermetically_sealed_regions: bool,
+    drop_vals_on_live_range_end: bool,
 
     // HACK(eddyb) this is only used by e.g. infinite loop detection.
     transiently_trace_all: bool,
@@ -966,6 +987,10 @@ impl DebugOptions {
                         "trace-slow" => debug.trace_slow = true,
                         "drop-vals-on-region-exit" => debug.drop_vals_on_region_exit = true,
                         "hermetically-sealed-regions" => debug.hermetically_sealed_regions = true,
+                        "drop-vals-on-live-range-end" => {
+                            debug.hermetically_sealed_regions = true;
+                            debug.drop_vals_on_live_range_end = true;
+                        }
                         _ => panic!("unknown `SPIRTI_DEBUG` option `{opt}`"),
                     }
                 }
@@ -985,6 +1010,7 @@ pub struct Interpreter<'a> {
     layout_cache: spirt::mem::layout::LayoutCache<'a>,
 
     module: &'a Module,
+    per_func_sched: &'a EntityOrientedDenseMap<Func, spirt::sched::Schedule>,
     bindings: FxIndexMap<BindSlot, BindState>,
 
     // FIXME(eddyb) maybe move all of these fields into a "debug state"?
@@ -1000,7 +1026,7 @@ pub struct Interpreter<'a> {
     global_vars_keys: FxIndexSet<GlobalVar>,
 
     global_vars: EntityOrientedDenseMap<GlobalVar, AllocId>,
-    call_stack: Vec<CallFrame>,
+    call_stack: Vec<CallFrame<'a>>,
 
     // FIXME(eddyb) maybe merge this and `mem_state` into a `GlobalState`?
     // TODO(eddyb) make this private by having an `eval_entry_launch`.
@@ -1017,6 +1043,7 @@ pub struct Interpreter<'a> {
 impl<'a> Interpreter<'a> {
     pub fn new(
         module: &'a Module,
+        per_func_sched: &'a EntityOrientedDenseMap<Func, spirt::sched::Schedule>,
         debug: DebugOptions,
         layout_config: &'a spirt::mem::LayoutConfig,
     ) -> Self {
@@ -1030,6 +1057,7 @@ impl<'a> Interpreter<'a> {
             layout_cache: spirt::mem::layout::LayoutCache::new(cx.clone(), layout_config),
 
             module,
+            per_func_sched,
             bindings: Default::default(),
 
             debug,
@@ -1222,7 +1250,9 @@ impl<'a> Interpreter<'a> {
             DeclDef::Present(def) => def,
         };
 
-        self.call_stack.push(CallFrame::default());
+        self.call_stack
+            .push(CallFrame { sched: self.per_func_sched.get(f), ..CallFrame::default() });
+
         let ret_vals = self.eval_region(func_def_body.at_body(), args);
         let frame = self.call_stack.pop().unwrap();
         let mem_state = self.mem_state.as_mut().unwrap();
@@ -1247,19 +1277,58 @@ impl<'a> Interpreter<'a> {
         // HACK(eddyb) only needed for the `Loop` exit condition.
         before_exit: impl FnOnce(&mut Self) -> R,
     ) -> (SmallVec<[DynVal; 4]>, R) {
-        let RegionDef { inputs: input_vars, children: _, outputs } = func_at_region.def();
+        let RegionDef { inputs: input_vars, children: _, outputs: output_vals } =
+            func_at_region.def();
 
         assert_eq!(input_vars.len(), inputs.len());
         for (&input_var, input) in input_vars.iter().zip_eq(inputs) {
             self.call_stack.last_mut().unwrap().var_values.insert(input_var, input);
         }
 
-        for func_at_node in func_at_region.at_children() {
-            self.eval_node(func_at_node);
+        if self.debug.drop_vals_on_live_range_end {
+            let sched = self.call_stack.last().unwrap().sched.unwrap();
+            for (i, &node) in sched.regions[func_at_region.position].nodes.iter().enumerate() {
+                let func_at_node = func_at_region.at(node);
+
+                // TODO(eddyb) "steal" the `Value`s that are used for the last time.
+                self.eval_node(func_at_node);
+
+                let var_values = &mut self.call_stack.last_mut().unwrap().var_values;
+                let inputs_use_pos =
+                    spirt::sched::UsePos::NodeInput { node_sched_idx: u32::try_from(i).unwrap() };
+                for &v in &func_at_node.def().inputs {
+                    if let Value::Var(var) = v
+                        && sched.vars[var].last_use_pos == Some(inputs_use_pos)
+                    {
+                        // FIXME(eddyb) should this use a tombstone instead?
+                        var_values.remove(var);
+                    }
+                }
+            }
+        } else {
+            for func_at_node in func_at_region.at_children() {
+                self.eval_node(func_at_node);
+            }
         }
 
-        let outputs = outputs.iter().map(|&v| self.eval_value(v)).collect();
+        // TODO(eddyb) "steal" the `Value`s that are used for the last time.
+        let outputs = output_vals.iter().map(|&v| self.eval_value(v)).collect();
+
+        // FIXME(eddyb) handle the loop repeat conditions for `drop_vals_on_live_range_end`.
         let extra = before_exit(self);
+
+        if self.debug.drop_vals_on_live_range_end {
+            let sched = self.call_stack.last().unwrap().sched.unwrap();
+            let var_values = &mut self.call_stack.last_mut().unwrap().var_values;
+            for &v in output_vals {
+                if let Value::Var(var) = v
+                    && sched.vars[var].last_use_pos == Some(spirt::sched::UsePos::RegionOutput)
+                {
+                    // FIXME(eddyb) should this use a tombstone instead?
+                    var_values.remove(var);
+                }
+            }
+        }
 
         if self.debug.drop_vals_on_region_exit {
             let vars_defined_in_region = input_vars
