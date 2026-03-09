@@ -168,6 +168,7 @@ pub mod passes {
 pub mod mem;
 pub mod qptr;
 pub mod scalar;
+pub mod sched;
 pub mod spv;
 pub mod vector;
 
