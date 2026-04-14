@@ -1,5 +1,6 @@
 //! SPIR-T to SPIR-V lifting.
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
 use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
@@ -7,8 +8,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey, Exportee, Func, FuncDecl, FuncParam,
     FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl,
-    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    ModuleDialect, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionInputDecl, Type,
+    TypeDef, TypeKind, TypeOrConst, Value,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -198,6 +199,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_attr(&mut self, attr: &Attr) {
         match *attr {
             Attr::Diagnostics(_)
+            | Attr::Mem(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
@@ -211,6 +213,12 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
         #[allow(clippy::match_same_arms)]
         match data_inst_def.kind {
+            // FIXME(eddyb) this should be a proper `Result`-based error instead,
+            // and/or `spv::lift` should mutate the module for legalization.
+            DataInstKind::Mem(_) => {
+                unreachable!("`DataInstKind::Mem` should be legalized away before lifting");
+            }
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::QPtr(_) => {
@@ -255,7 +263,7 @@ struct FuncLifting<'a> {
 /// What determines the values for [`Value::RegionInput`]s, for a specific
 /// region (effectively the subset of "region parents" that support inputs).
 ///
-/// Note that this is not used when a [`cfg::ControlInst`] has `target_inputs`,
+/// Note that this is not used when a [`cf::unstructured::ControlInst`] has `target_inputs`,
 /// and the target [`Region`] itself has phis for its `inputs`.
 enum RegionInputsSource {
     FuncParams,
@@ -292,7 +300,7 @@ struct Phi {
     default_value: Option<Value>,
 }
 
-/// Similar to [`cfg::ControlInst`], except:
+/// Similar to [`cf::unstructured::ControlInst`], except:
 /// * `targets` use [`CfgPoint`]s instead of [`Region`]s, to be able to
 ///   reach any of the SPIR-V blocks being created during lifting
 /// * φ ("phi") values can be provided for targets regardless of "which side" of
@@ -303,7 +311,7 @@ struct Phi {
 struct Terminator<'a> {
     attrs: AttrSet,
 
-    kind: Cow<'a, cfg::ControlInstKind>,
+    kind: Cow<'a, cf::unstructured::ControlInstKind>,
 
     // FIXME(eddyb) use `Cow` or something, but ideally the "owned" case always
     // has at most one input, so allocating a whole `Vec` for that seems unwise.
@@ -633,8 +641,13 @@ impl<'a> FuncLifting<'a> {
                         .as_ref()
                         .and_then(|cfg| cfg.control_inst_on_exit_from.get(region));
                     if let Some(terminator) = unstructured_terminator {
-                        let cfg::ControlInst { attrs, kind, inputs, targets, target_inputs } =
-                            terminator;
+                        let cf::unstructured::ControlInst {
+                            attrs,
+                            kind,
+                            inputs,
+                            targets,
+                            target_inputs,
+                        } = terminator;
                         Terminator {
                             attrs: *attrs,
                             kind: Cow::Borrowed(kind),
@@ -657,7 +670,7 @@ impl<'a> FuncLifting<'a> {
                         assert!(region == func_def_body.body);
                         Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cfg::ControlInstKind::Return),
+                            kind: Cow::Owned(cf::unstructured::ControlInstKind::Return),
                             inputs: func_def_body.at_body().def().outputs.clone(),
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
@@ -676,7 +689,9 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::Select { kind, scrutinee, cases } => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cfg::ControlInstKind::SelectBranch(kind.clone())),
+                            kind: Cow::Owned(cf::unstructured::ControlInstKind::SelectBranch(
+                                kind.clone(),
+                            )),
                             inputs: [*scrutinee].into_iter().collect(),
                             targets: cases
                                 .iter()
@@ -689,7 +704,7 @@ impl<'a> FuncLifting<'a> {
                         NodeKind::Loop { initial_inputs: _, body, repeat_condition: _ } => {
                             Terminator {
                                 attrs: AttrSet::default(),
-                                kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                                kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
                                 inputs: [].into_iter().collect(),
                                 targets: [CfgPoint::RegionEntry(*body)].into_iter().collect(),
                                 target_phi_values: FxIndexMap::default(),
@@ -709,7 +724,9 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::ExitInvocation { kind, inputs } => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cfg::ControlInstKind::ExitInvocation(kind.clone())),
+                            kind: Cow::Owned(cf::unstructured::ControlInstKind::ExitInvocation(
+                                kind.clone(),
+                            )),
                             inputs: inputs.clone(),
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
@@ -736,7 +753,7 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::Select { .. } => Terminator {
                             attrs: AttrSet::default(),
-                            kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                            kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
                             inputs: [].into_iter().collect(),
                             targets: [parent_exit].into_iter().collect(),
                             target_phi_values: region_outputs
@@ -768,7 +785,7 @@ impl<'a> FuncLifting<'a> {
                             if is_infinite_loop {
                                 Terminator {
                                     attrs: AttrSet::default(),
-                                    kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                                    kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
                                     inputs: [].into_iter().collect(),
                                     targets: [backedge].into_iter().collect(),
                                     target_phi_values,
@@ -777,9 +794,11 @@ impl<'a> FuncLifting<'a> {
                             } else {
                                 Terminator {
                                     attrs: AttrSet::default(),
-                                    kind: Cow::Owned(cfg::ControlInstKind::SelectBranch(
-                                        SelectionKind::BoolCond,
-                                    )),
+                                    kind: Cow::Owned(
+                                        cf::unstructured::ControlInstKind::SelectBranch(
+                                            SelectionKind::BoolCond,
+                                        ),
+                                    ),
                                     inputs: [repeat_condition].into_iter().collect(),
                                     targets: [backedge, parent_exit].into_iter().collect(),
                                     target_phi_values,
@@ -794,7 +813,7 @@ impl<'a> FuncLifting<'a> {
                 // implied edge from a `Block`'s `Entry` to its `Exit`).
                 (_, Some(succ_cursor)) => Terminator {
                     attrs: AttrSet::default(),
-                    kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                    kind: Cow::Owned(cf::unstructured::ControlInstKind::Branch),
                     inputs: [].into_iter().collect(),
                     targets: [succ_cursor.point].into_iter().collect(),
                     target_phi_values: FxIndexMap::default(),
@@ -863,22 +882,72 @@ impl<'a> FuncLifting<'a> {
         // HACK(eddyb) this takes advantage of `blocks` being an `IndexMap`,
         // to iterate at the same time as mutating other entries.
         for block_idx in (0..blocks.len()).rev() {
-            let BlockLifting { terminator: original_terminator, .. } = &blocks[block_idx];
+            // HACK(eddyb) elide empty cases of an `if`-`else`/`switch`, as
+            // SPIR-V allows their targets to just be the whole merge block
+            // (the same one that `OpSelectionMerge` describes).
+            let block = &blocks[block_idx];
+            if let (
+                cf::unstructured::ControlInstKind::SelectBranch(_),
+                Some(Merge::Selection(merge_point)),
+            ) = (&*block.terminator.kind, block.terminator.merge)
+            {
+                for target_idx in 0..block.terminator.targets.len() {
+                    let block = &blocks[block_idx];
+                    let target = block.terminator.targets[target_idx];
+                    if !block
+                        .terminator
+                        .target_phi_values
+                        .get(&target)
+                        .copied()
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        continue;
+                    }
 
+                    let target_is_trivial_branch = {
+                        let BlockLifting {
+                            phis,
+                            insts,
+                            terminator:
+                                Terminator { attrs, kind, inputs, targets, target_phi_values, merge },
+                        } = &blocks[&target];
+
+                        (phis.is_empty()
+                            && insts.iter().all(|insts| insts.is_empty())
+                            && *attrs == AttrSet::default()
+                            && matches!(**kind, cf::unstructured::ControlInstKind::Branch)
+                            && inputs.is_empty()
+                            && targets.len() == 1
+                            && target_phi_values.is_empty()
+                            && merge.is_none())
+                        .then(|| targets[0])
+                    };
+                    if let Some(target_of_target) = target_is_trivial_branch
+                        && target_of_target == merge_point
+                    {
+                        blocks[block_idx].terminator.targets[target_idx] = target_of_target;
+                        *use_counts.get_mut(&target).unwrap() -= 1;
+                        *use_counts.get_mut(&target_of_target).unwrap() += 1;
+                    }
+                }
+            }
+
+            let block = &blocks[block_idx];
             let is_trivial_branch = {
                 let Terminator { attrs, kind, inputs, targets, target_phi_values, merge } =
-                    original_terminator;
+                    &block.terminator;
 
-                *attrs == AttrSet::default()
-                    && matches!(**kind, cfg::ControlInstKind::Branch)
+                (*attrs == AttrSet::default()
+                    && matches!(**kind, cf::unstructured::ControlInstKind::Branch)
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
-                    && merge.is_none()
+                    && merge.is_none())
+                .then(|| targets[0])
             };
 
-            if is_trivial_branch {
-                let target = original_terminator.targets[0];
+            if let Some(target) = is_trivial_branch {
                 let target_use_count = use_counts.get_mut(&target).unwrap();
 
                 if *target_use_count == 1 {
@@ -896,7 +965,7 @@ impl<'a> FuncLifting<'a> {
                             new_terminator,
                             Terminator {
                                 attrs: Default::default(),
-                                kind: Cow::Owned(cfg::ControlInstKind::Unreachable),
+                                kind: Cow::Owned(cf::unstructured::ControlInstKind::Unreachable),
                                 inputs: Default::default(),
                                 targets: Default::default(),
                                 target_phi_values: Default::default(),
@@ -1225,7 +1294,7 @@ impl LazyInst<'_, '_> {
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
                     // Disallowed while visiting.
-                    DataInstKind::QPtr(_) => unreachable!(),
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
 
                     &DataInstKind::FuncCall(callee) => {
                         (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
@@ -1275,25 +1344,25 @@ impl LazyInst<'_, '_> {
             },
             Self::Terminator { parent_func, terminator } => {
                 let inst = match &*terminator.kind {
-                    cfg::ControlInstKind::Unreachable => wk.OpUnreachable.into(),
-                    cfg::ControlInstKind::Return => {
+                    cf::unstructured::ControlInstKind::Unreachable => wk.OpUnreachable.into(),
+                    cf::unstructured::ControlInstKind::Return => {
                         if terminator.inputs.is_empty() {
                             wk.OpReturn.into()
                         } else {
                             wk.OpReturnValue.into()
                         }
                     }
-                    cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(
+                    cf::unstructured::ControlInstKind::ExitInvocation(
+                        cf::ExitInvocationKind::SpvInst(inst),
+                    )
+                    | cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
                         inst,
                     )) => inst.clone(),
 
-                    cfg::ControlInstKind::Branch => wk.OpBranch.into(),
+                    cf::unstructured::ControlInstKind::Branch => wk.OpBranch.into(),
 
-                    cfg::ControlInstKind::SelectBranch(SelectionKind::BoolCond) => {
+                    cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond) => {
                         wk.OpBranchConditional.into()
-                    }
-                    cfg::ControlInstKind::SelectBranch(SelectionKind::SpvInst(inst)) => {
-                        inst.clone()
                     }
                 };
                 spv::InstWithIds {
@@ -1504,6 +1573,7 @@ impl Module {
                 match attr {
                     Attr::DbgSrcLoc(_)
                     | Attr::Diagnostics(_)
+                    | Attr::Mem(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
                     Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
