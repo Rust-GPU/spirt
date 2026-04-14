@@ -198,6 +198,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_attr(&mut self, attr: &Attr) {
         match *attr {
             Attr::Diagnostics(_)
+            | Attr::Mem(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
@@ -211,6 +212,12 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
         #[allow(clippy::match_same_arms)]
         match data_inst_def.kind {
+            // FIXME(eddyb) this should be a proper `Result`-based error instead,
+            // and/or `spv::lift` should mutate the module for legalization.
+            DataInstKind::Mem(_) => {
+                unreachable!("`DataInstKind::Mem` should be legalized away before lifting");
+            }
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::QPtr(_) => {
@@ -863,22 +870,70 @@ impl<'a> FuncLifting<'a> {
         // HACK(eddyb) this takes advantage of `blocks` being an `IndexMap`,
         // to iterate at the same time as mutating other entries.
         for block_idx in (0..blocks.len()).rev() {
-            let BlockLifting { terminator: original_terminator, .. } = &blocks[block_idx];
+            // HACK(eddyb) elide empty cases of an `if`-`else`/`switch`, as
+            // SPIR-V allows their targets to just be the whole merge block
+            // (the same one that `OpSelectionMerge` describes).
+            let block = &blocks[block_idx];
+            if let (cfg::ControlInstKind::SelectBranch(_), Some(Merge::Selection(merge_point))) =
+                (&*block.terminator.kind, block.terminator.merge)
+            {
+                for target_idx in 0..block.terminator.targets.len() {
+                    let block = &blocks[block_idx];
+                    let target = block.terminator.targets[target_idx];
+                    if !block
+                        .terminator
+                        .target_phi_values
+                        .get(&target)
+                        .copied()
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        continue;
+                    }
 
+                    let target_is_trivial_branch = {
+                        let BlockLifting {
+                            phis,
+                            insts,
+                            terminator:
+                                Terminator { attrs, kind, inputs, targets, target_phi_values, merge },
+                        } = &blocks[&target];
+
+                        (phis.is_empty()
+                            && insts.iter().all(|insts| insts.is_empty())
+                            && *attrs == AttrSet::default()
+                            && matches!(**kind, cfg::ControlInstKind::Branch)
+                            && inputs.is_empty()
+                            && targets.len() == 1
+                            && target_phi_values.is_empty()
+                            && merge.is_none())
+                        .then(|| targets[0])
+                    };
+                    if let Some(target_of_target) = target_is_trivial_branch
+                        && target_of_target == merge_point
+                    {
+                        blocks[block_idx].terminator.targets[target_idx] = target_of_target;
+                        *use_counts.get_mut(&target).unwrap() -= 1;
+                        *use_counts.get_mut(&target_of_target).unwrap() += 1;
+                    }
+                }
+            }
+
+            let block = &blocks[block_idx];
             let is_trivial_branch = {
                 let Terminator { attrs, kind, inputs, targets, target_phi_values, merge } =
-                    original_terminator;
+                    &block.terminator;
 
-                *attrs == AttrSet::default()
+                (*attrs == AttrSet::default()
                     && matches!(**kind, cfg::ControlInstKind::Branch)
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
-                    && merge.is_none()
+                    && merge.is_none())
+                .then(|| targets[0])
             };
 
-            if is_trivial_branch {
-                let target = original_terminator.targets[0];
+            if let Some(target) = is_trivial_branch {
                 let target_use_count = use_counts.get_mut(&target).unwrap();
 
                 if *target_use_count == 1 {
@@ -1225,7 +1280,7 @@ impl LazyInst<'_, '_> {
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
                     // Disallowed while visiting.
-                    DataInstKind::QPtr(_) => unreachable!(),
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
 
                     &DataInstKind::FuncCall(callee) => {
                         (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
@@ -1504,6 +1559,7 @@ impl Module {
                 match attr {
                     Attr::DbgSrcLoc(_)
                     | Attr::Diagnostics(_)
+                    | Attr::Mem(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
                     Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {

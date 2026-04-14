@@ -4,7 +4,7 @@ use crate::qptr;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{AttrSet, Const, Context, Func, FxIndexSet, GlobalVar, Module, Type};
 
-pub fn lower_from_spv_ptrs(module: &mut Module, layout_config: &qptr::LayoutConfig) {
+pub fn lower_from_spv_ptrs(module: &mut Module, layout_config: &crate::mem::LayoutConfig) {
     let cx = &module.cx();
 
     let (seen_global_vars, seen_funcs) = {
@@ -34,11 +34,13 @@ pub fn lower_from_spv_ptrs(module: &mut Module, layout_config: &qptr::LayoutConf
     }
 }
 
-pub fn analyze_uses(module: &mut Module, layout_config: &qptr::LayoutConfig) {
-    qptr::analyze::InferUsage::new(module.cx(), layout_config).infer_usage_in_module(module);
+// FIXME(eddyb) this doesn't really belong in `qptr`.
+pub fn analyze_mem_accesses(module: &mut Module, layout_config: &crate::mem::LayoutConfig) {
+    crate::mem::analyze::GatherAccesses::new(module.cx(), layout_config)
+        .gather_accesses_in_module(module);
 }
 
-pub fn lift_to_spv_ptrs(module: &mut Module, layout_config: &qptr::LayoutConfig) {
+pub fn lift_to_spv_ptrs(module: &mut Module, layout_config: &crate::mem::LayoutConfig) {
     let cx = &module.cx();
 
     let (seen_global_vars, seen_funcs) = {
