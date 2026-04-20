@@ -56,15 +56,15 @@ pub fn test_two_state_vars(
     }
 }
 
-// Nested loops: inner 0..4, outer 0..2
+// u64 for-range: for i in 0u64..4
 #[spirv(compute(threads(1)))]
-pub fn test_nested(
+pub fn test_u64_for_range(
     #[spirv(global_invocation_id)] _id: glam::UVec3,
     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] data: &mut [u32; 64],
 ) {
-    for i in 0u32..2 {
-        for j in 0u32..4 {
-            data[(i * 4 + j) as usize] = i + j;
-        }
+    for i in 0u64..4 {
+        data[i as usize] = i as u32;
     }
 }
+
+

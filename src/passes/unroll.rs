@@ -286,10 +286,9 @@ fn try_trip_count_from_cmp(
     //   `OpCompositeExtract(input, counter_field) < OpCompositeExtract(input, bound_field)`
     // where the initial value of `input` is `OpConstantComposite(init, bound)`.
     if is_lt || is_ne {
-        if let (Some((lhs_base, lhs_field)), Some((rhs_base, rhs_field))) = (
-            follow_composite_extract(func, *lhs),
-            follow_composite_extract(func, *rhs),
-        ) {
+        if let (Some((lhs_base, lhs_field)), Some((rhs_base, rhs_field))) =
+            (follow_composite_extract(func, *lhs), follow_composite_extract(func, *rhs))
+        {
             if let (
                 Value::RegionInput { region: lr, input_idx: li },
                 Value::RegionInput { region: rr, input_idx: ri },
@@ -299,11 +298,7 @@ fn try_trip_count_from_cmp(
                     let init_composite = *initial_inputs.get(li as usize)?;
                     let init_val = extract_composite_field_const(cx, init_composite, lhs_field)?;
                     let bound = extract_composite_field_const(cx, init_composite, rhs_field)?;
-                    return if is_ne {
-                        bound.checked_sub(init_val)
-                    } else {
-                        bound.checked_sub(init_val).map(|d| d + 1)
-                    };
+                    return u64_trip_count(init_val, bound, is_ne);
                 }
             }
         }
@@ -315,34 +310,22 @@ fn try_trip_count_from_cmp(
             if let Value::RegionInput { region, input_idx } = base {
                 if region == body {
                     let init_composite = *initial_inputs.get(input_idx as usize)?;
-                    let init_val =
-                        extract_composite_field_const(cx, init_composite, field)?;
-                    let upper = extract_u32_const(cx, *rhs)?;
-                    return if is_ne {
-                        upper.checked_sub(init_val)
-                    } else {
-                        upper.checked_sub(init_val).map(|d| d + 1)
-                    };
+                    let init_val = extract_composite_field_const(cx, init_composite, field)?;
+                    let upper = extract_u64_const(cx, *rhs)?;
+                    return u64_trip_count(init_val, upper, is_ne);
                 }
             }
         }
     }
 
-    let upper = extract_u32_const(cx, *rhs)?;
+    let upper = extract_u64_const(cx, *rhs)?;
 
     // `loop_input < N`  →  N+1 iterations (guard included).
     if let Value::RegionInput { region, input_idx } = lhs {
         if *region == body {
             let init = initial_inputs.get(*input_idx as usize)?;
-            let init_val = extract_u32_const(cx, *init)?;
-            // For INotEqual starting at 0 and incrementing by 1 until ≠ N:
-            // body runs N - init_val times (no guard).
-            // For LessThan: body runs until old_val == N, so N - init_val + 1 (guard).
-            return if is_ne {
-                upper.checked_sub(init_val)
-            } else {
-                upper.checked_sub(init_val).map(|d| d + 1)
-            };
+            let init_val = extract_u64_const(cx, *init)?;
+            return u64_trip_count(init_val, upper, is_ne);
         }
     }
 
@@ -357,7 +340,6 @@ fn try_trip_count_from_cmp(
                 return None;
             }
             let [a, b] = iadd.inputs.as_slice() else { return None };
-            // gind which input is the loop var and which is the step.
             let (loop_var, step) = if is_loop_region_input(body, *a) {
                 (*a, *b)
             } else if is_loop_region_input(body, *b) {
@@ -365,18 +347,26 @@ fn try_trip_count_from_cmp(
             } else {
                 return None;
             };
-            if extract_u32_const(cx, step) != Some(1) {
+            if extract_u64_const(cx, step) != Some(1) {
                 return None;
             }
             let Value::RegionInput { input_idx, .. } = loop_var else {
                 return None;
             };
-            let init_val = extract_u32_const(cx, *initial_inputs.get(input_idx as usize)?)?;
-            return upper.checked_sub(init_val); // exactly N - init iterations
+            let init_val = extract_u64_const(cx, *initial_inputs.get(input_idx as usize)?)?;
+            return upper.checked_sub(init_val).and_then(|d| u32::try_from(d).ok());
         }
     }
 
     None
+}
+
+/// compute trip count from 64-bit init/bound, returning `None` if the result
+/// overflows `u32` (these loops will probably exceed `max_trip_count` anyway).
+fn u64_trip_count(init: u64, bound: u64, is_ne: bool) -> Option<u32> {
+    let diff = bound.checked_sub(init)?;
+    let tc = if is_ne { diff } else { diff.checked_add(1)? };
+    u32::try_from(tc).ok()
 }
 
 /// scan top-level `Block` DataInsts of `body` for a usable comparison.
@@ -418,7 +408,7 @@ fn is_const_false(cx: &Context, v: Value) -> bool {
     spv_inst.opcode.name() == "OpConstantFalse"
 }
 
-fn extract_u32_const(cx: &Context, v: Value) -> Option<u32> {
+fn extract_u64_const(cx: &Context, v: Value) -> Option<u64> {
     let Value::Const(ct) = v else { return None };
     let ConstKind::SpvInst { ref spv_inst_and_const_inputs } = cx[ct].kind else {
         return None;
@@ -428,7 +418,12 @@ fn extract_u32_const(cx: &Context, v: Value) -> Option<u32> {
         return None;
     }
     match spv_inst.imms.as_slice() {
-        [spv::Imm::Short(_, v)] => Some(*v),
+        // 32-bit constant — widen so callers can use one function for both widths.
+        [spv::Imm::Short(_, lo)] => Some(*lo as u64),
+        // 64-bit constant: lo word first, hi word second.
+        [spv::Imm::LongStart(_, lo), spv::Imm::LongCont(_, hi)] => {
+            Some((*lo as u64) | ((*hi as u64) << 32))
+        }
         _ => None,
     }
 }
@@ -449,7 +444,7 @@ fn follow_composite_extract(func: &FuncDefBody, v: Value) -> Option<(Value, u32)
 }
 
 /// extract `field` from an `OpConstantComposite` constant.
-fn extract_composite_field_const(cx: &Context, v: Value, field: u32) -> Option<u32> {
+fn extract_composite_field_const(cx: &Context, v: Value, field: u32) -> Option<u64> {
     let Value::Const(ct) = v else { return None };
     let ConstKind::SpvInst { ref spv_inst_and_const_inputs } = cx[ct].kind else {
         return None;
@@ -459,7 +454,7 @@ fn extract_composite_field_const(cx: &Context, v: Value, field: u32) -> Option<u
         return None;
     }
     let elem = const_inputs.get(field as usize)?;
-    extract_u32_const(cx, Value::Const(*elem))
+    extract_u64_const(cx, Value::Const(*elem))
 }
 
 /// replace `loop_node` in `parent_region.children` with `trip_count` inlined
