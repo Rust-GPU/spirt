@@ -168,6 +168,7 @@ pub mod passes {
     pub mod legalize;
     pub mod link;
     pub mod qptr;
+    pub mod unroll;
 }
 pub mod qptr;
 pub mod spv;
