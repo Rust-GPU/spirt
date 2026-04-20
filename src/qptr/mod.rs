@@ -3,22 +3,17 @@
 // FIXME(eddyb) consider `#[cfg(doc)] use crate::TypeKind::QPtr;` for doc comments.
 // FIXME(eddyb) PR description of https://github.com/EmbarkStudios/spirt/pull/24
 // has more useful docs that could be copied here.
+//
+// FIXME(eddyb) fully update post-`mem`-split.
 
 use crate::{AddrSpace, OrdAssertEq, Type};
-use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::ops::Range;
-use std::rc::Rc;
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
-pub mod analyze;
-mod layout;
 pub mod lift;
 pub mod lower;
-pub mod shapes;
-
-pub use layout::LayoutConfig;
 
 /// `QPtr`-specific attributes ([`Attr::QPtr`]).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,97 +47,11 @@ pub enum QPtrAttr {
         addr_space: OrdAssertEq<AddrSpace>,
         pointee: OrdAssertEq<Type>,
     },
-
-    /// When applied to a `QPtr`-typed `GlobalVar`, `DataInst`,
-    /// `RegionInputDecl` or `NodeOutputDecl`, this tracks all the
-    /// ways in which the pointer may be used (see `QPtrUsage`).
-    Usage(OrdAssertEq<QPtrUsage>),
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum QPtrUsage {
-    /// Used to access one or more handles (i.e. optionally indexed by
-    /// [`QPtrOp::HandleArrayIndex`]), which can be:
-    /// - `Handle::Opaque(handle_type)`: all uses involve [`QPtrOp::Load`] or
-    ///   [`QPtrAttr::ToSpvPtrInput`], with the common type `handle_type`
-    /// - `Handle::Buffer(data_usage)`: carries with it `data_usage`, i.e. the
-    ///   usage of the memory that can be accessed through [`QPtrOp::BufferData`]
-    Handles(shapes::Handle<QPtrMemUsage>),
-
-    // FIXME(eddyb) unify terminology around "concrete"/"memory"/"untyped (data)".
-    Memory(QPtrMemUsage),
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct QPtrMemUsage {
-    /// If present, this is a worst-case upper bound on memory accesses that may
-    /// be performed through this pointer.
-    //
-    // FIXME(eddyb) use proper newtypes for byte amounts.
-    //
-    // FIXME(eddyb) suboptimal naming choice, but other options are too verbose,
-    // including maybe using `RangeTo<_>` to explicitly indicate "exclusive".
-    //
-    // FIXME(eddyb) consider renaming such information to "extent", but that might
-    // be ambiguous with an offset range (as opposed to min/max of *possible*
-    // `offset_range.end`, i.e. "size").
-    pub max_size: Option<u32>,
-
-    pub kind: QPtrMemUsageKind,
-}
-
-impl QPtrMemUsage {
-    pub const UNUSED: Self = Self { max_size: Some(0), kind: QPtrMemUsageKind::Unused };
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum QPtrMemUsageKind {
-    /// Not actually used, which could be caused by pointer offsetting operations
-    /// with unused results, or as an intermediary state during analyses.
-    Unused,
-
-    // FIXME(eddyb) replace the two leaves with e.g. `Leaf(Type, QPtrMemLeafUsage)`.
-    //
-    //
-    //
-    /// Used as a typed pointer (e.g. via unknown SPIR-V instructions), requiring
-    /// a specific choice of pointee type which cannot be modified, and has to be
-    /// reused as-is when lifting `QPtr`s back to typed pointers.
-    ///
-    /// Other overlapping uses can be merged into this one as long as they can
-    /// be fully expressed using the (transitive) components of this type.
-    StrictlyTyped(Type),
-
-    /// Used directly to access memory (e.g. [`QPtrOp::Load`], [`QPtrOp::Store`]),
-    /// which can be decomposed as necessary (down to individual scalar leaves),
-    /// to allow maximal merging opportunities.
-    //
-    // FIXME(eddyb) track whether `Load`s and/or `Store`s are used, so that we
-    // can infer `NonWritable`/`NonReadable` annotations as well.
-    DirectAccess(Type),
-
-    /// Used as a common base for (constant) offsetting, which requires it to have
-    /// its own (aggregate) type, when lifting `QPtr`s back to typed pointers.
-    OffsetBase(Rc<BTreeMap<u32, QPtrMemUsage>>),
-
-    /// Used as a common base for (dynamic) offsetting, which requires it to have
-    /// its own (array) type, when lifting `QPtr`s back to typed pointers, with
-    /// one single element type being repeated across the entire size.
-    DynOffsetBase {
-        // FIXME(eddyb) this feels inefficient.
-        element: Rc<QPtrMemUsage>,
-        stride: NonZeroU32,
-    },
-    // FIXME(eddyb) consider adding an `Union` case for driving legalization.
 }
 
 /// `QPtr`-specific operations ([`DataInstKind::QPtr`]).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum QPtrOp {
-    // HACK(eddyb) `OpVariable` replacement, which itself should not be kept as
-    // a `SpvInst` - once fn-local variables are lowered, this should go there.
-    FuncLocalVar(shapes::MemLayout),
-
     /// Adjust a **handle array** `QPtr` (`inputs[0]`), by selecting the handle
     /// at the index (`inputs[1]`) from the handle array (i.e. the resulting
     /// `QPtr` is limited to that one handle and can't be further "moved around").
@@ -169,10 +78,7 @@ pub enum QPtrOp {
     // the redundant `(x * a + b - b) / a` to just `x`?
     //
     // FIXME(eddyb) actually lower `OpArrayLength` to this!
-    BufferDynLen {
-        fixed_base_size: u32,
-        dyn_unit_stride: NonZeroU32,
-    },
+    BufferDynLen { fixed_base_size: u32, dyn_unit_stride: NonZeroU32 },
 
     /// Adjust a **memory** `QPtr` (`inputs[0]`), by adding a (signed) immediate
     /// amount of bytes to its "address" (whether physical or conceptual).
@@ -192,17 +98,4 @@ pub enum QPtrOp {
         // FIXME(eddyb) should this be an attribute/refinement?
         index_bounds: Option<Range<i32>>,
     },
-
-    /// Read a single value from a `QPtr` (`inputs[0]`).
-    //
-    // FIXME(eddyb) limit this to memory, and scalars, maybe vectors at most.
-    Load,
-
-    /// Write a single value (`inputs[1]`) to a `QPtr` (`inputs[0]`).
-    //
-    // FIXME(eddyb) limit this to memory, and scalars, maybe vectors at most.
-    Store,
-    //
-    // FIXME(eddyb) implement more ops! at the very least copying!
-    // (and lowering could ignore pointercasts, I guess?)
 }
