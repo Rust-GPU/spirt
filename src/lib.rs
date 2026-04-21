@@ -71,7 +71,7 @@
     clippy::dbg_macro,
     clippy::debug_assert_with_mut_call,
     clippy::doc_markdown,
-    clippy::empty_enum,
+    clippy::empty_enums,
     clippy::enum_glob_use,
     clippy::exit,
     clippy::expl_impl_clone_on_copy,
@@ -168,6 +168,7 @@ pub mod passes {
     pub mod legalize;
     pub mod link;
     pub mod qptr;
+    pub mod unroll;
 }
 pub mod qptr;
 pub mod spv;
