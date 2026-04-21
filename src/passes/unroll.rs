@@ -135,8 +135,7 @@ fn collect_loop_candidates(func: &FuncDefBody) -> Vec<(Region, Node)> {
 
 fn visit_region_for_loops(func: &FuncDefBody, region: Region, out: &mut Vec<(Region, Node)>) {
     let mut iter = func.regions[region].children.iter();
-    loop {
-        let Some((node, rest)) = iter.split_first(&func.nodes) else { break };
+    while let Some((node, rest)) = iter.split_first(&func.nodes) {
         iter = rest;
         match &func.nodes[node].kind {
             NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => {}
@@ -161,14 +160,12 @@ fn count_body_insts(func: &FuncDefBody, region: Region) -> usize {
 
 fn count_region_insts(func: &FuncDefBody, region: Region, n: &mut usize) {
     let mut iter = func.regions[region].children.iter();
-    loop {
-        let Some((node, rest)) = iter.split_first(&func.nodes) else { break };
+    while let Some((node, rest)) = iter.split_first(&func.nodes) {
         iter = rest;
         match &func.nodes[node].kind {
             NodeKind::Block { insts } => {
                 let mut it = insts.iter();
-                loop {
-                    let Some((_, r)) = it.split_first(&func.data_insts) else { break };
+                while let Some((_, r)) = it.split_first(&func.data_insts) {
                     it = r;
                     *n += 1;
                 }
@@ -216,7 +213,7 @@ fn detect_trip_count(cx: &Context, func: &FuncDefBody, loop_node: Node) -> Optio
 /// try to derive the trip count by inspecting `repeat_condition`.
 ///
 /// Handles:
-/// * `DataInstOutput(cmp)` – direct comparison DataInst.
+/// * `DataInstOutput(cmp)` – direct comparison `DataInst`.
 /// * `NodeOutput{select, idx}` – the condition comes out of a Select;
 ///   we inspect the branches to find a constant-false arm and pull the real
 ///   condition from the other arm.
@@ -285,77 +282,71 @@ fn try_trip_count_from_cmp(
     //  rust-gpu packs range state into a struct; the comparison is
     //   `OpCompositeExtract(input, counter_field) < OpCompositeExtract(input, bound_field)`
     // where the initial value of `input` is `OpConstantComposite(init, bound)`.
-    if is_lt || is_ne {
-        if let (Some((lhs_base, lhs_field)), Some((rhs_base, rhs_field))) =
+    if (is_lt || is_ne)
+        && let (Some((lhs_base, lhs_field)), Some((rhs_base, rhs_field))) =
             (follow_composite_extract(func, *lhs), follow_composite_extract(func, *rhs))
-        {
-            if let (
-                Value::RegionInput { region: lr, input_idx: li },
-                Value::RegionInput { region: rr, input_idx: ri },
-            ) = (lhs_base, rhs_base)
-            {
-                if lr == body && rr == body && li == ri {
-                    let init_composite = *initial_inputs.get(li as usize)?;
-                    let init_val = extract_composite_field_const(cx, init_composite, lhs_field)?;
-                    let bound = extract_composite_field_const(cx, init_composite, rhs_field)?;
-                    return u64_trip_count(init_val, bound, is_ne);
-                }
-            }
-        }
+        && let (
+            Value::RegionInput { region: lr, input_idx: li },
+            Value::RegionInput { region: rr, input_idx: ri },
+        ) = (lhs_base, rhs_base)
+        && lr == body
+        && rr == body
+        && li == ri
+    {
+        let init_composite = *initial_inputs.get(li as usize)?;
+        let init_val = extract_composite_field_const(cx, init_composite, lhs_field)?;
+        let bound = extract_composite_field_const(cx, init_composite, rhs_field)?;
+        return u64_trip_count(init_val, bound, is_ne);
     }
 
     // handle `OpCompositeExtract(input, field) OP const` for scalar structs.
-    if is_lt || is_ne {
-        if let Some((base, field)) = follow_composite_extract(func, *lhs) {
-            if let Value::RegionInput { region, input_idx } = base {
-                if region == body {
-                    let init_composite = *initial_inputs.get(input_idx as usize)?;
-                    let init_val = extract_composite_field_const(cx, init_composite, field)?;
-                    let upper = extract_u64_const(cx, *rhs)?;
-                    return u64_trip_count(init_val, upper, is_ne);
-                }
-            }
-        }
+    if (is_lt || is_ne)
+        && let Some((base, field)) = follow_composite_extract(func, *lhs)
+        && let Value::RegionInput { region, input_idx } = base
+        && region == body
+    {
+        let init_composite = *initial_inputs.get(input_idx as usize)?;
+        let init_val = extract_composite_field_const(cx, init_composite, field)?;
+        let upper = extract_u64_const(cx, *rhs)?;
+        return u64_trip_count(init_val, upper, is_ne);
     }
 
     let upper = extract_u64_const(cx, *rhs)?;
 
     // `loop_input < N`  →  N+1 iterations (guard included).
-    if let Value::RegionInput { region, input_idx } = lhs {
-        if *region == body {
-            let init = initial_inputs.get(*input_idx as usize)?;
-            let init_val = extract_u64_const(cx, *init)?;
-            return u64_trip_count(init_val, upper, is_ne);
-        }
+    if let Value::RegionInput { region, input_idx } = lhs
+        && *region == body
+    {
+        let init = initial_inputs.get(*input_idx as usize)?;
+        let init_val = extract_u64_const(cx, *init)?;
+        return u64_trip_count(init_val, upper, is_ne);
     }
 
     //  `IAdd(loop_input, 1) < N`  →  N iterations (no guard needed).
-    if is_lt {
-        if let Value::DataInstOutput(iadd_inst) = lhs {
-            let iadd = &*func.data_insts[*iadd_inst];
-            let DataInstKind::SpvInst(ref iadd_op) = iadd.kind else {
-                return None;
-            };
-            if iadd_op.opcode.name() != "OpIAdd" {
-                return None;
-            }
-            let [a, b] = iadd.inputs.as_slice() else { return None };
-            let (loop_var, step) = if is_loop_region_input(body, *a) {
-                (*a, *b)
-            } else if is_loop_region_input(body, *b) {
-                (*b, *a)
-            } else {
-                return None;
-            };
-            if extract_u64_const(cx, step) != Some(1) {
-                return None;
-            }
-            let Value::RegionInput { input_idx, .. } = loop_var else {
-                return None;
-            };
-            let init_val = extract_u64_const(cx, *initial_inputs.get(input_idx as usize)?)?;
-            return upper.checked_sub(init_val).and_then(|d| u32::try_from(d).ok());
+    if is_lt && let Value::DataInstOutput(iadd_inst) = lhs {
+        let iadd = &*func.data_insts[*iadd_inst];
+        let DataInstKind::SpvInst(ref iadd_op) = iadd.kind else {
+            return None;
+        };
+        if iadd_op.opcode.name() != "OpIAdd" {
+            return None;
         }
+        let [a, b] = iadd.inputs.as_slice() else { return None };
+        let (loop_var, step) = if is_loop_region_input(body, *a) {
+            (*a, *b)
+        } else if is_loop_region_input(body, *b) {
+            (*b, *a)
+        } else {
+            return None;
+        };
+        if extract_u64_const(cx, step) != Some(1) {
+            return None;
+        }
+        let Value::RegionInput { input_idx, .. } = loop_var else {
+            return None;
+        };
+        let init_val = extract_u64_const(cx, *initial_inputs.get(input_idx as usize)?)?;
+        return upper.checked_sub(init_val).and_then(|d| u32::try_from(d).ok());
     }
 
     None
@@ -369,7 +360,7 @@ fn u64_trip_count(init: u64, bound: u64, is_ne: bool) -> Option<u32> {
     u32::try_from(tc).ok()
 }
 
-/// scan top-level `Block` DataInsts of `body` for a usable comparison.
+/// scan top-level `Block` `DataInsts` of `body` for a usable comparison.
 fn trip_count_from_body_scan(
     cx: &Context,
     func: &FuncDefBody,
@@ -377,13 +368,11 @@ fn trip_count_from_body_scan(
     initial_inputs: &[Value],
 ) -> Option<u32> {
     let mut iter = func.regions[body].children.iter();
-    loop {
-        let Some((node, rest)) = iter.split_first(&func.nodes) else { break };
+    while let Some((node, rest)) = iter.split_first(&func.nodes) {
         iter = rest;
         let NodeKind::Block { insts } = func.nodes[node].kind else { continue };
         let mut it = insts.iter();
-        loop {
-            let Some((inst, ir)) = it.split_first(&func.data_insts) else { break };
+        while let Some((inst, ir)) = it.split_first(&func.data_insts) {
             it = ir;
             if let Some(tc) =
                 try_trip_count_from_cmp(cx, func, &func.data_insts[inst], body, initial_inputs)
@@ -593,8 +582,8 @@ fn clone_data_inst_list(
 ) -> EntityList<DataInst> {
     let mut new_list = EntityList::empty();
     let mut iter = insts.iter();
-    loop {
-        let Some((inst, rest)) = iter.split_first(&func.data_insts) else { break };
+
+    while let Some((inst, rest)) = iter.split_first(&func.data_insts) {
         iter = rest;
         let old: DataInstDef = (*func.data_insts[inst]).clone();
         let new_inputs = old.inputs.iter().map(|&v| map_value(v, value_map)).collect();
@@ -617,8 +606,7 @@ fn clone_data_inst_list(
 fn collect_children(func: &FuncDefBody, region: Region) -> Vec<Node> {
     let mut v = Vec::new();
     let mut iter = func.regions[region].children.iter();
-    loop {
-        let Some((node, rest)) = iter.split_first(&func.nodes) else { break };
+    while let Some((node, rest)) = iter.split_first(&func.nodes) {
         iter = rest;
         v.push(node);
     }
