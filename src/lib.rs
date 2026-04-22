@@ -593,6 +593,12 @@ pub struct ConstDef {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ConstKind {
+    /// Undeterminate value (i.e. SPIR-V `OpUndef`, LLVM `undef`).
+    //
+    // FIXME(eddyb) could it be possible to adopt LLVM's newer `poison`+`freeze`
+    // model, without being forced to never lift back to `OpUndef`?
+    Undef,
+
     // FIXME(eddyb) maybe merge these? however, their connection is somewhat
     // tenuous (being one of the LLVM-isms SPIR-V inherited, among other things),
     // there's still the need to rename "global variable" post-`Var`-refactor,
