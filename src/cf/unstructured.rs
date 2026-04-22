@@ -30,7 +30,7 @@ pub struct ControlInst {
     pub targets: SmallVec<[Region; 4]>,
 
     /// `target_inputs[region][input_idx]` is the [`Value`] that
-    /// `Value::RegionInput { region, input_idx }` will get on entry,
+    /// `VarKind::RegionInput { region, input_idx }` will get on entry,
     /// where `region` must be appear at least once in `targets` - this is a
     /// separate map instead of being part of `targets` because it reflects the
     /// limitations of φ ("phi") nodes, which (unlike "basic block arguments")
