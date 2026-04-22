@@ -5,11 +5,11 @@ use crate::func_at::FuncAt;
 use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstKind,
-    DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
+    DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
+    RegionInputDecl, Type, TypeDef, TypeKind, TypeOrConst, Value, spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -64,9 +64,6 @@ pub trait Visitor<'a>: Sized {
     }
     fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
         func_at_node.inner_visit_with(self);
-    }
-    fn visit_data_inst_def(&mut self, data_inst_def: &'a DataInstDef) {
-        data_inst_def.inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -128,7 +125,6 @@ impl_visit! {
         visit_const_def(ConstDef),
         visit_global_var_decl(GlobalVarDecl),
         visit_func_decl(FuncDecl),
-        visit_data_inst_def(DataInstDef),
         visit_value_use(Value),
     }
     forward_to_inner_visit {
@@ -475,37 +471,38 @@ impl<'a> FuncAt<'a, EntityListIter<Node>> {
 // requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
 impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let NodeDef { kind, outputs } = self.def();
+        let NodeDef { attrs, kind, inputs, child_regions, outputs } = self.def();
 
+        visitor.visit_attr_set_use(*attrs);
         match kind {
-            NodeKind::Block { insts } => {
-                for func_at_inst in self.at(*insts) {
-                    visitor.visit_data_inst_def(func_at_inst.def());
-                }
-            }
-            NodeKind::Select {
-                kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                scrutinee,
-                cases,
-            } => {
-                visitor.visit_value_use(scrutinee);
-                for &case in cases {
-                    visitor.visit_region_def(self.at(case));
-                }
-            }
-            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
-                for v in initial_inputs {
-                    visitor.visit_value_use(v);
-                }
-                visitor.visit_region_def(self.at(*body));
-                visitor.visit_value_use(repeat_condition);
-            }
-            NodeKind::ExitInvocation { kind: cf::ExitInvocationKind::SpvInst(_), inputs } => {
-                for v in inputs {
-                    visitor.visit_value_use(v);
-                }
-            }
+            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
+
+            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            | NodeKind::Loop { repeat_condition: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
+            | DataInstKind::QPtr(
+                QPtrOp::HandleArrayIndex
+                | QPtrOp::BufferData
+                | QPtrOp::BufferDynLen { .. }
+                | QPtrOp::Offset(_)
+                | QPtrOp::DynOffset { .. },
+            )
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => {}
         }
+        for v in inputs {
+            visitor.visit_value_use(v);
+        }
+        for &region in child_regions {
+            visitor.visit_region_def(self.at(region));
+        }
+
+        // HACK(eddyb) semantically, `repeat_condition` is a body region output.
+        if let NodeKind::Loop { repeat_condition } = kind {
+            visitor.visit_value_use(repeat_condition);
+        }
+
         for output in outputs {
             output.inner_visit_with(visitor);
         }
@@ -518,40 +515,6 @@ impl InnerVisit for NodeOutputDecl {
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
-    }
-}
-
-impl InnerVisit for DataInstDef {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, output_type } = self;
-
-        visitor.visit_attr_set_use(*attrs);
-        kind.inner_visit_with(visitor);
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        if let Some(ty) = *output_type {
-            visitor.visit_type_use(ty);
-        }
-    }
-}
-
-impl InnerVisit for DataInstKind {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        match self {
-            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
-            DataInstKind::Mem(op) => match *op {
-                MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store => {}
-            },
-            DataInstKind::QPtr(op) => match *op {
-                QPtrOp::HandleArrayIndex
-                | QPtrOp::BufferData
-                | QPtrOp::BufferDynLen { .. }
-                | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. } => {}
-            },
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
     }
 }
 
@@ -587,8 +550,7 @@ impl InnerVisit for Value {
         match *self {
             Self::Const(ct) => visitor.visit_const_use(ct),
             Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput(_) => {}
+            | Self::NodeOutput { node: _, output_idx: _ } => {}
         }
     }
 }

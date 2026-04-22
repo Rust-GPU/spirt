@@ -702,7 +702,6 @@ pub struct FuncParam {
 pub struct FuncDefBody {
     pub regions: EntityDefs<Region>,
     pub nodes: EntityDefs<Node>,
-    pub data_insts: EntityDefs<DataInst>,
 
     /// The [`Region`] representing the whole body of the function.
     ///
@@ -853,13 +852,22 @@ pub use context::Node;
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
 pub struct NodeDef {
+    pub attrs: AttrSet,
+
     pub kind: NodeKind,
+
+    // FIXME(eddyb) change the inline size of this to fit most nodes.
+    pub inputs: SmallVec<[Value; 2]>,
+
+    // HACK(eddyb) mostly separate to allow the above `kind`-before-`inputs` order.
+    pub child_regions: SmallVec<[Region; 2]>,
 
     /// Outputs from this [`Node`]:
     /// * accessed using [`Value::NodeOutput`]
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
+    // TODO(eddyb) include former `DataInst`s in above docs.
     pub outputs: SmallVec<[NodeOutputDecl; 2]>,
 }
 
@@ -870,30 +878,21 @@ pub struct NodeOutputDecl {
     pub ty: Type,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum NodeKind {
-    /// Linear chain of [`DataInst`]s, executing in sequence.
-    ///
-    /// This is only an optimization over keeping [`DataInst`]s in [`Region`]
-    /// linear chains directly, or even merging [`DataInst`] with [`Node`].
-    Block {
-        // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
-        // linked directly into the `Region` `children` list?
-        insts: EntityList<DataInst>,
-    },
-
-    /// Choose one [`Region`] out of `cases` to execute, based on a single
-    /// value input (`scrutinee`) interpreted according to [`SelectionKind`].
+    /// Choose one [`Region`] out of `child_regions` to execute, based on a single
+    /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: cf::SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
+    Select(cf::SelectionKind),
 
-    /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
+    /// Execute a "body" (`child_regions[0]`) repeatedly, until `repeat_condition`
+    /// evaluates to `false`.
     ///
-    /// To represent "loop state", `body` can take `inputs`, getting values from:
-    /// * on the first iteration: `initial_inputs`
-    /// * on later iterations: `body`'s own `outputs` (from the last iteration)
+    /// To represent "loop state", the body can take inputs, getting values from:
+    /// * on the first iteration: initial `inputs` (from `NodeDef`)
+    /// * on later iterations: the body's own `outputs` (from the last iteration)
     ///
     /// As the condition is checked only *after* the body, this type of loop is
     /// sometimes described as "tail-controlled", and is also equivalent to the
@@ -901,12 +900,8 @@ pub enum NodeKind {
     ///
     /// This corresponds to "theta" (`θ`) nodes in (R)VSDG.
     Loop {
-        initial_inputs: SmallVec<[Value; 2]>,
-
-        body: Region,
-
-        // FIXME(eddyb) should this be kept in `body.outputs`? (that would not
-        // have any ambiguity as to whether it can see `body`-computed values)
+        // FIXME(eddyb) move this to body's `outputs`, removing any ambiguity as
+        // to whether it can see body-computed values, and simplifying traversals.
         repeat_condition: Value,
     },
 
@@ -915,38 +910,10 @@ pub enum NodeKind {
     /// indicating a fatal error as well.
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
-    ExitInvocation {
-        kind: cf::ExitInvocationKind,
+    ExitInvocation(cf::ExitInvocationKind),
 
-        // FIXME(eddyb) centralize `Value` inputs across `Node`s,
-        // and only use stricter types for building/traversing the IR.
-        inputs: SmallVec<[Value; 2]>,
-    },
-}
-
-/// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
-pub use context::DataInst;
-
-/// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
-//
-// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `NodeKind`,
-// but also `DataInst` vs `Node` is a purely artificial distinction.
-#[derive(Clone)]
-pub struct DataInstDef {
-    pub attrs: AttrSet,
-
-    pub kind: DataInstKind,
-
-    // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub inputs: SmallVec<[Value; 2]>,
-
-    pub output_type: Option<Type>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
-pub enum DataInstKind {
-    // FIXME(eddyb) try to split this into recursive and non-recursive calls,
-    // to avoid needing special handling for recursion where it's impossible.
+    // NOTE(eddyb) all variants below used to be in `DataInstKind`.
+    //
     FuncCall(Func),
 
     /// Memory-specific operations (see [`mem::MemOp`]).
@@ -964,6 +931,13 @@ pub enum DataInstKind {
         inst: u32,
     },
 }
+
+// HACK(eddyb) temporarily reusing `Node` pre-merger, with:
+// - `child_regions` always empty
+// - `outputs.len` always <= 1
+pub type DataInst = Node;
+pub type DataInstDef = NodeDef;
+pub type DataInstKind = NodeKind;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
@@ -983,11 +957,9 @@ pub enum Value {
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
     ///   executed child [`Region`] (of `node`):
     ///   * when `node` is a `Select`: the case that was chosen
+    // TODO(eddyb) include former `DataInst`s in above docs.
     NodeOutput {
         node: Node,
         output_idx: u32,
     },
-
-    /// The output value of a [`DataInst`].
-    DataInstOutput(DataInst),
 }

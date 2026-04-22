@@ -258,13 +258,11 @@ enum Use {
         node: Node,
         output_idx: u32,
     },
-    DataInstOutput(DataInst),
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
     AlignmentAnchorForRegion(Region),
     AlignmentAnchorForNode(Node),
-    AlignmentAnchorForDataInst(DataInst),
 }
 
 impl From<Value> for Use {
@@ -273,7 +271,6 @@ impl From<Value> for Use {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
             Value::RegionInput { region, input_idx } => Use::RegionInput { region, input_idx },
             Value::NodeOutput { node, output_idx } => Use::NodeOutput { node, output_idx },
-            Value::DataInstOutput(inst) => Use::DataInstOutput(inst),
         }
     }
 }
@@ -292,13 +289,11 @@ impl Use {
             Self::DbgScope { .. } => ("", "d"),
             Self::RegionLabel(_) => ("label", "L"),
 
-            Self::RegionInput { .. } | Self::NodeOutput { .. } | Self::DataInstOutput(_) => {
-                ("", "v")
-            }
+            Self::RegionInput { .. } | Self::NodeOutput { .. } => ("", "v"),
 
-            Self::AlignmentAnchorForRegion(_)
-            | Self::AlignmentAnchorForNode(_)
-            | Self::AlignmentAnchorForDataInst(_) => ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX),
+            Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
+                ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX)
+            }
         }
     }
 }
@@ -1063,10 +1058,8 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|(&use_kind, &use_count)| {
                 // HACK(eddyb) these are assigned later.
-                if let Use::RegionLabel(_)
-                | Use::RegionInput { .. }
-                | Use::NodeOutput { .. }
-                | Use::DataInstOutput(_) = use_kind
+                if let Use::RegionLabel(_) | Use::RegionInput { .. } | Use::NodeOutput { .. } =
+                    use_kind
                 {
                     return (use_kind, UseStyle::Inline);
                 }
@@ -1101,10 +1094,8 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput(_)
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => unreachable!(),
+                    | Use::AlignmentAnchorForNode(_) => unreachable!(),
                 }
 
                 if let Some(name) =
@@ -1176,10 +1167,8 @@ impl<'a> Printer<'a> {
                     | Use::RegionLabel(_)
                     | Use::RegionInput { .. }
                     | Use::NodeOutput { .. }
-                    | Use::DataInstOutput(_)
                     | Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => {
+                    | Use::AlignmentAnchorForNode(_) => {
                         unreachable!()
                     }
                 };
@@ -1202,10 +1191,8 @@ impl<'a> Printer<'a> {
                         | Use::RegionLabel(_)
                         | Use::RegionInput { .. }
                         | Use::NodeOutput { .. }
-                        | Use::DataInstOutput(_)
                         | Use::AlignmentAnchorForRegion(_)
-                        | Use::AlignmentAnchorForNode(_)
-                        | Use::AlignmentAnchorForDataInst(_) => {
+                        | Use::AlignmentAnchorForNode(_) => {
                             unreachable!()
                         }
                     };
@@ -1499,25 +1486,10 @@ impl<'a> Printer<'a> {
                             intra_region: DbgScopeDefPlaceInRegion { before_node: Some(node) },
                         });
 
-                        define(Use::AlignmentAnchorForNode(node), None);
+                        let NodeDef { attrs, kind: _, inputs: _, child_regions: _, outputs } =
+                            func_at_node.def();
 
-                        let NodeDef { kind, outputs } = func_at_node.def();
-
-                        if let NodeKind::Block { insts } = *kind {
-                            for func_at_inst in func_def_body.at(insts) {
-                                define(
-                                    Use::AlignmentAnchorForDataInst(func_at_inst.position),
-                                    None,
-                                );
-                                let inst_def = func_at_inst.def();
-                                if inst_def.output_type.is_some() {
-                                    define(
-                                        Use::DataInstOutput(func_at_inst.position),
-                                        Some(inst_def.attrs),
-                                    );
-                                }
-                            }
-                        }
+                        define(Use::AlignmentAnchorForNode(node), Some(*attrs));
 
                         for (i, output_decl) in outputs.iter().enumerate() {
                             define(
@@ -1547,13 +1519,11 @@ impl<'a> Printer<'a> {
                         (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::RegionInput { .. } | Use::NodeOutput { .. } | Use::DataInstOutput(_) => {
+                    Use::RegionInput { .. } | Use::NodeOutput { .. } => {
                         (&mut value_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::AlignmentAnchorForRegion(_)
-                    | Use::AlignmentAnchorForNode(_)
-                    | Use::AlignmentAnchorForDataInst(_) => (
+                    Use::AlignmentAnchorForRegion(_) | Use::AlignmentAnchorForNode(_) => (
                         &mut alignment_anchor_counter,
                         Some(use_styles.entry(use_kind).or_insert(UseStyle::Inline)),
                     ),
@@ -2109,8 +2079,7 @@ impl Use {
                 suffix.write_escaped_to(&mut anchor).unwrap();
 
                 let name = if let Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForNode(_)
-                | Self::AlignmentAnchorForDataInst(_) = self
+                | Self::AlignmentAnchorForNode(_) = self
                 {
                     vec![]
                 } else {
@@ -2173,15 +2142,15 @@ impl Use {
                         item.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
+
                 Self::DbgScope { .. }
                 | Self::RegionLabel(_)
                 | Self::RegionInput { .. }
-                | Self::NodeOutput { .. }
-                | Self::DataInstOutput(_) => "_".into(),
+                | Self::NodeOutput { .. } => "_".into(),
 
-                Self::AlignmentAnchorForRegion(_)
-                | Self::AlignmentAnchorForNode(_)
-                | Self::AlignmentAnchorForDataInst(_) => unreachable!(),
+                Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
+                    unreachable!()
+                }
             },
         }
     }
@@ -3739,7 +3708,9 @@ impl Print for FuncAt<'_, Node> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let node = self.position;
-        let NodeDef { kind, outputs } = self.def();
+        let NodeDef { attrs, kind, inputs, child_regions, outputs } = self.def();
+
+        let attrs = attrs.print(printer);
 
         let outputs_header = if !outputs.is_empty() {
             let mut outputs = outputs.iter().enumerate().map(|(output_idx, output)| {
@@ -3763,26 +3734,18 @@ impl Print for FuncAt<'_, Node> {
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
         let node_body = match kind {
-            NodeKind::Block { insts } => {
-                assert!(outputs.is_empty());
-
-                pretty::Fragment::new(
-                    self.at(*insts)
-                        .into_iter()
-                        .map(|func_at_inst| func_at_inst.print(printer))
-                        .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
-                )
-            }
-            NodeKind::Select { kind, scrutinee, cases } => kind.print_with_scrutinee_and_cases(
+            NodeKind::Select(kind) => kind.print_with_scrutinee_and_cases(
                 printer,
                 kw_style,
-                *scrutinee,
-                cases.iter().map(|&case| self.at(case).print(printer)),
+                inputs[0],
+                child_regions.iter().map(|&case| self.at(case).print(printer)),
             ),
-            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
+            NodeKind::Loop { repeat_condition } => {
                 assert!(outputs.is_empty());
 
-                let inputs = &self.at(*body).def().inputs;
+                let initial_inputs = inputs;
+                let body = child_regions[0];
+                let inputs = &self.at(body).def().inputs;
                 assert_eq!(initial_inputs.len(), inputs.len());
 
                 // FIXME(eddyb) this avoids customizing how `body` is printed,
@@ -3809,7 +3772,7 @@ impl Print for FuncAt<'_, Node> {
                             (
                                 input,
                                 Value::RegionInput {
-                                    region: *body,
+                                    region: body,
                                     input_idx: input_idx.try_into().unwrap(),
                                 },
                             )
@@ -3850,7 +3813,7 @@ impl Print for FuncAt<'_, Node> {
                     inputs_header,
                     " {".into(),
                     pretty::Node::IndentedBlock(vec![pretty::Fragment::new([
-                        self.at(*body).print(printer),
+                        self.at(body).print(printer),
                         body_suffix,
                     ])])
                     .into(),
@@ -3860,21 +3823,34 @@ impl Print for FuncAt<'_, Node> {
                     repeat_condition.print(printer),
                 ])
             }
-            NodeKind::ExitInvocation {
-                kind: cf::ExitInvocationKind::SpvInst(spv::Inst { opcode, imms }),
-                inputs,
-            } => printer.pretty_spv_inst(
+            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(spv::Inst {
+                opcode,
+                imms,
+            })) => printer.pretty_spv_inst(
                 kw_style,
                 *opcode,
                 imms,
                 inputs.iter().map(|v| v.print(printer)),
             ),
+
+            DataInstKind::FuncCall(_)
+            | DataInstKind::Mem(_)
+            | DataInstKind::QPtr(_)
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => {
+                // FIXME(eddyb) `outputs_header` is wastefully built even in
+                // this case (though ideally the logic would just be shared).
+                return pretty::Fragment::new([
+                    pretty::Node::ForceLineSeparation.into(),
+                    self.print_data_inst(printer),
+                ]);
+            }
         };
-        pretty::Fragment::new([
+        let def_without_name = pretty::Fragment::new([
             Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
-            outputs_header,
             node_body,
-        ])
+        ]);
+        AttrsAndDef { attrs, def_without_name }.insert_name_before_def(outputs_header)
     }
 }
 
@@ -3902,19 +3878,32 @@ impl Print for NodeOutputDecl {
     }
 }
 
-impl Print for FuncAt<'_, DataInst> {
-    type Output = pretty::Fragment;
-    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let DataInstDef { attrs, kind, inputs, output_type } = self.def();
+impl FuncAt<'_, DataInst> {
+    fn print_data_inst(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.def();
+
+        assert_eq!(child_regions.len(), 0);
 
         let attrs = attrs.print(printer);
 
-        let mut output_use_to_print_as_lhs =
-            output_type.map(|_| Use::DataInstOutput(self.position));
+        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+        let output_type = if !outputs.is_empty() {
+            assert_eq!(outputs.len(), 1);
+            Some(outputs[0].ty)
+        } else {
+            None
+        };
 
-        let mut output_type_to_print = *output_type;
+        let mut output_use_to_print_as_lhs =
+            output_type.map(|_| Use::NodeOutput { node: self.position, output_idx: 0 });
+
+        let mut output_type_to_print = output_type;
 
         let def_without_type = match kind {
+            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                unreachable!()
+            }
+
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([
                 printer.declarative_keyword_style().apply("call").into(),
                 " ".into(),
@@ -4263,7 +4252,7 @@ impl Print for FuncAt<'_, DataInst> {
 
         // FIXME(eddyb) this is quite verbose for prepending.
         let def_without_name = pretty::Fragment::new([
-            Use::AlignmentAnchorForDataInst(self.position).print_as_def(printer),
+            Use::AlignmentAnchorForNode(self.position).print_as_def(printer),
             def_without_name,
         ]);
 
