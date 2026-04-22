@@ -783,15 +783,9 @@ pub struct FuncDefBody {
 ///   (i.e. in all possible execution paths, the definition precedes all uses)
 ///
 /// But unlike SPIR-V, SPIR-T's structured control-flow has implications for SSA:
-/// * dominance is simpler, so values defined in a [`Region`](crate::Region) can be used:
-///   * later in that region, including in the region's `outputs`
-///     (which allows "exporting" values out to the rest of the function)
-///   * outside that region, but *only* if the parent [`Node`](crate::Node)
-///     is a `Loop` (that is, when the region is a loop's body)
-///     * this is an "emergent" property, stemming from the region having to
-///       execute (at least once) before the parent [`Node`](crate::Node)
-///       can complete, but is not is not ideal and should eventually be replaced
-///       with passing all such values through loop (body) `outputs`
+/// * dominance is simpler, so values defined in a [`Region`](crate::Region) can
+///   *only* be used later in that region, including in the region's `outputs`
+///   (which allows "exporting" values out to the rest of the function)
 /// * instead of φ ("phi") nodes, SPIR-T uses region `outputs` to merge values
 ///   coming from separate control-flow paths (i.e. the cases of a `Select`),
 ///   and region `inputs` for passing values back along loop backedges
@@ -823,15 +817,10 @@ pub struct RegionDef {
     pub children: EntityList<Node>,
 
     /// Output values from this [`Region`], provided to the parent:
-    /// * when this is the function body: these are the structured return values
-    /// * when this is a `Select` case: these are the values for the parent
-    ///   [`Node`]'s outputs (accessed using [`VarKind::NodeOutput`])
-    /// * when this is a `Loop` body: these are the values to be used for the
-    ///   next loop iteration's body `inputs`
-    ///   * **not** accessible through [`VarKind::NodeOutput`] on the `Loop`,
-    ///     as it's both confusing regarding [`VarKind::RegionInput`], and
-    ///     also there's nothing stopping body-defined values from directly being
-    ///     used outside the loop (once that changes, this aspect can be flipped)
+    /// * when exiting a [`Node`]: these are the values for its outputs
+    ///   (the caller's `FuncCall` [`Node`], in the case of a function body)
+    /// * when continuing a `Loop`: these are the values fed back into
+    ///   the next loop iteration's body `inputs`
     pub outputs: SmallVec<[Value; 2]>,
 }
 
@@ -861,6 +850,7 @@ pub struct NodeDef {
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
+    ///   * when this is a `Loop`: the last iteration of the body
     // TODO(eddyb) include former `DataInst`s in above docs.
     pub outputs: SmallVec<[Var; 2]>,
 }
@@ -974,6 +964,7 @@ pub enum VarKind {
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
     ///   executed child [`Region`] (of `node`):
     ///   * when `node` is a `Select`: the case that was chosen
+    ///   * when `node` is a `Loop`: the last iteration of the body
     // TODO(eddyb) include former `DataInst`s in above docs.
     NodeOutput { node: Node, output_idx: u32 },
 }

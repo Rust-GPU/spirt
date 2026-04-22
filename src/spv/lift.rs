@@ -620,8 +620,8 @@ impl<'a> FuncLifting<'a> {
                 }
                 CfgPoint::NodeExit(node) => {
                     let node_def = func_def_body.at(node).def();
-                    match &node_def.kind {
-                        NodeKind::Select(_) => node_def
+                    if !node_def.child_regions.is_empty() {
+                        node_def
                             .outputs
                             .iter()
                             .map(|&output_var| {
@@ -636,8 +636,9 @@ impl<'a> FuncLifting<'a> {
                                     default_value: None,
                                 })
                             })
-                            .collect::<Result<_, _>>()?,
-                        _ => SmallVec::new(),
+                            .collect::<Result<_, _>>()?
+                    } else {
+                        SmallVec::new()
                     }
                 }
             };
@@ -790,7 +791,7 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::Loop { repeat_condition } => {
                             let backedge = CfgPoint::NodeEntry(parent_node);
-                            let target_phi_values = region_outputs
+                            let mut target_phi_values = region_outputs
                                 .map(|outputs| (backedge, outputs))
                                 .into_iter()
                                 .collect();
@@ -816,6 +817,14 @@ impl<'a> FuncLifting<'a> {
                                     merge: None,
                                 }
                             } else {
+                                // FIXME(eddyb) this will cause redundant `OpPhi`s
+                                // (in that SSA dominance rules do allow directly
+                                // referencing values defined inside the loop body),
+                                // they should be soundly optimized out somehow,
+                                // maybe even reuse `cf::cfgssa` infrastructure?
+                                if let Some(outputs) = region_outputs {
+                                    target_phi_values.insert(parent_exit, outputs);
+                                }
                                 Terminator {
                                     attrs: AttrSet::default(),
                                     kind: Cow::Owned(
