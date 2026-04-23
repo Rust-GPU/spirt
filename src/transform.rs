@@ -438,7 +438,7 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
+                TypeKind::QPtr | TypeKind::Thunk | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
                 TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
@@ -580,11 +580,6 @@ impl InnerInPlaceTransform for FuncDefBody {
 
                 for region in rpo {
                     transformer.in_place_transform_region_def(self.at_mut(region));
-
-                    let cfg = self.unstructured_cfg.as_mut().unwrap();
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get_mut(region) {
-                        control_inst.inner_in_place_transform_with(transformer);
-                    }
                 }
             }
         }
@@ -641,6 +636,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. },
             )
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}
         }
@@ -676,33 +672,6 @@ impl InnerInPlaceTransform for VarDecl {
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         transformer.transform_type_use(*ty).apply_to(ty);
-    }
-}
-
-impl InnerInPlaceTransform for cf::unstructured::ControlInst {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
-
-        transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        match kind {
-            cf::unstructured::ControlInstKind::Unreachable
-            | cf::unstructured::ControlInstKind::Return
-            | cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
-                _,
-            ))
-            | cf::unstructured::ControlInstKind::Branch
-            | cf::unstructured::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
-        }
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
-        for inputs in target_inputs.values_mut() {
-            for v in inputs {
-                transformer.transform_value_use(v).apply_to(v);
-            }
-        }
     }
 }
 

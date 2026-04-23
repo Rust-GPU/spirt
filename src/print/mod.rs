@@ -613,20 +613,16 @@ impl<'a> Visitor<'a> for Plan<'a> {
         }
     }
 
-    fn visit_func_decl(&mut self, func_decl: &'a FuncDecl) {
-        if let DeclDef::Present(func_def_body) = &func_decl.def
-            && let Some(cfg) = &func_def_body.unstructured_cfg
-        {
-            for region in cfg.rev_post_order(func_def_body) {
-                if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                    for &target in &control_inst.targets {
-                        *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
-                    }
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
+        if let DataInstKind::ThunkBind(target) = func_at_node.def().kind {
+            match target {
+                cf::unstructured::ControlTarget::Region(target) => {
+                    *self.use_counts.entry(Use::RegionLabel(target)).or_default() += 1;
                 }
+                cf::unstructured::ControlTarget::Return => {}
             }
         }
-
-        func_decl.inner_visit_with(self);
+        func_at_node.inner_visit_with(self);
     }
 
     fn visit_value_use(&mut self, v: &'a Value) {
@@ -791,13 +787,8 @@ impl DbgScopeDefPlacer<'_> {
             None => self.scopes_used_in_region(func_def_body.at_body()),
             Some(cfg) => DbgScopeDefMap::merge_unordered(
                 DbgScopeDefPlace::top_of(func_def_body.at_body()),
-                cfg.rev_post_order(func_def_body).map(|region| {
-                    let mut scopes = self.scopes_used_in_region(func_def_body.at(region));
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        scopes.prepend_attrs(self.cx, control_inst.attrs);
-                    }
-                    scopes
-                }),
+                cfg.rev_post_order(func_def_body)
+                    .map(|region| self.scopes_used_in_region(func_def_body.at(region))),
             ),
         }
     }
@@ -1110,9 +1101,9 @@ impl<'a> Printer<'a> {
                                                 || type_and_const_inputs.is_empty()
                                         }
 
-                                        TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {
-                                            true
-                                        }
+                                        TypeKind::QPtr
+                                        | TypeKind::Thunk
+                                        | TypeKind::SpvStringLiteralForExtInst => true,
                                     };
 
                                     ty_def.attrs == AttrSet::default()
@@ -3127,6 +3118,8 @@ impl Print for TypeDef {
                     // FIXME(eddyb) should this be shortened to `qtr`?
                     TypeKind::QPtr => printer.declarative_keyword_style().apply("qptr").into(),
 
+                    TypeKind::Thunk => printer.imperative_keyword_style().apply("thunk").into(),
+
                     TypeKind::SpvInst { spv_inst, type_and_const_inputs } => printer
                         .pretty_spv_inst(
                             printer.spv_op_style(),
@@ -3550,24 +3543,23 @@ impl Print for FuncDecl {
                                     pretty::Fragment::default()
                                 };
 
-                                // FIXME(eddyb) `:` as used here for C-like "label syntax"
-                                // interferes (in theory) with `e: T` "type ascription syntax".
                                 pretty::Fragment::new([
                                     pretty::Node::ForceLineSeparation.into(),
                                     label.print_as_def(printer),
                                     label_inputs,
-                                    ":".into(),
-                                    pretty::Node::ForceLineSeparation.into(),
                                 ])
+                            } else if region == def.body {
+                                printer.imperative_keyword_style().apply("entry").into()
                             } else {
-                                pretty::Fragment::default()
+                                printer.error_style().apply("/* undefined label */_").into()
                             };
 
                             pretty::Fragment::new([
                                 label_header,
+                                " {".into(),
                                 pretty::Node::IndentedBlock(vec![def.at(region).print(printer)])
                                     .into(),
-                                cfg.control_inst_on_exit_from[region].print(printer),
+                                "}".into(),
                             ])
                         })
                         .intersperse({
@@ -3845,6 +3837,7 @@ impl Print for FuncAt<'_, Node> {
             DataInstKind::FuncCall(_)
             | DataInstKind::Mem(_)
             | DataInstKind::QPtr(_)
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {
                 // FIXME(eddyb) `outputs_header` is wastefully built even in
@@ -4029,6 +4022,29 @@ impl FuncAt<'_, DataInst> {
                     pretty::join_comma_sep("(", [qptr_input].into_iter().chain(extra_inputs), ")"),
                 ])
             }
+
+            &DataInstKind::ThunkBind(target) => pretty::Fragment::new([
+                printer
+                    .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                    .apply("thunk.")
+                    .into(),
+                printer.imperative_keyword_style().apply("bind").into(),
+                pretty::join_comma_sep(
+                    "(",
+                    [
+                        match target {
+                            cf::unstructured::ControlTarget::Region(target) => {
+                                Use::RegionLabel(target).print(printer)
+                            }
+                            cf::unstructured::ControlTarget::Return => {
+                                printer.imperative_keyword_style().apply("return").into()
+                            }
+                        },
+                        pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+                    ],
+                    ")",
+                ),
+            ]),
 
             DataInstKind::SpvInst(inst) => printer.pretty_spv_inst(
                 printer.spv_op_style(),
@@ -4250,74 +4266,6 @@ impl FuncAt<'_, DataInst> {
                 })
                 .unwrap_or_default(),
         )
-    }
-}
-
-impl Print for cf::unstructured::ControlInst {
-    type Output = pretty::Fragment;
-    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let Self { attrs, kind, inputs, targets, target_inputs } = self;
-
-        let attrs = attrs.print(printer);
-
-        let kw_style = printer.imperative_keyword_style();
-        let kw = |kw| kw_style.apply(kw).into();
-
-        let mut targets = targets.iter().map(|&target_region| {
-            let mut target = pretty::Fragment::new([
-                kw("branch"),
-                " ".into(),
-                Use::RegionLabel(target_region).print(printer),
-            ]);
-            if let Some(inputs) = target_inputs.get(&target_region) {
-                target = pretty::Fragment::new([
-                    target,
-                    pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
-                ]);
-            }
-            target
-        });
-
-        let def = match kind {
-            cf::unstructured::ControlInstKind::Unreachable => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0 && inputs.is_empty());
-                kw("unreachable")
-            }
-            cf::unstructured::ControlInstKind::Return => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0);
-                match inputs[..] {
-                    [] => kw("return"),
-                    [v] => pretty::Fragment::new([kw("return"), " ".into(), v.print(printer)]),
-                    _ => unreachable!(),
-                }
-            }
-            cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
-                spv::Inst { opcode, imms },
-            )) => {
-                // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
-                assert!(targets.len() == 0);
-                printer.pretty_spv_inst(
-                    kw_style,
-                    *opcode,
-                    imms,
-                    inputs.iter().map(|v| v.print(printer)),
-                )
-            }
-
-            cf::unstructured::ControlInstKind::Branch => {
-                assert_eq!((targets.len(), inputs.len()), (1, 0));
-                targets.next().unwrap()
-            }
-
-            cf::unstructured::ControlInstKind::SelectBranch(kind) => {
-                assert_eq!(inputs.len(), 1);
-                kind.print_with_scrutinee_and_cases(printer, kw_style, inputs[0], targets)
-            }
-        };
-
-        pretty::Fragment::new([attrs, def])
     }
 }
 

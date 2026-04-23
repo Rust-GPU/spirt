@@ -552,6 +552,9 @@ pub enum TypeKind {
     // and kept separately in `VarDecl`, might be a better approach?
     QPtr,
 
+    // TODO(eddyb) reconsider name? add signature? etc.
+    Thunk,
+
     SpvInst {
         spv_inst: spv::Inst,
         // FIXME(eddyb) find a better name.
@@ -754,9 +757,8 @@ pub struct FuncDefBody {
 ///       [`Node`], or function (the latter being a "structured return")
 ///     * "divergent": execution gets stuck in the region (an infinite loop),
 ///       or is aborted (e.g. `OpTerminateInvocation` from SPIR-V)
-/// * "unstructured": [`Region`]s which connect to other [`Region`]s
-///   using [`cfg::ControlInst`](crate::cfg::ControlInst)s (as described by a
-///   [`cfg::ControlFlowGraph`](crate::cfg::ControlFlowGraph))
+/// * "unstructured": [`Region`]s which connect to other [`Region`]s using "`thunk`s"
+///   (as described by [`cfg::ControlFlowGraph`](crate::cfg::ControlFlowGraph))
 ///
 /// When a function's entire body can be described by a single [`Region`],
 /// that function is said to have (entirely) "structured control-flow".
@@ -802,8 +804,7 @@ pub struct FuncDefBody {
 ///     instead of in the merge (where phi nodes require special-casing, as
 ///     their "uses" of all the "source" values would normally be illegal)
 ///   * in unstructured control-flow, region `inputs` are additionally used for
-///     representing phi nodes, as [`cfg::ControlInst`](crate::cfg::ControlInst)s
-///     passing values to their target regions
+///     representing phi nodes, as `thunk`s passing values to their target regions
 ///     * all value uses across unstructured control-flow edges (i.e. not in the
 ///       same region containing the value definition) *require* explicit passing,
 ///       as unstructured control-flow [`Region`](crate::Region)s
@@ -906,6 +907,9 @@ pub enum NodeKind {
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
     QPtr(qptr::QPtrOp),
+
+    // TODO(eddyb) document (maybe move into e.g. `cf::ThunkOp`?).
+    ThunkBind(cf::unstructured::ControlTarget),
 
     // FIXME(eddyb) should this have `#[from]`?
     SpvInst(spv::Inst),

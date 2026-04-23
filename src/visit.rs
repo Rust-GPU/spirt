@@ -321,7 +321,7 @@ impl InnerVisit for TypeDef {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {}
+            TypeKind::QPtr | TypeKind::Thunk | TypeKind::SpvStringLiteralForExtInst => {}
 
             TypeKind::SpvInst { spv_inst: _, type_and_const_inputs } => {
                 for &ty_or_ct in type_and_const_inputs {
@@ -426,10 +426,6 @@ impl InnerVisit for FuncDefBody {
             Some(cfg) => {
                 for region in cfg.rev_post_order(self) {
                     visitor.visit_region_def(self.at(region));
-
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        control_inst.inner_visit_with(visitor);
-                    }
                 }
             }
         }
@@ -483,6 +479,7 @@ impl<'a> FuncAt<'a, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. },
             )
+            | DataInstKind::ThunkBind(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}
         }
@@ -510,33 +507,6 @@ impl InnerVisit for VarDecl {
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
-    }
-}
-
-impl InnerVisit for cf::unstructured::ControlInst {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
-
-        visitor.visit_attr_set_use(*attrs);
-        match kind {
-            cf::unstructured::ControlInstKind::Unreachable
-            | cf::unstructured::ControlInstKind::Return
-            | cf::unstructured::ControlInstKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(
-                _,
-            ))
-            | cf::unstructured::ControlInstKind::Branch
-            | cf::unstructured::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
-        }
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        for inputs in target_inputs.values() {
-            for v in inputs {
-                visitor.visit_value_use(v);
-            }
-        }
     }
 }
 

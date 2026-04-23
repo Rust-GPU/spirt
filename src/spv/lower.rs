@@ -3,13 +3,14 @@
 use crate::cf::{self, SelectionKind};
 use crate::spv::{self, spec};
 // FIXME(eddyb) import more to avoid `crate::` everywhere.
+use crate::func_at::FuncAtMut;
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, Region,
-    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, VarDecl, print,
+    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, NodeDef,
+    NodeKind, Region, RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, VarDecl, print,
 };
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1465,7 +1466,7 @@ impl Module {
                     // Split the operands into value inputs (e.g. a branch's
                     // condition or an `OpSwitch`'s selector) and target blocks.
                     let mut inputs = SmallVec::new();
-                    let mut targets = SmallVec::new();
+                    let mut targets = SmallVec::<[_; 4]>::new();
                     for &id in ids {
                         match lookup_global_or_local_id_for_data_or_control_inst_input(id)? {
                             LocalIdDef::Value(v) => {
@@ -1484,45 +1485,146 @@ impl Module {
                         }
                     }
 
-                    let kind = if opcode == wk.OpUnreachable {
-                        assert!(targets.is_empty() && inputs.is_empty());
-                        cf::unstructured::ControlInstKind::Unreachable
-                    } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
-                        assert!(targets.is_empty() && inputs.len() <= 1);
-                        cf::unstructured::ControlInstKind::Return
-                    } else if targets.is_empty() {
-                        cf::unstructured::ControlInstKind::ExitInvocation(
-                            cf::ExitInvocationKind::SpvInst(raw_inst.without_ids.clone()),
+                    // FIXME(eddyb) collect targets in this form to
+                    // begin with (instead of recombining them here).
+                    let targets_with_inputs = targets.into_iter().map(|target| {
+                        (
+                            cf::unstructured::ControlTarget::Region(target),
+                            target_inputs.get(&target).cloned().unwrap_or_default(),
                         )
-                    } else if opcode == wk.OpBranch {
-                        assert_eq!((targets.len(), inputs.len()), (1, 0));
-                        cf::unstructured::ControlInstKind::Branch
-                    } else if opcode == wk.OpBranchConditional {
-                        assert_eq!((targets.len(), inputs.len()), (2, 1));
-                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::BoolCond)
+                    });
+
+                    // FIXME(eddyb) cache this.
+                    let thunk_ty = cx.intern(TypeKind::Thunk);
+
+                    let build_thunk =
+                        |func_at_region: FuncAtMut<'_, Region>, (target, target_inputs)| {
+                            let region = func_at_region.position;
+                            let func = func_at_region.at(());
+
+                            let thunk_node = func.nodes.define(
+                                &cx,
+                                NodeDef {
+                                    attrs,
+                                    kind: NodeKind::ThunkBind(target),
+                                    inputs: target_inputs,
+                                    child_regions: [].into_iter().collect(),
+                                    outputs: [].into_iter().collect(),
+                                }
+                                .into(),
+                            );
+                            func.regions[region].children.insert_last(thunk_node, func.nodes);
+
+                            let thunk_var = func.vars.define(
+                                &cx,
+                                VarDecl {
+                                    attrs: AttrSet::default(),
+                                    ty: thunk_ty,
+
+                                    def_parent: Either::Right(thunk_node),
+                                    def_idx: 0,
+                                },
+                            );
+                            func.nodes[thunk_node].outputs.push(thunk_var);
+
+                            Value::Var(thunk_var)
+                        };
+
+                    let selection_kind = if opcode == wk.OpBranchConditional {
+                        assert_eq!((targets_with_inputs.len(), inputs.len()), (2, 1));
+                        Some(SelectionKind::BoolCond)
                     } else if opcode == wk.OpSwitch {
-                        cf::unstructured::ControlInstKind::SelectBranch(SelectionKind::SpvInst(
-                            raw_inst.without_ids.clone(),
-                        ))
+                        Some(SelectionKind::SpvInst(raw_inst.without_ids.clone()))
+                    } else {
+                        None
+                    };
+
+                    let target_thunk = if let Some(selection_kind) = selection_kind {
+                        let cases = targets_with_inputs
+                            .map(|target_with_inputs| {
+                                let case = func_def_body.regions.define(&cx, RegionDef::default());
+                                let thunk =
+                                    build_thunk(func_def_body.at_mut(case), target_with_inputs);
+                                func_def_body.regions[case].outputs.push(thunk);
+                                case
+                            })
+                            .collect();
+
+                        let select_node = func_def_body.nodes.define(
+                            &cx,
+                            NodeDef {
+                                attrs,
+                                kind: NodeKind::Select(selection_kind),
+                                inputs: mem::take(&mut inputs),
+                                child_regions: cases,
+                                outputs: [].into_iter().collect(),
+                            }
+                            .into(),
+                        );
+                        func_def_body.regions[current_block.region]
+                            .children
+                            .insert_last(select_node, &mut func_def_body.nodes);
+
+                        let select_thunk_var = func_def_body.vars.define(
+                            &cx,
+                            VarDecl {
+                                attrs: AttrSet::default(),
+                                ty: thunk_ty,
+
+                                def_parent: Either::Right(select_node),
+                                def_idx: 0,
+                            },
+                        );
+                        func_def_body.nodes[select_node].outputs.push(select_thunk_var);
+
+                        Value::Var(select_thunk_var)
+                    } else if [wk.OpReturn, wk.OpReturnValue].contains(&opcode) {
+                        assert!(targets_with_inputs.len() == 0 && inputs.len() <= 1);
+                        build_thunk(
+                            func_def_body.at_mut(current_block.region),
+                            (cf::unstructured::ControlTarget::Return, mem::take(&mut inputs)),
+                        )
+                    } else if targets_with_inputs.len() == 0 {
+                        if opcode != wk.OpUnreachable {
+                            let node = func_def_body.nodes.define(
+                                &cx,
+                                NodeDef {
+                                    attrs,
+                                    kind: NodeKind::ExitInvocation(
+                                        cf::ExitInvocationKind::SpvInst(
+                                            raw_inst.without_ids.clone(),
+                                        ),
+                                    ),
+                                    inputs: mem::take(&mut inputs),
+                                    child_regions: [].into_iter().collect(),
+                                    outputs: [].into_iter().collect(),
+                                }
+                                .into(),
+                            );
+                            func_def_body.regions[current_block.region]
+                                .children
+                                .insert_last(node, &mut func_def_body.nodes);
+                        }
+
+                        // FIXME(eddyb) cache this.
+                        Value::Const(cx.intern(ConstDef {
+                            attrs: AttrSet::default(),
+                            ty: thunk_ty,
+                            kind: ConstKind::Undef,
+                        }))
+                    } else if opcode == wk.OpBranch {
+                        build_thunk(
+                            func_def_body.at_mut(current_block.region),
+                            targets_with_inputs.exactly_one().ok().unwrap(),
+                        )
                     } else {
                         return Err(invalid("unsupported control-flow instruction"));
                     };
 
-                    func_def_body
-                        .unstructured_cfg
-                        .as_mut()
-                        .unwrap()
-                        .control_inst_on_exit_from
-                        .insert(
-                            current_block.region,
-                            cf::unstructured::ControlInst {
-                                attrs,
-                                kind,
-                                inputs,
-                                targets,
-                                target_inputs,
-                            },
-                        );
+                    assert_eq!(inputs.len(), 0);
+
+                    func_def_body.regions[current_block.region].outputs =
+                        [target_thunk].into_iter().collect();
                 } else if opcode == wk.OpPhi {
                     if !current_block_region_def.children.is_empty() {
                         return Err(invalid(
