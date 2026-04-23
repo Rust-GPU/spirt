@@ -991,24 +991,29 @@ impl<'a> Structurizer<'a> {
                 .children
                 .insert_last(loop_node, &mut self.func_def_body.nodes);
 
-            // HACK(eddyb) we've treated loop exits as extra "false edges", so
-            // here they have to be added to the loop (potentially unlocking
-            // structurization to the outside of the loop, in the caller).
-            if let Some(exit_targets) = self.loop_header_to_exit_targets.get(&target) {
-                for &exit_target in exit_targets {
-                    // FIXME(eddyb) what if this is `None`, is that impossible?
-                    if let Some(exit_edge_bundle) = deferred_edges
-                        .get_edge_bundle_mut_by_target(DeferredTarget::Region(exit_target))
-                    {
-                        exit_edge_bundle.accumulated_count += IncomingEdgeCount::ONE;
-                    }
-                }
-            }
-
             wrapper_region
         } else {
             target
         };
+
+        // HACK(eddyb) we've treated loop exits as extra "false edges", so
+        // here they have to be added to the loop (potentially unlocking
+        // structurization to the outside of the loop, in the caller).
+        //
+        // NOTE(eddyb) this is applied in all cases, not just loops, because
+        // SPIR-V allows `OpLoopMerge` to exist without a reachable backedge,
+        // and without this adjustment, structurization would remain incomplete.
+        if let Some(exit_targets) = self.loop_header_to_exit_targets.get(&target) {
+            for &exit_target in exit_targets {
+                // FIXME(eddyb) what if this is `None`, is that impossible?
+                if let Some(exit_edge_bundle) = deferred_edges
+                    .get_edge_bundle_mut_by_target(DeferredTarget::Region(exit_target))
+                {
+                    exit_edge_bundle.accumulated_count += IncomingEdgeCount::ONE;
+                }
+            }
+        }
+
         let IncomingEdgeBundle { attrs, target: _, accumulated_count: _, target_inputs } =
             edge_bundle;
 
