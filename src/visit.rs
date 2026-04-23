@@ -322,6 +322,7 @@ impl InnerVisit for TypeDef {
         visitor.visit_attr_set_use(*attrs);
         match kind {
             TypeKind::Scalar(_)
+            | TypeKind::Vector(_)
             | TypeKind::QPtr
             | TypeKind::Thunk
             | TypeKind::SpvStringLiteralForExtInst => {}
@@ -345,7 +346,10 @@ impl InnerVisit for ConstDef {
         visitor.visit_attr_set_use(*attrs);
         visitor.visit_type_use(*ty);
         match kind {
-            ConstKind::Undef | ConstKind::Scalar(_) | ConstKind::SpvStringLiteralForExtInst(_) => {}
+            ConstKind::Undef
+            | ConstKind::Scalar(_)
+            | ConstKind::Vector(_)
+            | ConstKind::SpvStringLiteralForExtInst(_) => {}
 
             &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
             &ConstKind::PtrToFunc(func) => visitor.visit_func_use(func),
@@ -477,6 +481,7 @@ impl<'a> FuncAt<'a, Node> {
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
             | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

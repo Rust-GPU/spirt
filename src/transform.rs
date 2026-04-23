@@ -439,6 +439,7 @@ impl InnerTransform for TypeDef {
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
                 TypeKind::Scalar(_)
+                | TypeKind::Vector(_)
                 | TypeKind::QPtr
                 | TypeKind::Thunk
                 | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
@@ -476,6 +477,7 @@ impl InnerTransform for ConstDef {
             kind -> match kind {
                 ConstKind::Undef
                 | ConstKind::Scalar(_)
+                | ConstKind::Vector(_)
                 | ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged,
 
                 ConstKind::PtrToGlobalVar(gv) => transform!({
@@ -635,6 +637,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
             | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

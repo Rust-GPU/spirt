@@ -631,15 +631,9 @@ impl Module {
 
                 let ty = cx.intern(TypeDef {
                     attrs: mem::take(&mut attrs),
-                    kind: match inst.as_canonical_type() {
-                        Some(type_kind) => {
-                            assert_eq!(type_and_const_inputs.len(), 0);
-                            type_kind
-                        }
-                        None => {
-                            TypeKind::SpvInst { spv_inst: inst.without_ids, type_and_const_inputs }
-                        }
-                    },
+                    kind: inst.as_canonical_type(&cx, &type_and_const_inputs).unwrap_or(
+                        TypeKind::SpvInst { spv_inst: inst.without_ids, type_and_const_inputs },
+                    ),
                 });
                 id_defs.insert(id, IdDef::Type(ty));
 
@@ -700,15 +694,11 @@ impl Module {
                 let ct = cx.intern(ConstDef {
                     attrs: mem::take(&mut attrs),
                     ty,
-                    kind: match inst.as_canonical_const(&cx, ty) {
-                        Some(const_kind) => {
-                            assert_eq!(const_inputs.len(), 0);
-                            const_kind
-                        }
-                        None => ConstKind::SpvInst {
+                    kind: inst.as_canonical_const(&cx, ty, &const_inputs).unwrap_or_else(|| {
+                        ConstKind::SpvInst {
                             spv_inst_and_const_inputs: Rc::new((inst.without_ids, const_inputs)),
-                        },
-                    },
+                        }
+                    }),
                 });
                 id_defs.insert(id, IdDef::Const(ct));
 
@@ -1819,13 +1809,7 @@ impl Module {
                     // some "structured regions" replacement for the CFG.
                 } else {
                     let mut ids = &ids[..];
-                    let kind = if let Some(kind) = raw_inst.without_ids.as_canonical_node_kind(
-                        &cx,
-                        result_type.map(|ty| [ty]).as_ref().map_or(&[][..], |tys| &tys[..]),
-                    ) {
-                        // FIXME(eddyb) sanity-check the number/types of inputs.
-                        kind
-                    } else if opcode == wk.OpFunctionCall {
+                    let kind = if opcode == wk.OpFunctionCall {
                         assert!(imms.is_empty());
                         let callee_id = ids[0];
                         let maybe_callee = id_defs
@@ -1930,6 +1914,30 @@ impl Module {
                     }
 
                     current_block_region_def.children.insert_last(inst, &mut func_def_body.nodes);
+
+                    // HACK(eddyb) doing this after defining the maybe-uncanonical
+                    // node, just to keep the iterators simpler.
+                    let node_def = &mut func_def_body.nodes[inst];
+                    if let DataInstKind::SpvInst(spv_inst) = &node_def.kind
+                        && let Some(canonical_kind) = spv_inst.as_canonical_node_kind(
+                            &cx,
+                            node_def
+                                .outputs
+                                .iter()
+                                .map(|&output_var| func_def_body.vars[output_var].ty),
+                            node_def.inputs.iter().map(|&v| {
+                                // HACK(eddyb) `func_def_body.at(v).type_of(cx)`
+                                // equivalent, without running into borrow issues.
+                                match v {
+                                    Value::Const(ct) => cx[ct].ty,
+                                    Value::Var(var) => func_def_body.vars[var].ty,
+                                }
+                            }),
+                        )
+                    {
+                        // FIXME(eddyb) sanity-check the number/types of inputs.
+                        node_def.kind = canonical_kind;
+                    }
                 }
             }
 
