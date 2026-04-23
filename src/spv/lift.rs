@@ -9,7 +9,7 @@ use crate::{
     DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap,
     FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, Node,
     NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeDef, TypeKind, TypeOrConst, Value, Var,
-    VarDecl, VarKind,
+    VarDecl, VarKind, scalar,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -121,6 +121,8 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         }
         let ty_def = &self.cx[ty];
         match ty_def.kind {
+            TypeKind::Scalar(_) | TypeKind::SpvInst { .. } => {}
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             TypeKind::QPtr => {
@@ -132,7 +134,6 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 return;
             }
 
-            TypeKind::SpvInst { .. } => {}
             TypeKind::SpvStringLiteralForExtInst => {
                 unreachable!(
                     "`TypeKind::SpvStringLiteralForExtInst` should not be used \
@@ -155,6 +156,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             }
 
             ConstKind::Undef
+            | ConstKind::Scalar(_)
             | ConstKind::PtrToGlobalVar(_)
             | ConstKind::PtrToFunc(_)
             | ConstKind::SpvInst { .. } => {
@@ -223,11 +225,14 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     }
 
     fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
-        #[allow(clippy::match_same_arms)]
         match func_at_node.def().kind {
-            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {}
-
-            DataInstKind::FuncCall(_) => {}
+            NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_)
+            | DataInstKind::Scalar(_)
+            | DataInstKind::FuncCall(_)
+            | DataInstKind::ThunkBind(_)
+            | DataInstKind::SpvInst(_) => {}
 
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
@@ -241,9 +246,6 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 unreachable!("`DataInstKind::QPtr` should be legalized away before lifting");
             }
 
-            DataInstKind::ThunkBind(_) => {}
-
-            DataInstKind::SpvInst(_) => {}
             DataInstKind::SpvExtInst { ext_set, .. } => {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
             }
@@ -490,7 +492,8 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 | NodeKind::Loop { .. }
                 | NodeKind::ExitInvocation { .. } => None,
 
-                DataInstKind::FuncCall(_)
+                DataInstKind::Scalar(_)
+                | DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::ThunkBind(_)
@@ -582,8 +585,6 @@ impl<'a> FuncLifting<'a> {
         func_decl: &'a FuncDecl,
         mut alloc_id: impl FnMut() -> Result<spv::Id, E>,
     ) -> Result<Self, E> {
-        let wk = &spec::Spec::get().well_known;
-
         let func_id = alloc_id()?;
         let param_ids = func_decl.params.iter().map(|_| alloc_id()).collect::<Result<_, _>>()?;
 
@@ -705,7 +706,8 @@ impl<'a> FuncLifting<'a> {
                         SmallVec::new()
                     }
 
-                    DataInstKind::FuncCall(_)
+                    DataInstKind::Scalar(_)
+                    | DataInstKind::FuncCall(_)
                     | DataInstKind::Mem(_)
                     | DataInstKind::QPtr(_)
                     | DataInstKind::SpvInst(_)
@@ -875,7 +877,8 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        DataInstKind::FuncCall(_)
+                        DataInstKind::Scalar(_)
+                        | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::ThunkBind(_)
@@ -916,14 +919,9 @@ impl<'a> FuncLifting<'a> {
                                 .collect();
 
                             let is_infinite_loop = match repeat_condition {
-                                Value::Const(cond) => match &cx[cond].kind {
-                                    ConstKind::SpvInst { spv_inst_and_const_inputs } => {
-                                        let (spv_inst, _const_inputs) =
-                                            &**spv_inst_and_const_inputs;
-                                        spv_inst.opcode == wk.OpConstantTrue
-                                    }
-                                    _ => false,
-                                },
+                                Value::Const(cond) => {
+                                    matches!(cx[cond].kind, ConstKind::Scalar(scalar::Const::TRUE))
+                                }
                                 Value::Var(_) => false,
                             };
                             if is_infinite_loop {
@@ -956,6 +954,7 @@ impl<'a> FuncLifting<'a> {
                         }
 
                         NodeKind::ExitInvocation { .. }
+                        | DataInstKind::Scalar(_)
                         | DataInstKind::FuncCall(_)
                         | DataInstKind::Mem(_)
                         | DataInstKind::QPtr(_)
@@ -1276,6 +1275,7 @@ impl LazyInst<'_, '_> {
 
                             ConstKind::Undef
                             | ConstKind::PtrToFunc(_)
+                            | ConstKind::Scalar(_)
                             | ConstKind::SpvInst { .. } => (ct_def.attrs, None),
 
                             // Not inserted into `globals` while visiting.
@@ -1351,27 +1351,45 @@ impl LazyInst<'_, '_> {
         let (result_id, attrs, _) = self.result_id_attrs_and_import(module, ids);
         let inst = match self {
             Self::Global(global) => match global {
-                Global::Type(ty) => match &cx[ty].kind {
-                    TypeKind::SpvInst { spv_inst, type_and_const_inputs } => spv::InstWithIds {
-                        without_ids: spv_inst.clone(),
-                        result_type_id: None,
-                        result_id,
-                        ids: type_and_const_inputs
-                            .iter()
-                            .map(|&ty_or_ct| {
-                                ids.globals[&match ty_or_ct {
-                                    TypeOrConst::Type(ty) => Global::Type(ty),
-                                    TypeOrConst::Const(ct) => Global::Const(ct),
-                                }]
-                            })
-                            .collect(),
-                    },
+                Global::Type(ty) => {
+                    let ty_def = &cx[ty];
+                    match spv::Inst::from_canonical_type(&ty_def.kind).ok_or(&ty_def.kind) {
+                        Ok(spv_inst) => spv::InstWithIds {
+                            without_ids: spv_inst,
+                            result_type_id: None,
+                            result_id,
+                            ids: [].into_iter().collect(),
+                        },
 
-                    // Not inserted into `globals` while visiting.
-                    TypeKind::QPtr | TypeKind::Thunk | TypeKind::SpvStringLiteralForExtInst => {
-                        unreachable!()
+                        Err(TypeKind::Scalar(_)) => {
+                            unreachable!("should've been handled as canonical")
+                        }
+
+                        Err(TypeKind::SpvInst { spv_inst, type_and_const_inputs }) => {
+                            spv::InstWithIds {
+                                without_ids: spv_inst.clone(),
+                                result_type_id: None,
+                                result_id,
+                                ids: type_and_const_inputs
+                                    .iter()
+                                    .map(|&ty_or_ct| {
+                                        ids.globals[&match ty_or_ct {
+                                            TypeOrConst::Type(ty) => Global::Type(ty),
+                                            TypeOrConst::Const(ct) => Global::Const(ct),
+                                        }]
+                                    })
+                                    .collect(),
+                            }
+                        }
+
+                        // Not inserted into `globals` while visiting.
+                        Err(
+                            TypeKind::QPtr | TypeKind::Thunk | TypeKind::SpvStringLiteralForExtInst,
+                        ) => {
+                            unreachable!()
+                        }
                     }
-                },
+                }
                 Global::Const(ct) => {
                     let ct_def = &cx[ct];
                     match spv::Inst::from_canonical_const(&ct_def.kind).ok_or(&ct_def.kind) {
@@ -1382,7 +1400,7 @@ impl LazyInst<'_, '_> {
                             ids: [].into_iter().collect(),
                         },
 
-                        Err(ConstKind::Undef) => {
+                        Err(ConstKind::Undef | ConstKind::Scalar(_)) => {
                             unreachable!("should've been handled as canonical")
                         }
 
@@ -1496,29 +1514,43 @@ impl LazyInst<'_, '_> {
                     .collect(),
             },
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
-                let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
-                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
-                        unreachable!()
-                    }
+                let kind = &data_inst_def.kind;
+                let (inst, extra_initial_id_operand) =
+                    match spv::Inst::from_canonical_node_kind(kind).ok_or(kind) {
+                        Ok(spv_inst) => (spv_inst, None),
 
-                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) | DataInstKind::ThunkBind(_) => {
-                        // Disallowed while visiting.
-                        unreachable!()
-                    }
+                        Err(
+                            NodeKind::Select(_)
+                            | NodeKind::Loop { .. }
+                            | NodeKind::ExitInvocation(_),
+                        ) => unreachable!(),
 
-                    &DataInstKind::FuncCall(callee) => {
-                        (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
-                    }
-                    DataInstKind::SpvInst(inst) => (inst.clone(), None),
-                    &DataInstKind::SpvExtInst { ext_set, inst } => (
-                        spv::Inst {
-                            opcode: wk.OpExtInst,
-                            imms: iter::once(spv::Imm::Short(wk.LiteralExtInstInteger, inst))
-                                .collect(),
-                        },
-                        Some(ids.ext_inst_imports[&cx[ext_set]]),
-                    ),
-                };
+                        Err(DataInstKind::Scalar(_)) => {
+                            unreachable!("should've been handled as canonical")
+                        }
+
+                        Err(
+                            DataInstKind::Mem(_)
+                            | DataInstKind::QPtr(_)
+                            | DataInstKind::ThunkBind(_),
+                        ) => {
+                            // Disallowed while visiting.
+                            unreachable!()
+                        }
+
+                        Err(&DataInstKind::FuncCall(callee)) => {
+                            (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
+                        }
+                        Err(DataInstKind::SpvInst(inst)) => (inst.clone(), None),
+                        Err(&DataInstKind::SpvExtInst { ext_set, inst }) => (
+                            spv::Inst {
+                                opcode: wk.OpExtInst,
+                                imms: iter::once(spv::Imm::Short(wk.LiteralExtInstInteger, inst))
+                                    .collect(),
+                            },
+                            Some(ids.ext_inst_imports[&cx[ext_set]]),
+                        ),
+                    };
                 spv::InstWithIds {
                     without_ids: inst,
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
@@ -1553,6 +1585,14 @@ impl LazyInst<'_, '_> {
                 ids: [merge_label_id, continue_label_id].into_iter().collect(),
             },
             Self::Terminator { parent_func, terminator } => {
+                let mut ids: SmallVec<[_; 4]> = terminator
+                    .inputs
+                    .iter()
+                    .map(|&v| value_to_id(parent_func, v))
+                    .chain(terminator.targets.iter().map(|&target| parent_func.label_ids[&target]))
+                    .collect();
+
+                // FIXME(eddyb) move some of this to `spv::canonical`.
                 let inst = match terminator.kind {
                     TerminatorKind::Unreachable => wk.OpUnreachable.into(),
                     TerminatorKind::Return => {
@@ -1562,28 +1602,30 @@ impl LazyInst<'_, '_> {
                             wk.OpReturnValue.into()
                         }
                     }
-                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst))
-                    | TerminatorKind::SelectBranch(SelectionKind::SpvInst(inst)) => inst.clone(),
+                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst)) => {
+                        inst.clone()
+                    }
 
                     TerminatorKind::Branch => wk.OpBranch.into(),
 
                     TerminatorKind::SelectBranch(SelectionKind::BoolCond) => {
                         wk.OpBranchConditional.into()
                     }
+                    TerminatorKind::SelectBranch(SelectionKind::Switch { case_consts }) => {
+                        // HACK(eddyb) move the default case from last back to first.
+                        let default_target = ids.pop().unwrap();
+                        ids.insert(1, default_target);
+
+                        spv::Inst {
+                            opcode: wk.OpSwitch,
+                            imms: case_consts
+                                .iter()
+                                .flat_map(|ct| ct.encode_as_spv_imms())
+                                .collect(),
+                        }
+                    }
                 };
-                spv::InstWithIds {
-                    without_ids: inst,
-                    result_type_id: None,
-                    result_id: None,
-                    ids: terminator
-                        .inputs
-                        .iter()
-                        .map(|&v| value_to_id(parent_func, v))
-                        .chain(
-                            terminator.targets.iter().map(|&target| parent_func.label_ids[&target]),
-                        )
-                        .collect(),
-                }
+                spv::InstWithIds { without_ids: inst, result_type_id: None, result_id: None, ids }
             }
             Self::OpFunctionEnd => spv::InstWithIds {
                 without_ids: wk.OpFunctionEnd.into(),
