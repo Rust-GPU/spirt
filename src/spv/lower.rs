@@ -769,7 +769,7 @@ impl Module {
                 let ptr_to_global_var = cx.intern(ConstDef {
                     attrs: AttrSet::default(),
                     ty: type_of_ptr_to_global_var,
-                    kind: ConstKind::PtrToGlobalVar(global_var),
+                    kind: ConstKind::PtrToGlobalVar { global_var, offset: None },
                 });
                 id_defs.insert(global_var_id, IdDef::Const(ptr_to_global_var));
 
@@ -2016,7 +2016,9 @@ impl Module {
                 Export::Linkage { name, target_id } => {
                     let exportee = match id_defs.get(&target_id) {
                         Some(id_def @ &IdDef::Const(ct)) => match cx[ct].kind {
-                            ConstKind::PtrToGlobalVar(gv) => Ok(Exportee::GlobalVar(gv)),
+                            ConstKind::PtrToGlobalVar { global_var, offset: None } => {
+                                Ok(Exportee::GlobalVar(global_var))
+                            }
                             _ => Err(id_def.descr(&cx)),
                         },
                         Some(&IdDef::Func(func)) => Ok(Exportee::Func(func)),
@@ -2045,7 +2047,9 @@ impl Module {
                         .into_iter()
                         .map(|id| match id_defs.get(&id) {
                             Some(id_def @ &IdDef::Const(ct)) => match cx[ct].kind {
-                                ConstKind::PtrToGlobalVar(gv) => Ok(gv),
+                                ConstKind::PtrToGlobalVar { global_var, offset: None } => {
+                                    Ok(global_var)
+                                }
                                 _ => Err(id_def.descr(&cx)),
                             },
                             Some(id_def) => Err(id_def.descr(&cx)),

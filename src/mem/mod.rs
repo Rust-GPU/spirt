@@ -12,7 +12,7 @@
 
 use crate::{OrdAssertEq, Type};
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroI32, NonZeroU32};
 use std::rc::Rc;
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
@@ -29,6 +29,9 @@ pub use layout::LayoutConfig;
 pub enum MemAttr {
     /// When applied to a `GlobalVar` or `FuncLocalVar`, this tracks all possible
     /// access patterns its memory may be subjected to (see [`MemAccesses`]).
+    //
+    // FIXME(eddyb) either document that `qptr` offsetting ops also get this
+    // attribute applied to them, or undo that change entirely.
     Accesses(OrdAssertEq<MemAccesses>),
 }
 
@@ -137,15 +140,25 @@ pub enum MemOp {
     // a `SpvInst` - once fn-local variables are lowered, this should go there.
     FuncLocalVar(shapes::MemLayout),
 
-    /// Read a single value from a pointer (`inputs[0]`).
+    /// Read a single value from a pointer (`inputs[0]`) at `offset`.
     //
     // FIXME(eddyb) limit this to data - and scalars, maybe vectors at most.
-    Load,
+    Load {
+        // FIXME(eddyb) make this an `enum`, with another variant encoding some
+        // GEP-like (aka SPIR-V `OpAccessChain`) "field path", and/or even one
+        // (or more) stride(s) to allow direct array indexing at access time.
+        offset: Option<NonZeroI32>,
+    },
 
-    /// Write a single value (`inputs[1]`) to a pointer (`inputs[0]`).
+    /// Write a single value (`inputs[1]`) to a pointer (`inputs[0]`) at `offset`.
     //
     // FIXME(eddyb) limit this to data - and scalars, maybe vectors at most.
-    Store,
+    Store {
+        // FIXME(eddyb) make this an `enum`, with another variant encoding some
+        // GEP-like (aka SPIR-V `OpAccessChain`) "field path", and/or even one
+        // (or more) stride(s) to allow direct array indexing at access time.
+        offset: Option<NonZeroI32>,
+    },
     //
     // FIXME(eddyb) implement more ops (e.g. copies, atomics).
 }

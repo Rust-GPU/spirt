@@ -176,6 +176,7 @@ pub mod vector;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 
 // HACK(eddyb) work around the lack of `FxIndex{Map,Set}` type aliases elsewhere.
@@ -669,7 +670,16 @@ pub enum ConstKind {
     // there's still the need to rename "global variable" post-`Var`-refactor,
     // and last but not least, `PtrToFunc` needs `SPV_INTEL_function_pointers`,
     // an OpenCL-only extension Intel came up with for their own SPIR-V tooling.
-    PtrToGlobalVar(GlobalVar),
+    PtrToGlobalVar {
+        global_var: GlobalVar,
+
+        // FIXME(eddyb) try using this feature in more places.
+        // FIXME(eddyb) make this an `enum`, with another variant encoding some
+        // GEP-like (aka SPIR-V `OpAccessChain`) "field path".
+        // FIXME(eddyb) consider some kind of "capability slicing" replacement,
+        // which could limit the usable range of the resulting pointer.
+        offset: Option<NonZeroU32>,
+    },
     PtrToFunc(Func),
 
     // HACK(eddyb) this is a fallback case that should become increasingly rare
