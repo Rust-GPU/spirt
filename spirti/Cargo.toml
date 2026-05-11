@@ -1,0 +1,22 @@
+[package]
+name = "spirti"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+spirt = { path = ".." }
+
+# FIXME(eddyb) deduplicate these by the workspace inheritance feature.
+arrayvec = "0.7.1"
+derive_more = "0.99.17"
+indexmap = "2.0.0"
+itertools = "0.10.3"
+lazy_static = "1.4.0"
+rustc-hash = "1.1.0"
+smallvec = { version = "1.7.0", features = ["serde", "union"] }
+
+image = "0.25"
+rayon = { version = "1", optional = true }
+
+[features]
+default = ["rayon"]
