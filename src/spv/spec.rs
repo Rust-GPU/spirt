@@ -131,7 +131,11 @@ def_well_known! {
 
         // FIXME(eddyb) hide these from code, lowering should handle most cases.
         OpConstantComposite,
+        OpSpecConstantComposite,
         OpConstantFunctionPointerINTEL,
+
+        // FIXME(eddyb) this is only exposed here for `qptr`.
+        OpSpecConstantOp,
 
         OpVariable,
 
@@ -152,9 +156,11 @@ def_well_known! {
         OpSwitch,
 
         OpFunctionCall,
+        OpFunctionPointerCallINTEL,
 
         OpLoad,
         OpStore,
+        OpCopyMemory,
         OpArrayLength,
         OpAccessChain,
         OpInBoundsAccessChain,

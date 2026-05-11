@@ -1,14 +1,14 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lifting (e.g. to SPIR-V).
 
 use crate::func_at::{FuncAt, FuncAtMut};
-use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, const_data, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
-    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, Module, Node, NodeKind, Region, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv,
+    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, GlobalVarInit, Module, Node, NodeKind, Region,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, scalar, spv, vector,
 };
 use itertools::Either;
 use smallvec::SmallVec;
@@ -41,20 +41,232 @@ impl<'a> LiftToSpvPtrs<'a> {
     }
 
     pub fn lift_global_var(&self, global_var_decl: &mut GlobalVarDecl) {
-        match self.spv_ptr_type_and_addr_space_for_global_var(global_var_decl) {
-            Ok((spv_ptr_type, addr_space)) => {
+        // HACK(eddyb) only change any fields of `global_var_decl` on success.
+        let lift_result = self
+            .spv_pointee_type_and_addr_space_for_global_var(global_var_decl)
+            .and_then(|(spv_pointee_type, addr_space)| {
+                let maybe_init = match &mut global_var_decl.def {
+                    DeclDef::Imported(_) => None,
+                    DeclDef::Present(global_var_def_body) => {
+                        global_var_def_body.initializer.as_mut()
+                    }
+                };
+
+                let maybe_init_and_lifted_init = maybe_init
+                    .map(|init| {
+                        let lifted_init = self.try_lift_global_var_init(init, spv_pointee_type)?;
+                        Ok((init, lifted_init))
+                    })
+                    .transpose()?;
+
                 global_var_decl.attrs = self.strip_mem_accesses_attr(global_var_decl.attrs);
-                global_var_decl.type_of_ptr_to = spv_ptr_type;
+                global_var_decl.type_of_ptr_to = self.spv_ptr_type(addr_space, spv_pointee_type);
                 global_var_decl.addr_space = addr_space;
                 global_var_decl.shape = None;
-            }
+
+                if let Some((init, lifted_init)) = maybe_init_and_lifted_init {
+                    *init = lifted_init;
+                }
+
+                Ok(())
+            });
+        match lift_result {
+            Ok(()) => {}
             Err(LiftError(e)) => {
                 global_var_decl.attrs.push_diag(&self.cx, e);
             }
         }
-        // FIXME(eddyb) if globals have initializers pointing at other globals,
-        // here is where they might get fixed up, but that usage is illegal so
-        // likely needs to get legalized on `qptr`s, before here.
+    }
+    fn try_lift_global_var_init(
+        &self,
+        global_var_init: &GlobalVarInit,
+        ty: Type,
+    ) -> Result<GlobalVarInit, LiftError> {
+        let data = match global_var_init {
+            &GlobalVarInit::Direct(ct) => return Ok(GlobalVarInit::Direct(ct)),
+
+            // FIXME(eddyb) there is no need for this to clone, but also this
+            // should be rare (only an error case?).
+            GlobalVarInit::SpvAggregate { .. } => {
+                return Ok(global_var_init.clone());
+            }
+
+            GlobalVarInit::Data(data) => data,
+        };
+        let layout = match self.layout_of(ty)? {
+            // FIXME(eddyb) consider bad interactions with "interface blocks"?
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => {
+                return Err(LiftError(Diag::bug(["handles should not have initializers".into()])));
+            }
+            TypeLayout::Concrete(layout) => layout,
+        };
+
+        // Whether `candidate_layout` is an aggregate (to recurse into).
+        let is_aggregate = |candidate_layout: &MemTypeLayout| {
+            matches!(
+                &self.cx[candidate_layout.original_type].kind,
+                TypeKind::SpvInst { value_lowering: spv::ValueLowering::Disaggregate(_), .. }
+            )
+        };
+
+        let mut leaf_values = SmallVec::new();
+        let result = layout.deeply_flatten_if(0, &is_aggregate, &mut |leaf_offset, leaf| {
+            let leaf_offset = u32::try_from(leaf_offset).ok().ok_or_else(|| {
+                LayoutError(Diag::bug(
+                    [format!("negative layout leaf offset {leaf_offset}").into()],
+                ))
+            })?;
+
+            let leaf_size = NonZeroU32::new(leaf.mem_layout.fixed_base.size).ok_or_else(|| {
+                LayoutError(Diag::bug([
+                    format!("zero-sized initializer leaf at offset {leaf_offset}, with type `")
+                        .into(),
+                    leaf.original_type.into(),
+                    "`".into(),
+                ]))
+            })?;
+
+            // FIXME(eddyb) avoid out-of-bounds panics with malformed layouts
+            // (and/or guarantee certain invariants in layouts that didn't error).
+            let mut leaf_parts = data.read(leaf_offset..(leaf_offset + leaf_size.get()));
+
+            let leaf_part = leaf_parts.next().unwrap();
+            let is_single_whole_part = leaf_parts.next().is_none()
+                && match &leaf_part {
+                    const_data::Part::Uninit { .. } | const_data::Part::Bytes(_) => true,
+                    const_data::Part::Symbolic { size, maybe_partial_slice, value: _ } => {
+                        maybe_partial_slice == &(0..size.get())
+                    }
+                };
+            if !is_single_whole_part {
+                // FIXME(eddyb) needs a better error (or even partial support?).
+                return Err(LayoutError(Diag::bug([
+                    format!("NYI: initializer leaf at offset {leaf_offset}, with type `").into(),
+                    leaf.original_type.into(),
+                    "`, straddles an undef and/or symbolic boundary".into(),
+                ])));
+            }
+
+            let leaf_value = match leaf_part {
+                const_data::Part::Uninit { .. } => self.cx.intern(ConstDef {
+                    attrs: Default::default(),
+                    ty: leaf.original_type,
+                    kind: ConstKind::Undef,
+                }),
+                const_data::Part::Bytes(bytes) => {
+                    let mut total_read_scalar_size = 0;
+                    let mut read_next_scalar = |leaf_scalar_type: scalar::Type| {
+                        let byte_len = match leaf_scalar_type {
+                            scalar::Type::Bool => {
+                                self.layout_cache.config.abstract_bool_size_align.0
+                            }
+                            scalar::Type::SInt(_)
+                            | scalar::Type::UInt(_)
+                            | scalar::Type::Float(_) => {
+                                let bit_width = leaf_scalar_type.bit_width();
+                                assert_eq!(bit_width % 8, 0);
+                                bit_width / 8
+                            }
+                        } as usize;
+
+                        let mut copied_bytes = [0; 16];
+                        copied_bytes[..byte_len]
+                            .copy_from_slice(&bytes[total_read_scalar_size..][..byte_len]);
+                        if self.layout_cache.config.is_big_endian {
+                            copied_bytes[..byte_len].reverse();
+                        }
+                        let bits = u128::from_le_bytes(copied_bytes);
+
+                        let leaf_scalar = scalar::Const::try_from_bits(leaf_scalar_type, bits)
+                            .ok_or_else(|| {
+                                // HACK(eddyb) only `bool` should be able to fail this,
+                                // everything else uses whole bytes (enforced above).
+                                assert!(matches!(leaf_scalar_type, scalar::Type::Bool));
+                                // FIXME(eddyb) needs a better error, esp. for `bool`.
+                                LayoutError(Diag::bug([
+                                    format!(
+                                        "initializer leaf at offset {}, with type `",
+                                        leaf_offset + (total_read_scalar_size as u32)
+                                    )
+                                    .into(),
+                                    leaf.original_type.into(),
+                                    format!("`, has invalid value {bits}").into(),
+                                ]))
+                            })?;
+
+                        total_read_scalar_size += byte_len;
+
+                        Ok(leaf_scalar)
+                    };
+
+                    let leaf_const_kind = match self.cx[leaf.original_type].kind {
+                        TypeKind::Scalar(ty) => read_next_scalar(ty)?.into(),
+                        TypeKind::Vector(ty) => {
+                            // HACK(eddyb) buffering elems due to `Result`.
+                            let elems: SmallVec<[_; 4]> = (0..ty.elem_count.get())
+                                .map(|_| read_next_scalar(ty.elem))
+                                .collect::<Result<_, _>>()?;
+                            vector::Const::from_elems(ty, elems).into()
+                        }
+                        _ => {
+                            return Err(LayoutError(Diag::bug([
+                                format!(
+                                    "NYI: initializer leaf at offset {leaf_offset}, with type `"
+                                )
+                                .into(),
+                                leaf.original_type.into(),
+                                format!("`, made of bytes ({bytes:?})").into(),
+                            ])));
+                        }
+                    };
+
+                    assert_eq!(total_read_scalar_size, bytes.len());
+
+                    self.cx.intern(ConstDef {
+                        attrs: Default::default(),
+                        ty: leaf.original_type,
+                        kind: leaf_const_kind,
+                    })
+                }
+                const_data::Part::Symbolic { value, .. } => value,
+            };
+
+            let expected_ty = leaf.original_type;
+            let found_ty = self.cx[leaf_value].ty;
+            if expected_ty != found_ty {
+                return Err(LayoutError(Diag::bug([
+                    "initializer leaf type mismatch: expected `".into(),
+                    expected_ty.into(),
+                    "`, found `".into(),
+                    found_ty.into(),
+                    "` typed value `".into(),
+                    leaf_value.into(),
+                    "`".into(),
+                ])));
+            }
+
+            leaf_values.push(leaf_value);
+
+            Ok(())
+        });
+        result.map_err(|LayoutError(e)| LiftError(e))?;
+
+        let expected_leaf_count = self.cx[layout.original_type].disaggregated_leaf_count();
+        let found_leaf_count = leaf_values.len();
+        if expected_leaf_count != found_leaf_count {
+            return Err(LiftError(Diag::bug([format!(
+                "initializer leaf count mismatch: expected {expected_leaf_count} leaves, \
+                 found {found_leaf_count} leaves"
+            )
+            .into()])));
+        }
+
+        Ok(if is_aggregate(&layout) {
+            GlobalVarInit::SpvAggregate { ty, leaves: leaf_values }
+        } else {
+            assert_eq!(leaf_values.len(), 1);
+            GlobalVarInit::Direct(leaf_values.pop().unwrap())
+        })
     }
 
     pub fn lift_all_funcs(&self, module: &mut Module, funcs: impl IntoIterator<Item = Func>) {
@@ -97,7 +309,7 @@ impl<'a> LiftToSpvPtrs<'a> {
         })
     }
 
-    fn spv_ptr_type_and_addr_space_for_global_var(
+    fn spv_pointee_type_and_addr_space_for_global_var(
         &self,
         global_var_decl: &GlobalVarDecl,
     ) -> Result<(Type, AddrSpace), LiftError> {
@@ -107,48 +319,25 @@ impl<'a> LiftToSpvPtrs<'a> {
 
         let shape =
             global_var_decl.shape.ok_or_else(|| LiftError(Diag::bug(["missing shape".into()])))?;
-        let (storage_class, pointee_type) = match (global_var_decl.addr_space, shape) {
-            (AddrSpace::Handles, shapes::GlobalVarShape::Handles { handle, fixed_count }) => {
-                let (storage_class, handle_type) = match handle {
-                    shapes::Handle::Opaque(ty) => {
-                        if self.pointee_type_for_accesses(mem_accesses)? != ty {
-                            return Err(LiftError(Diag::bug([
-                                "mismatched opaque handle types in `mem.accesses` vs `shape`"
-                                    .into(),
-                            ])));
-                        }
-                        (wk.UniformConstant, ty)
-                    }
-                    // FIXME(eddyb) validate accesses against `buf` and/or expand
-                    // the type to make sure it has the right size.
-                    shapes::Handle::Buffer(AddrSpace::SpvStorageClass(storage_class), _buf) => {
-                        (storage_class, self.pointee_type_for_accesses(mem_accesses)?)
+        let pointee_type = self.pointee_type_for_shape_and_accesses(shape, mem_accesses)?;
+        let storage_class = match (global_var_decl.addr_space, shape) {
+            (AddrSpace::Handles, shapes::GlobalVarShape::Handles { handle, fixed_count: _ }) => {
+                match handle {
+                    shapes::Handle::Opaque(_) => wk.UniformConstant,
+                    shapes::Handle::Buffer(AddrSpace::SpvStorageClass(storage_class), _) => {
+                        storage_class
                     }
                     shapes::Handle::Buffer(AddrSpace::Handles, _) => {
                         return Err(LiftError(Diag::bug([
                             "invalid `AddrSpace::Handles` in `Handle::Buffer`".into(),
                         ])));
                     }
-                };
-                (
-                    storage_class,
-                    if fixed_count == Some(NonZeroU32::new(1).unwrap()) {
-                        handle_type
-                    } else {
-                        self.spv_op_type_array(handle_type, fixed_count.map(|c| c.get()), None)?
-                    },
-                )
+                }
             }
-            // FIXME(eddyb) validate accesses against `layout` and/or expand
-            // the type to make sure it has the right size.
             (
                 AddrSpace::SpvStorageClass(storage_class),
-                shapes::GlobalVarShape::UntypedData(_layout),
-            ) => (storage_class, self.pointee_type_for_accesses(mem_accesses)?),
-            (
-                AddrSpace::SpvStorageClass(storage_class),
-                shapes::GlobalVarShape::TypedInterface(ty),
-            ) => (storage_class, ty),
+                shapes::GlobalVarShape::UntypedData(_) | shapes::GlobalVarShape::TypedInterface(_),
+            ) => storage_class,
 
             (
                 AddrSpace::Handles,
@@ -159,7 +348,7 @@ impl<'a> LiftToSpvPtrs<'a> {
             }
         };
         let addr_space = AddrSpace::SpvStorageClass(storage_class);
-        Ok((self.spv_ptr_type(addr_space, pointee_type), addr_space))
+        Ok((pointee_type, addr_space))
     }
 
     /// Returns `Some` iff `ty` is a SPIR-V `OpTypePointer`.
@@ -167,7 +356,7 @@ impl<'a> LiftToSpvPtrs<'a> {
     // FIXME(eddyb) deduplicate with `qptr::lower`.
     fn as_spv_ptr_type(&self, ty: Type) -> Option<(AddrSpace, Type)> {
         match &self.cx[ty].kind {
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                 if spv_inst.opcode == self.wk.OpTypePointer =>
             {
                 let sc = match spv_inst.imms[..] {
@@ -191,60 +380,130 @@ impl<'a> LiftToSpvPtrs<'a> {
             AddrSpace::Handles => unreachable!(),
             AddrSpace::SpvStorageClass(storage_class) => storage_class,
         };
-        self.cx.intern(TypeKind::SpvInst {
-            spv_inst: spv::Inst {
+        self.cx.intern(
+            spv::Inst {
                 opcode: wk.OpTypePointer,
                 imms: [spv::Imm::Short(wk.StorageClass, storage_class)].into_iter().collect(),
-            },
-            type_and_const_inputs: [TypeOrConst::Type(pointee_type)].into_iter().collect(),
-        })
+            }
+            .into_canonical_type_with(
+                &self.cx,
+                [TypeOrConst::Type(pointee_type)].into_iter().collect(),
+            ),
+        )
     }
 
-    fn pointee_type_for_accesses(&self, accesses: &MemAccesses) -> Result<Type, LiftError> {
+    fn pointee_type_for_shape_and_accesses(
+        &self,
+        shape: shapes::GlobalVarShape,
+        accesses: &MemAccesses,
+    ) -> Result<Type, LiftError> {
         let wk = self.wk;
 
-        match accesses {
-            &MemAccesses::Handles(shapes::Handle::Opaque(ty)) => Ok(ty),
-            MemAccesses::Handles(shapes::Handle::Buffer(_, data_happ)) => {
-                let attr_spv_decorate_block = Attr::SpvAnnotation(spv::Inst {
-                    opcode: wk.OpDecorate,
-                    imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
-                });
-                match &data_happ.kind {
-                    DataHappKind::Dead => self.spv_op_type_struct([], [attr_spv_decorate_block]),
-                    DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
-                        fields.iter().map(|(&field_offset, field_happ)| {
-                            Ok((field_offset, self.pointee_type_for_data_happ(field_happ)?))
-                        }),
-                        [attr_spv_decorate_block],
-                    ),
-                    DataHappKind::StrictlyTyped(_)
-                    | DataHappKind::Direct(_)
-                    | DataHappKind::Repeated { .. } => self.spv_op_type_struct(
-                        [Ok((0, self.pointee_type_for_data_happ(data_happ)?))],
-                        [attr_spv_decorate_block],
-                    ),
+        match (shape, accesses) {
+            (
+                shapes::GlobalVarShape::Handles { handle, fixed_count },
+                MemAccesses::Handles(handle_accesses),
+            ) => {
+                let handle_type = match (handle, handle_accesses) {
+                    (shapes::Handle::Opaque(ty), &shapes::Handle::Opaque(access_ty)) => {
+                        if access_ty != ty {
+                            return Err(LiftError(Diag::bug([
+                                "mismatched opaque handle types in `mem.accesses` vs `shape`"
+                                    .into(),
+                            ])));
+                        }
+                        ty
+                    }
+                    (shapes::Handle::Buffer(_, buf), shapes::Handle::Buffer(_, data_happ)) => {
+                        let max_size_allowed_by_shape =
+                            buf.dyn_unit_stride.is_none().then_some(buf.fixed_base.size);
+                        let attr_spv_decorate_block = Attr::SpvAnnotation(spv::Inst {
+                            opcode: wk.OpDecorate,
+                            imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
+                        });
+                        match &data_happ.kind {
+                            DataHappKind::Dead => {
+                                self.spv_op_type_struct([], [attr_spv_decorate_block])?
+                            }
+                            DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
+                                fields.iter().map(|(&field_offset, field_happ)| {
+                                    Ok((
+                                        field_offset,
+                                        self.pointee_type_for_data_happ(
+                                            field_happ,
+                                            max_size_allowed_by_shape
+                                                .and_then(|max| max.checked_sub(field_offset)),
+                                        )?,
+                                    ))
+                                }),
+                                [attr_spv_decorate_block],
+                            )?,
+                            DataHappKind::StrictlyTyped(_)
+                            | DataHappKind::Direct(_)
+                            | DataHappKind::Repeated { .. } => self.spv_op_type_struct(
+                                [Ok((
+                                    0,
+                                    self.pointee_type_for_data_happ(
+                                        data_happ,
+                                        max_size_allowed_by_shape,
+                                    )?,
+                                ))],
+                                [attr_spv_decorate_block],
+                            )?,
+                        }
+                    }
+                    _ => {
+                        return Err(LiftError(Diag::bug([
+                            "mismatched `mem.accesses` and `shape`".into(),
+                        ])));
+                    }
+                };
+                if fixed_count == Some(NonZeroU32::new(1).unwrap()) {
+                    Ok(handle_type)
+                } else {
+                    self.spv_op_type_array(handle_type, fixed_count.map(|c| c.get()), None)
                 }
             }
-            MemAccesses::Data(happ) => self.pointee_type_for_data_happ(happ),
+            (shapes::GlobalVarShape::UntypedData(layout), MemAccesses::Data(happ)) => {
+                self.pointee_type_for_data_happ(happ, Some(layout.size))
+            }
+
+            // FIXME(eddyb) validate against accesses? (maybe in `mem::analyze`?)
+            (shapes::GlobalVarShape::TypedInterface(ty), _) => Ok(ty),
+
+            _ => Err(LiftError(Diag::bug(["mismatched `mem.accesses` and `shape`".into()]))),
         }
     }
 
-    fn pointee_type_for_data_happ(&self, happ: &DataHapp) -> Result<Type, LiftError> {
+    fn pointee_type_for_data_happ(
+        &self,
+        happ: &DataHapp,
+        // HACK(eddyb) `mem::analyze` should be merging shape and accesses itself.
+        // FIXME(eddyb) this isn't actually used to validate anything, only as
+        // a fallback for now (i.e. to avoid spurious `OpTypeRuntimeArray`s).
+        max_size_allowed_by_shape: Option<u32>,
+    ) -> Result<Type, LiftError> {
         match &happ.kind {
             DataHappKind::Dead => self.spv_op_type_struct([], []),
             &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => Ok(ty),
             DataHappKind::Disjoint(fields) => self.spv_op_type_struct(
                 fields.iter().map(|(&field_offset, field_happ)| {
-                    Ok((field_offset, self.pointee_type_for_data_happ(field_happ)?))
+                    Ok((
+                        field_offset,
+                        self.pointee_type_for_data_happ(
+                            field_happ,
+                            max_size_allowed_by_shape.and_then(|max| max.checked_sub(field_offset)),
+                        )?,
+                    ))
                 }),
                 [],
             ),
             DataHappKind::Repeated { element, stride } => {
-                let element_type = self.pointee_type_for_data_happ(element)?;
+                let element_type = self.pointee_type_for_data_happ(element, None)?;
 
                 let fixed_len = happ
                     .max_size
+                    .or(max_size_allowed_by_shape)
                     .map(|size| {
                         if !size.is_multiple_of(stride.get()) {
                             return Err(LiftError(Diag::bug([format!(
@@ -288,15 +547,18 @@ impl<'a> LiftToSpvPtrs<'a> {
 
         Ok(self.cx.intern(TypeDef {
             attrs: stride_attrs.unwrap_or_default(),
-            kind: TypeKind::SpvInst {
-                spv_inst: spv_opcode.into(),
-                type_and_const_inputs: [TypeOrConst::Type(element_type)]
-                    .into_iter()
-                    .chain(fixed_len.map(|len| {
+            kind: spv::Inst::from(spv_opcode).into_canonical_type_with(
+                &self.cx,
+                [
+                    Some(TypeOrConst::Type(element_type)),
+                    fixed_len.map(|len| {
                         TypeOrConst::Const(self.cx.intern(scalar::Const::from_u32(len)))
-                    }))
-                    .collect(),
-            },
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
         }))
     }
 
@@ -328,7 +590,8 @@ impl<'a> LiftToSpvPtrs<'a> {
         attrs.attrs.extend(extra_attrs);
         Ok(self.cx.intern(TypeDef {
             attrs: self.cx.intern(attrs),
-            kind: TypeKind::SpvInst { spv_inst: wk.OpTypeStruct.into(), type_and_const_inputs },
+            kind: spv::Inst::from(wk.OpTypeStruct)
+                .into_canonical_type_with(&self.cx, type_and_const_inputs),
         }))
     }
 
@@ -456,19 +719,25 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
 
-            DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
+            &DataInstKind::Mem(MemOp::FuncLocalVar(mem_layout)) => {
                 let output_mem_accesses = self
                     .lifter
                     .require_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)?;
 
-                // FIXME(eddyb) validate against `mem_layout`!
-                let pointee_type = self.lifter.pointee_type_for_accesses(output_mem_accesses)?;
+                // HACK(eddyb) reusing the same functionality meant for globals.
+                let pointee_type = self.lifter.pointee_type_for_shape_and_accesses(
+                    shapes::GlobalVarShape::UntypedData(mem_layout),
+                    output_mem_accesses,
+                )?;
 
                 let mut data_inst_def = data_inst_def.clone();
-                data_inst_def.kind = DataInstKind::SpvInst(spv::Inst {
-                    opcode: wk.OpVariable,
-                    imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
-                });
+                data_inst_def.kind = DataInstKind::SpvInst(
+                    spv::Inst {
+                        opcode: wk.OpVariable,
+                        imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
+                    },
+                    spv::InstLowering::default(),
+                );
                 let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
                 output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
                 output_decl.ty =
@@ -496,7 +765,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 let mut data_inst_def = data_inst_def.clone();
-                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
                 let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
                 output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
                 output_decl.ty = self.lifter.spv_ptr_type(addr_space, handle_type);
@@ -565,10 +835,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 DataInstDef {
-                    kind: DataInstKind::SpvInst(spv::Inst {
-                        opcode: wk.OpArrayLength,
-                        imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)].into_iter().collect(),
-                    }),
+                    kind: DataInstKind::SpvInst(
+                        spv::Inst {
+                            opcode: wk.OpArrayLength,
+                            imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)]
+                                .into_iter()
+                                .collect(),
+                        },
+                        spv::InstLowering::default(),
+                    ),
                     ..data_inst_def.clone()
                 }
             }
@@ -688,7 +963,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 let mut data_inst_def = data_inst_def;
-                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
                 data_inst_def.inputs = [array_ptr, array_index].into_iter().collect();
                 let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
                 output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
@@ -772,7 +1048,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
 
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                let lowering_disaggregated_output = lowering.disaggregated_output;
+
                 let mut changed_data_inst_def = None;
 
                 for attr in &cx[data_inst_def.attrs].attrs {
@@ -844,6 +1122,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             data_inst_def.inputs[input_idx] = adjusted_ptr;
                         }
                         QPtrAttr::FromSpvPtrOutput { addr_space, pointee } => {
+                            assert!(lowering_disaggregated_output.is_none());
+
+                            assert_eq!(data_inst_def.outputs.len(), 1);
                             let output_decl =
                                 func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
                             output_decl.ty = self.lifter.spv_ptr_type(addr_space.0, pointee.0);
@@ -893,7 +1174,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     func.reborrow(),
                     DataInstDef {
                         attrs: Default::default(),
-                        kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
+                        kind: DataInstKind::SpvInst(
+                            wk.OpAccessChain.into(),
+                            spv::InstLowering::default(),
+                        ),
                         inputs: access_chain_inputs,
                         child_regions: [].into_iter().collect(),
                         outputs: [].into_iter().collect(),

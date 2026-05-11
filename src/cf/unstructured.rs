@@ -61,7 +61,8 @@ pub struct ControlFlowGraph {
 pub enum ControlTarget {
     Region(Region),
 
-    /// Leave the current function (returning `target_inputs`, if any).
+    /// Leave the current function, returning some number of [`Value`]s, as per
+    /// the function's signature (`ret_types` in [`FuncDecl`](crate::FuncDecl)).
     //
     // FIXME(eddyb) now that this is used through `NodeKind::ThunkBind`,
     // it should probably be more like `break` or some kind of "leave scope".
