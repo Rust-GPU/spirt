@@ -200,6 +200,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             Attr::Diagnostics(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
+            | Attr::SpvExecutionModeIds(_)
             | Attr::SpvBitflagsOperand(_) => {}
             Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc { file_path, .. })) => {
                 self.debug_strings.insert(&self.cx[file_path]);
@@ -1506,6 +1507,25 @@ impl Module {
                     | Attr::Diagnostics(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
+                    Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
+                        let target_id =
+                            result_id.expect("an execution mode must have a target function");
+                        for (inst, inputs) in modes {
+                            let input_ids = inputs.iter().map(|&input| {
+                                let global = match input {
+                                    TypeOrConst::Type(ty) => Global::Type(ty),
+                                    TypeOrConst::Const(ct) => Global::Const(ct),
+                                };
+                                ids.globals[&global]
+                            });
+                            execution_mode_insts.push(spv::InstWithIds {
+                                without_ids: inst.clone(),
+                                result_type_id: None,
+                                result_id: None,
+                                ids: iter::once(target_id).chain(input_ids).collect(),
+                            });
+                        }
+                    }
                     Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
                         let target_id = result_id.expect(
                             "FIXME: it shouldn't be possible to attach \

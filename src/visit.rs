@@ -234,6 +234,14 @@ impl InnerVisit for Attr {
         match self {
             Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {}
 
+            Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
+                for (_, inputs) in modes {
+                    for input in inputs {
+                        input.inner_visit_with(visitor);
+                    }
+                }
+            }
+
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path: _,
                 start_line_col: _,
@@ -313,6 +321,15 @@ impl InnerVisit for QPtrMemUsageKind {
     }
 }
 
+impl InnerVisit for TypeOrConst {
+    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
+        match *self {
+            Self::Type(ty) => visitor.visit_type_use(ty),
+            Self::Const(ct) => visitor.visit_const_use(ct),
+        }
+    }
+}
+
 impl InnerVisit for TypeDef {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         let Self { attrs, kind } = self;
@@ -322,11 +339,8 @@ impl InnerVisit for TypeDef {
             TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {}
 
             TypeKind::SpvInst { spv_inst: _, type_and_const_inputs } => {
-                for &ty_or_ct in type_and_const_inputs {
-                    match ty_or_ct {
-                        TypeOrConst::Type(ty) => visitor.visit_type_use(ty),
-                        TypeOrConst::Const(ct) => visitor.visit_const_use(ct),
-                    }
+                for input in type_and_const_inputs {
+                    input.inner_visit_with(visitor);
                 }
             }
         }

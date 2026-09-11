@@ -403,6 +403,14 @@ pub enum Attr {
 
     SpvAnnotation(spv::Inst),
 
+    /// This attribute stores `OpExecutionModeId` instructions for a function.
+    /// The function is the implicit first operand. The remaining ID operands
+    /// refer to types or constants.
+    ///
+    /// All modes share one attribute. This avoids ordering interned handles
+    /// when modes have the same literal operands.
+    SpvExecutionModeIds(OrdAssertEq<Vec<(spv::Inst, Vec<TypeOrConst>)>>),
+
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
     //
@@ -569,6 +577,8 @@ impl context::InternInCx<Type> for TypeKind {
 
 // HACK(eddyb) this is like `Either<Type, Const>`, only used in `TypeKind::SpvInst`,
 // and only because SPIR-V type definitions can references both types and consts.
+//
+// `Attr::SpvExecutionModeIds` also uses `TypeOrConst` for its type and constant operands.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum TypeOrConst {
     Type(Type),

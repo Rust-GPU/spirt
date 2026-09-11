@@ -320,6 +320,16 @@ impl InnerTransform for Attr {
                 Transformed::Unchanged
             }
 
+            Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
+                Transformed::map_iter(modes.iter(), |(inst, inputs)| {
+                    Transformed::map_iter(inputs.iter(), |input| {
+                        input.inner_transform_with(transformer)
+                    })
+                    .map(|inputs| (inst.clone(), inputs.collect()))
+                })
+                .map(|modes| Attr::SpvExecutionModeIds(OrdAssertEq(modes.collect())))
+            }
+
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path,
                 start_line_col,
@@ -424,6 +434,15 @@ impl InnerTransform for QPtrMemUsageKind {
     }
 }
 
+impl InnerTransform for TypeOrConst {
+    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
+        match *self {
+            Self::Type(ty) => transformer.transform_type_use(ty).map(Self::Type),
+            Self::Const(ct) => transformer.transform_const_use(ct).map(Self::Const),
+        }
+    }
+}
+
 impl InnerTransform for TypeDef {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         let Self { attrs, kind } = self;
@@ -435,15 +454,7 @@ impl InnerTransform for TypeDef {
 
                 TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
-                    |ty_or_ct| match *ty_or_ct {
-                        TypeOrConst::Type(ty) => transform!({
-                            ty -> transformer.transform_type_use(ty),
-                        } => TypeOrConst::Type(ty)),
-
-                        TypeOrConst::Const(ct) => transform!({
-                            ct -> transformer.transform_const_use(ct),
-                        } => TypeOrConst::Const(ct)),
-                    },
+                    |input| input.inner_transform_with(transformer),
                 ).map(|new_iter| TypeKind::SpvInst {
                     spv_inst: spv_inst.clone(),
                     type_and_const_inputs: new_iter.collect(),

@@ -6,8 +6,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, print,
+    Module, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -183,6 +183,7 @@ impl Module {
 
         let mut has_memory_model = false;
         let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
+        let mut pending_execution_modes = FxHashMap::<spv::Id, Vec<spv::InstWithIds>>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -255,6 +256,34 @@ impl Module {
 
             let mut attrs =
                 inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
+
+            // SPIR-V requires execution modes to appear before types and constants.
+            // Resolve their operand IDs at the target function, once those definitions are available.
+            if let Some(modes) = inst.result_id.and_then(|id| pending_execution_modes.remove(&id)) {
+                if opcode != wk.OpFunction {
+                    return Err(invalid("OpExecutionModeId target is not a function"));
+                }
+                let mut resolved_modes = Vec::with_capacity(modes.len());
+                for mode in modes {
+                    let inputs = mode.ids[1..]
+                        .iter()
+                        .map(|id| match id_defs.get(id) {
+                            Some(&IdDef::Type(ty)) => Ok(TypeOrConst::Type(ty)),
+                            Some(&IdDef::Const(ct))
+                                if !matches!(cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
+                            {
+                                Ok(TypeOrConst::Const(ct))
+                            }
+                            _ => Err(invalid(&format!(
+                                "OpExecutionModeId operand %{id} does not refer to \
+                                 a defined type or constant"
+                            ))),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    resolved_modes.push((mode.without_ids, inputs));
+                }
+                attrs.attrs.insert(Attr::SpvExecutionModeIds(OrdAssertEq(resolved_modes)));
+            }
 
             if let Some(dbg_src_loc) = current_dbg_src_loc {
                 attrs.set_dbg_src_loc(dbg_src_loc);
@@ -475,9 +504,14 @@ impl Module {
                 });
 
                 Seq::EntryPoint
+            } else if opcode == wk.OpExecutionModeId {
+                let &[target_id, ..] = &inst.ids[..] else {
+                    return Err(invalid("OpExecutionModeId has no target function"));
+                };
+                pending_execution_modes.entry(target_id).or_default().push(inst);
+                Seq::ExecutionMode
             } else if [
                 wk.OpExecutionMode,
-                wk.OpExecutionModeId, // FIXME(eddyb) not actually supported
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
@@ -526,7 +560,7 @@ impl Module {
                     }
                 };
 
-                if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(&opcode) {
+                if opcode == wk.OpExecutionMode {
                     Seq::ExecutionMode
                 } else if [wk.OpName, wk.OpMemberName].contains(&opcode) {
                     Seq::DebugName
@@ -817,6 +851,9 @@ impl Module {
             return Err(invalid("missing OpMemoryModel"));
         }
 
+        if !pending_execution_modes.is_empty() {
+            return Err(invalid("OpExecutionModeId refers to an undefined function"));
+        }
         if !pending_attrs.is_empty() {
             let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
             return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
