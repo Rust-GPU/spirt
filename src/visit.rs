@@ -234,6 +234,12 @@ impl InnerVisit for Attr {
         match self {
             Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {}
 
+            Attr::SpvAnnotationWithConstInputs { inst: _, const_inputs } => {
+                for &ct in &const_inputs.0 {
+                    visitor.visit_const_use(ct);
+                }
+            }
+
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path: _,
                 start_line_col: _,

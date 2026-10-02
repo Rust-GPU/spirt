@@ -183,6 +183,8 @@ impl Module {
 
         let mut has_memory_model = false;
         let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
+        // Execution modes precede the constants referenced by `OpExecutionModeId`.
+        let mut pending_execution_mode_ids = vec![];
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -477,7 +479,7 @@ impl Module {
                 Seq::EntryPoint
             } else if [
                 wk.OpExecutionMode,
-                wk.OpExecutionModeId, // FIXME(eddyb) not actually supported
+                wk.OpExecutionModeId,
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
@@ -491,40 +493,49 @@ impl Module {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
                 let target_id = inst.ids[0];
-                if inst.ids.len() > 1 {
-                    return Err(invalid("unsupported decoration with ID"));
-                }
+                if opcode == wk.OpExecutionModeId {
+                    pending_execution_mode_ids.push((
+                        target_id,
+                        inst.without_ids,
+                        inst.ids[1..].iter().copied().collect::<SmallVec<[spv::Id; 3]>>(),
+                    ));
+                } else {
+                    if inst.ids.len() > 1 {
+                        return Err(invalid("unsupported decoration with ID"));
+                    }
 
-                match inst.imms[..] {
-                    // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
-                    [
-                        decoration @ spv::Imm::Short(..),
-                        ref name @ ..,
-                        spv::Imm::Short(lt_kind, linkage_type),
-                    ] if opcode == wk.OpDecorate
-                        && decoration == spv::Imm::Short(wk.Decoration, wk.LinkageAttributes)
-                        && lt_kind == wk.LinkageType
-                        && [wk.Import, wk.Export].contains(&linkage_type) =>
-                    {
-                        let name = spv::extract_literal_string(name)
-                            .map_err(|e| invalid(&format!("{} in {:?}", e, e.as_bytes())))?;
-                        let name = cx.intern(name);
+                    match inst.imms[..] {
+                        // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
+                        [
+                            decoration @ spv::Imm::Short(..),
+                            ref name @ ..,
+                            spv::Imm::Short(lt_kind, linkage_type),
+                        ] if opcode == wk.OpDecorate
+                            && decoration
+                                == spv::Imm::Short(wk.Decoration, wk.LinkageAttributes)
+                            && lt_kind == wk.LinkageType
+                            && [wk.Import, wk.Export].contains(&linkage_type) =>
+                        {
+                            let name = spv::extract_literal_string(name)
+                                .map_err(|e| invalid(&format!("{} in {:?}", e, e.as_bytes())))?;
+                            let name = cx.intern(name);
 
-                        if linkage_type == wk.Import {
-                            pending_imports.insert(target_id, Import::LinkName(name));
-                        } else {
-                            pending_exports.push(Export::Linkage { name, target_id });
+                            if linkage_type == wk.Import {
+                                pending_imports.insert(target_id, Import::LinkName(name));
+                            } else {
+                                pending_exports.push(Export::Linkage { name, target_id });
+                            }
                         }
-                    }
 
-                    _ => {
-                        pending_attrs
-                            .entry(target_id)
-                            .or_default()
-                            .attrs
-                            .insert(Attr::SpvAnnotation(inst.without_ids));
-                    }
-                };
+                        _ => {
+                            pending_attrs
+                                .entry(target_id)
+                                .or_default()
+                                .attrs
+                                .insert(Attr::SpvAnnotation(inst.without_ids));
+                        }
+                    };
+                }
 
                 if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(&opcode) {
                     Seq::ExecutionMode
@@ -820,6 +831,42 @@ impl Module {
         if !pending_attrs.is_empty() {
             let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
             return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
+        }
+
+        for (target_id, inst, input_ids) in pending_execution_mode_ids {
+            let func = match id_defs.get(&target_id) {
+                Some(&IdDef::Func(func)) => func,
+                Some(id_def) => {
+                    return Err(invalid(&format!(
+                        "in OpExecutionModeId: target %{target_id} should be a function, not {}",
+                        id_def.descr(&cx)
+                    )));
+                }
+                None => {
+                    return Err(invalid(&format!(
+                        "in OpExecutionModeId: target function %{target_id} never defined"
+                    )));
+                }
+            };
+            let const_inputs = input_ids
+                .into_iter()
+                .map(|id| match id_defs.get(&id) {
+                    Some(&IdDef::Const(ct)) => Ok(ct),
+                    Some(id_def) => Err(invalid(&format!(
+                        "in OpExecutionModeId: input %{id} should be a constant, not {}",
+                        id_def.descr(&cx)
+                    ))),
+                    None => Err(invalid(&format!(
+                        "in OpExecutionModeId: input constant %{id} never defined"
+                    ))),
+                })
+                .collect::<io::Result<_>>()?;
+            module.funcs[func].attrs.mutate(&cx, |attrs| {
+                attrs.attrs.insert(Attr::SpvAnnotationWithConstInputs {
+                    inst,
+                    const_inputs: crate::OrdAssertEq(const_inputs),
+                });
+            });
         }
 
         if current_func_body.is_some() {

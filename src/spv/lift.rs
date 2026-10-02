@@ -201,6 +201,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
+            Attr::SpvAnnotationWithConstInputs { .. } => {}
             Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc { file_path, .. })) => {
                 self.debug_strings.insert(&self.cx[file_path]);
             }
@@ -1523,6 +1524,28 @@ impl Module {
                             execution_mode_insts.push(inst);
                         } else if [wk.OpName, wk.OpMemberName].contains(opcode) {
                             debug_name_insts.push(inst);
+                        } else {
+                            decoration_insts.push(inst);
+                        }
+                    }
+                    Attr::SpvAnnotationWithConstInputs { inst, const_inputs } => {
+                        let target_id = result_id
+                            .expect("SPIR-V annotation with constant inputs needs a target ID");
+                        let inst = spv::InstWithIds {
+                            without_ids: inst.clone(),
+                            result_type_id: None,
+                            result_id: None,
+                            ids: iter::once(target_id)
+                                .chain(
+                                    const_inputs
+                                        .0
+                                        .iter()
+                                        .map(|&ct| ids.globals[&Global::Const(ct)]),
+                                )
+                                .collect(),
+                        };
+                        if inst.opcode == wk.OpExecutionModeId {
+                            execution_mode_insts.push(inst);
                         } else {
                             decoration_insts.push(inst);
                         }

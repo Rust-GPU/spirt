@@ -3018,6 +3018,13 @@ impl Print for Attr {
                     printer.pretty_spv_inst(printer.attr_style(), *opcode, imms, [None])
                 }
             }
+            Attr::SpvAnnotationWithConstInputs { inst, const_inputs } => printer.pretty_spv_inst(
+                printer.attr_style(),
+                inst.opcode,
+                &inst.imms,
+                std::iter::once(None)
+                    .chain(const_inputs.0.iter().map(|ct| Some(ct.print(printer)))),
+            ),
             &Attr::SpvBitflagsOperand(imm) => printer.pretty_spv_operand_from_imms([imm]),
         };
         pretty::Fragment::new([

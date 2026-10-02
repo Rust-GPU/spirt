@@ -403,6 +403,12 @@ pub enum Attr {
 
     SpvAnnotation(spv::Inst),
 
+    /// An annotation with constant ID operands, such as `OpExecutionModeId`.
+    SpvAnnotationWithConstInputs {
+        inst: spv::Inst,
+        const_inputs: OrdAssertEq<SmallVec<[Const; 3]>>,
+    },
+
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
     //

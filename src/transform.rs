@@ -320,6 +320,16 @@ impl InnerTransform for Attr {
                 Transformed::Unchanged
             }
 
+            Attr::SpvAnnotationWithConstInputs { inst, const_inputs } => {
+                Transformed::map_iter(const_inputs.0.iter(), |&ct| {
+                    transformer.transform_const_use(ct)
+                })
+                .map(|new_iter| Attr::SpvAnnotationWithConstInputs {
+                    inst: inst.clone(),
+                    const_inputs: OrdAssertEq(new_iter.collect()),
+                })
+            }
+
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path,
                 start_line_col,
