@@ -3000,6 +3000,22 @@ impl Print for Attr {
                 ])
             }
 
+            Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations)) => {
+                return pretty::Fragment::new(annotations.iter().map(|(inst, inputs)| {
+                    pretty::Fragment::new([
+                        printer.attr_style().apply("#[").into(),
+                        printer.pretty_spv_inst(
+                            printer.attr_style(),
+                            inst.opcode,
+                            &inst.imms,
+                            std::iter::once(None)
+                                .chain(inputs.iter().map(|input| Some(input.print(printer)))),
+                        ),
+                        printer.attr_style().apply("]").into(),
+                        pretty::Node::ForceLineSeparation.into(),
+                    ])
+                }));
+            }
             Attr::SpvAnnotation(spv::Inst { opcode, imms }) => {
                 let wk = &spv::spec::Spec::get().well_known;
 
@@ -3108,6 +3124,16 @@ impl Print for QPtrMemUsage {
     }
 }
 
+impl Print for TypeOrConst {
+    type Output = pretty::Fragment;
+    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        match *self {
+            Self::Type(ty) => ty.print(printer),
+            Self::Const(ct) => ct.print(printer),
+        }
+    }
+}
+
 impl Print for TypeDef {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
@@ -3174,10 +3200,7 @@ impl Print for TypeDef {
                             printer.spv_op_style(),
                             spv_inst.opcode,
                             &spv_inst.imms,
-                            type_and_const_inputs.iter().map(|&ty_or_ct| match ty_or_ct {
-                                TypeOrConst::Type(ty) => ty.print(printer),
-                                TypeOrConst::Const(ct) => ct.print(printer),
-                            }),
+                            type_and_const_inputs.iter().map(|input| input.print(printer)),
                         ),
                     TypeKind::SpvStringLiteralForExtInst => pretty::Fragment::new([
                         printer.error_style().apply("type_of").into(),

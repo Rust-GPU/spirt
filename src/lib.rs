@@ -403,6 +403,14 @@ pub enum Attr {
 
     SpvAnnotation(spv::Inst),
 
+    /// SPIR-V annotations with ID operands. The target is the implicit first
+    /// operand. Other IDs refer to types, constants, or global variables.
+    /// Global variables use [`ConstKind::PtrToGlobalVar`].
+    ///
+    /// All such annotations share one attribute. This avoids ordering interned
+    /// handles when annotations have the same literal operands.
+    SpvAnnotationsWithIds(OrdAssertEq<Vec<(spv::Inst, Vec<TypeOrConst>)>>),
+
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
     //
@@ -569,6 +577,8 @@ impl context::InternInCx<Type> for TypeKind {
 
 // HACK(eddyb) this is like `Either<Type, Const>`, only used in `TypeKind::SpvInst`,
 // and only because SPIR-V type definitions can references both types and consts.
+//
+// `Attr::SpvAnnotationsWithIds` also uses `TypeOrConst` for its ID operands.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum TypeOrConst {
     Type(Type),

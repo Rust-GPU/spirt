@@ -200,6 +200,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             Attr::Diagnostics(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
+            | Attr::SpvAnnotationsWithIds(_)
             | Attr::SpvBitflagsOperand(_) => {}
             Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc { file_path, .. })) => {
                 self.debug_strings.insert(&self.cx[file_path]);
@@ -1501,32 +1502,45 @@ impl Module {
             let (result_id, attrs, import) = lazy_inst.result_id_attrs_and_import(self, ids);
 
             for attr in cx[attrs].attrs.iter() {
+                let mut emit_annotation = |inst: &spv::Inst, inputs: &[TypeOrConst]| {
+                    let target_id = result_id.expect(
+                        "FIXME: it shouldn't be possible to attach \
+                         attributes to instructions without an output",
+                    );
+                    let input_ids = inputs.iter().map(|&input| {
+                        let global = match input {
+                            TypeOrConst::Type(ty) => Global::Type(ty),
+                            TypeOrConst::Const(ct) => Global::Const(ct),
+                        };
+                        ids.globals[&global]
+                    });
+                    let inst = spv::InstWithIds {
+                        without_ids: inst.clone(),
+                        result_type_id: None,
+                        result_id: None,
+                        ids: iter::once(target_id).chain(input_ids).collect(),
+                    };
+
+                    if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(&inst.opcode) {
+                        execution_mode_insts.push(inst);
+                    } else if [wk.OpName, wk.OpMemberName].contains(&inst.opcode) {
+                        debug_name_insts.push(inst);
+                    } else {
+                        decoration_insts.push(inst);
+                    }
+                };
+
                 match attr {
                     Attr::DbgSrcLoc(_)
                     | Attr::Diagnostics(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
-                    Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
-                        let target_id = result_id.expect(
-                            "FIXME: it shouldn't be possible to attach \
-                                 attributes to instructions without an output",
-                        );
-
-                        let inst = spv::InstWithIds {
-                            without_ids: inst.clone(),
-                            result_type_id: None,
-                            result_id: None,
-                            ids: iter::once(target_id).collect(),
-                        };
-
-                        if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(opcode) {
-                            execution_mode_insts.push(inst);
-                        } else if [wk.OpName, wk.OpMemberName].contains(opcode) {
-                            debug_name_insts.push(inst);
-                        } else {
-                            decoration_insts.push(inst);
+                    Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations)) => {
+                        for (inst, inputs) in annotations {
+                            emit_annotation(inst, inputs);
                         }
                     }
+                    Attr::SpvAnnotation(inst) => emit_annotation(inst, &[]),
                 }
 
                 if let Some(import) = import {

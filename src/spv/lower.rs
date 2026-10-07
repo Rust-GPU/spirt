@@ -6,8 +6,8 @@ use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, EntityList, ExportKey, Exportee, Func, FuncDecl,
     FuncDefBody, FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr,
-    Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, print,
+    Module, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, RegionInputDecl, SelectionKind,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, print,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -183,6 +183,7 @@ impl Module {
 
         let mut has_memory_model = false;
         let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
+        let mut pending_annotations = FxHashMap::<spv::Id, Vec<spv::InstWithIds>>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -255,6 +256,39 @@ impl Module {
 
             let mut attrs =
                 inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
+
+            // SPIR-V requires annotation operands to be defined before the target.
+            // Resolve them when the target is reached.
+            if let Some(annotations) = inst.result_id.and_then(|id| pending_annotations.remove(&id))
+            {
+                let mut resolved_annotations = Vec::with_capacity(annotations.len());
+                for annotation in annotations {
+                    let is_execution_mode = annotation.opcode == wk.OpExecutionModeId;
+                    if is_execution_mode && opcode != wk.OpFunction {
+                        return Err(invalid("OpExecutionModeId target is not a function"));
+                    }
+                    let inputs = annotation.ids[1..]
+                        .iter()
+                        .map(|id| match id_defs.get(id) {
+                            Some(&IdDef::Type(ty)) if is_execution_mode => {
+                                Ok(TypeOrConst::Type(ty))
+                            }
+                            Some(&IdDef::Const(ct))
+                                if !is_execution_mode
+                                    || !matches!(cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
+                            {
+                                Ok(TypeOrConst::Const(ct))
+                            }
+                            _ => Err(invalid(&format!(
+                                "unsupported or undefined operand %{id} in {}",
+                                annotation.opcode.name()
+                            ))),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    resolved_annotations.push((annotation.without_ids, inputs));
+                }
+                attrs.attrs.insert(Attr::SpvAnnotationsWithIds(OrdAssertEq(resolved_annotations)));
+            }
 
             if let Some(dbg_src_loc) = current_dbg_src_loc {
                 attrs.set_dbg_src_loc(dbg_src_loc);
@@ -477,12 +511,12 @@ impl Module {
                 Seq::EntryPoint
             } else if [
                 wk.OpExecutionMode,
-                wk.OpExecutionModeId, // FIXME(eddyb) not actually supported
+                wk.OpExecutionModeId,
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
                 wk.OpMemberDecorate,
-                wk.OpDecorateId, // FIXME(eddyb) not actually supported
+                wk.OpDecorateId,
                 wk.OpDecorateString,
                 wk.OpMemberDecorateString,
             ]
@@ -491,10 +525,6 @@ impl Module {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
                 let target_id = inst.ids[0];
-                if inst.ids.len() > 1 {
-                    return Err(invalid("unsupported decoration with ID"));
-                }
-
                 match inst.imms[..] {
                     // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
                     [
@@ -517,6 +547,9 @@ impl Module {
                         }
                     }
 
+                    _ if inst.ids.len() > 1 => {
+                        pending_annotations.entry(target_id).or_default().push(inst);
+                    }
                     _ => {
                         pending_attrs
                             .entry(target_id)
@@ -817,8 +850,9 @@ impl Module {
             return Err(invalid("missing OpMemoryModel"));
         }
 
-        if !pending_attrs.is_empty() {
-            let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
+        if !pending_attrs.is_empty() || !pending_annotations.is_empty() {
+            let ids =
+                pending_attrs.keys().chain(pending_annotations.keys()).collect::<BTreeSet<_>>();
             return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
         }
 
