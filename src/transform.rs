@@ -320,14 +320,14 @@ impl InnerTransform for Attr {
                 Transformed::Unchanged
             }
 
-            Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
-                Transformed::map_iter(modes.iter(), |(inst, inputs)| {
+            Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations)) => {
+                Transformed::map_iter(annotations.iter(), |(inst, inputs)| {
                     Transformed::map_iter(inputs.iter(), |input| {
                         input.inner_transform_with(transformer)
                     })
                     .map(|inputs| (inst.clone(), inputs.collect()))
                 })
-                .map(|modes| Attr::SpvExecutionModeIds(OrdAssertEq(modes.collect())))
+                .map(|annotations| Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations.collect())))
             }
 
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {

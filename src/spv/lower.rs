@@ -183,7 +183,7 @@ impl Module {
 
         let mut has_memory_model = false;
         let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
-        let mut pending_execution_modes = FxHashMap::<spv::Id, Vec<spv::InstWithIds>>::default();
+        let mut pending_annotations = FxHashMap::<spv::Id, Vec<spv::InstWithIds>>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -257,32 +257,37 @@ impl Module {
             let mut attrs =
                 inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
 
-            // SPIR-V requires execution modes to appear before types and constants.
-            // Resolve their operand IDs at the target function, once those definitions are available.
-            if let Some(modes) = inst.result_id.and_then(|id| pending_execution_modes.remove(&id)) {
-                if opcode != wk.OpFunction {
-                    return Err(invalid("OpExecutionModeId target is not a function"));
-                }
-                let mut resolved_modes = Vec::with_capacity(modes.len());
-                for mode in modes {
-                    let inputs = mode.ids[1..]
+            // SPIR-V requires annotation operands to be defined before the target.
+            // Resolve them when the target is reached.
+            if let Some(annotations) = inst.result_id.and_then(|id| pending_annotations.remove(&id))
+            {
+                let mut resolved_annotations = Vec::with_capacity(annotations.len());
+                for annotation in annotations {
+                    let is_execution_mode = annotation.opcode == wk.OpExecutionModeId;
+                    if is_execution_mode && opcode != wk.OpFunction {
+                        return Err(invalid("OpExecutionModeId target is not a function"));
+                    }
+                    let inputs = annotation.ids[1..]
                         .iter()
                         .map(|id| match id_defs.get(id) {
-                            Some(&IdDef::Type(ty)) => Ok(TypeOrConst::Type(ty)),
+                            Some(&IdDef::Type(ty)) if is_execution_mode => {
+                                Ok(TypeOrConst::Type(ty))
+                            }
                             Some(&IdDef::Const(ct))
-                                if !matches!(cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
+                                if !is_execution_mode
+                                    || !matches!(cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
                             {
                                 Ok(TypeOrConst::Const(ct))
                             }
                             _ => Err(invalid(&format!(
-                                "OpExecutionModeId operand %{id} does not refer to \
-                                 a defined type or constant"
+                                "unsupported or undefined operand %{id} in {}",
+                                annotation.opcode.name()
                             ))),
                         })
                         .collect::<Result<_, _>>()?;
-                    resolved_modes.push((mode.without_ids, inputs));
+                    resolved_annotations.push((annotation.without_ids, inputs));
                 }
-                attrs.attrs.insert(Attr::SpvExecutionModeIds(OrdAssertEq(resolved_modes)));
+                attrs.attrs.insert(Attr::SpvAnnotationsWithIds(OrdAssertEq(resolved_annotations)));
             }
 
             if let Some(dbg_src_loc) = current_dbg_src_loc {
@@ -504,19 +509,14 @@ impl Module {
                 });
 
                 Seq::EntryPoint
-            } else if opcode == wk.OpExecutionModeId {
-                let &[target_id, ..] = &inst.ids[..] else {
-                    return Err(invalid("OpExecutionModeId has no target function"));
-                };
-                pending_execution_modes.entry(target_id).or_default().push(inst);
-                Seq::ExecutionMode
             } else if [
                 wk.OpExecutionMode,
+                wk.OpExecutionModeId,
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
                 wk.OpMemberDecorate,
-                wk.OpDecorateId, // FIXME(eddyb) not actually supported
+                wk.OpDecorateId,
                 wk.OpDecorateString,
                 wk.OpMemberDecorateString,
             ]
@@ -525,10 +525,6 @@ impl Module {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
                 let target_id = inst.ids[0];
-                if inst.ids.len() > 1 {
-                    return Err(invalid("unsupported decoration with ID"));
-                }
-
                 match inst.imms[..] {
                     // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
                     [
@@ -551,6 +547,9 @@ impl Module {
                         }
                     }
 
+                    _ if inst.ids.len() > 1 => {
+                        pending_annotations.entry(target_id).or_default().push(inst);
+                    }
                     _ => {
                         pending_attrs
                             .entry(target_id)
@@ -560,7 +559,7 @@ impl Module {
                     }
                 };
 
-                if opcode == wk.OpExecutionMode {
+                if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(&opcode) {
                     Seq::ExecutionMode
                 } else if [wk.OpName, wk.OpMemberName].contains(&opcode) {
                     Seq::DebugName
@@ -851,11 +850,9 @@ impl Module {
             return Err(invalid("missing OpMemoryModel"));
         }
 
-        if !pending_execution_modes.is_empty() {
-            return Err(invalid("OpExecutionModeId refers to an undefined function"));
-        }
-        if !pending_attrs.is_empty() {
-            let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
+        if !pending_attrs.is_empty() || !pending_annotations.is_empty() {
+            let ids =
+                pending_attrs.keys().chain(pending_annotations.keys()).collect::<BTreeSet<_>>();
             return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
         }
 

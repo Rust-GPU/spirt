@@ -234,8 +234,8 @@ impl InnerVisit for Attr {
         match self {
             Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {}
 
-            Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
-                for (_, inputs) in modes {
+            Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations)) => {
+                for (_, inputs) in annotations {
                     for input in inputs {
                         input.inner_visit_with(visitor);
                     }

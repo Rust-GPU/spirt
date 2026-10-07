@@ -3000,8 +3000,8 @@ impl Print for Attr {
                 ])
             }
 
-            Attr::SpvExecutionModeIds(OrdAssertEq(modes)) => {
-                return pretty::Fragment::new(modes.iter().map(|(inst, inputs)| {
+            Attr::SpvAnnotationsWithIds(OrdAssertEq(annotations)) => {
+                return pretty::Fragment::new(annotations.iter().map(|(inst, inputs)| {
                     pretty::Fragment::new([
                         printer.attr_style().apply("#[").into(),
                         printer.pretty_spv_inst(

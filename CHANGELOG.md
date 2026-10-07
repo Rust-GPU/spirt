@@ -34,8 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - ReleaseDate
 
 ### Added ⭐
-- Preserve type and constant operands of `OpExecutionModeId` during lowering,
-  transformation, and lifting. This supports `FPFastMathDefault` and `LocalSizeId`.
+- Preserve ID operands of `OpExecutionModeId` and `OpDecorateId`.
+  `OpMemberDecorateIdEXT` and `OpacityMicromapIdKHR` are potential future uses of this interface.
 
 ## [0.4.0] - 2024-10-07
 
