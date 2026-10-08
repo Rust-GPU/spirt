@@ -256,12 +256,15 @@ impl<IMMS: Iterator<Item = spv::Imm>, ID, IDS: Iterator<Item = ID>> OperandPrint
     }
 }
 
-/// Print a single SPIR-V operand from only immediates, potentially composed of
-/// an enumerand with parameters (which consumes more immediates).
-pub fn operand_from_imms<T>(imms: impl IntoIterator<Item = spv::Imm>) -> TokensForOperand<T> {
+/// Print a single SPIR-V operand from `imms` and `ids`, described by `imms[0]`,
+/// but which may consume more immediates/IDs (e.g. for enumerand parameters).
+pub fn operand<ID>(
+    imms: impl IntoIterator<Item = spv::Imm>,
+    ids: impl IntoIterator<Item = ID>,
+) -> TokensForOperand<ID> {
     let mut printer = OperandPrinter {
         imms: imms.into_iter().peekable(),
-        ids: iter::empty().peekable(),
+        ids: ids.into_iter().peekable(),
         out: TokensForOperand::default(),
     };
     let &kind = match printer.imms.peek().unwrap() {
@@ -270,6 +273,7 @@ pub fn operand_from_imms<T>(imms: impl IntoIterator<Item = spv::Imm>) -> TokensF
     };
     printer.operand("", kind);
     assert!(printer.imms.next().is_none());
+    assert!(printer.ids.next().is_none());
     printer.out
 }
 

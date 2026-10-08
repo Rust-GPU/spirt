@@ -1876,7 +1876,7 @@ impl Printer<'_> {
         &self,
         imms: impl IntoIterator<Item = spv::Imm>,
     ) -> pretty::Fragment {
-        self.pretty_spv_print_tokens_for_operand(spv::print::operand_from_imms(imms))
+        self.pretty_spv_print_tokens_for_operand(spv::print::operand(imms, []))
     }
 
     /// Pretty-print a single SPIR-V (short) immediate (e.g. an enumerand).
@@ -2426,7 +2426,7 @@ impl Print for spv::Dialect {
                         // HACK(eddyb) construct a custom `spv.Capability.{A,B,C}`.
                         let capability_namespace_prefix = printer
                             .pretty_spv_print_tokens_for_operand({
-                                let mut tokens = spv::print::operand_from_imms(cap_imms(0));
+                                let mut tokens = spv::print::operand(cap_imms(0), []);
                                 assert!(matches!(
                                     tokens.tokens.pop(),
                                     Some(spv::print::Token::EnumerandName(_))
@@ -2436,7 +2436,7 @@ impl Print for spv::Dialect {
 
                         let mut cap_names = capabilities.iter().map(|&cap| {
                             printer.pretty_spv_print_tokens_for_operand({
-                                let mut tokens = spv::print::operand_from_imms(cap_imms(cap));
+                                let mut tokens = spv::print::operand(cap_imms(cap), []);
                                 tokens.tokens.drain(..tokens.tokens.len() - 1);
                                 assert!(matches!(
                                     tokens.tokens[..],
