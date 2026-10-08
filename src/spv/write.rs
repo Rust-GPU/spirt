@@ -109,10 +109,8 @@ impl OperandEmitter<'_> {
                 let word = get_enum_word()?;
                 self.out.push(word);
 
-                let variant_def = u16::try_from(word)
-                    .ok()
-                    .and_then(|v| variants.get(v))
-                    .ok_or(Error::UnsupportedEnumerand(kind, word))?;
+                let variant_def =
+                    variants.get(word).ok_or(Error::UnsupportedEnumerand(kind, word))?;
                 self.enumerant_params(variant_def)?;
             }
             spec::OperandKindDef::Id => {

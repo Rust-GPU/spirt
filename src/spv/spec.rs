@@ -372,7 +372,7 @@ impl OperandKind {
 }
 
 // HACK(eddyb) only needed because there are more than 256 unique operand names,
-// but less than 64 `OperandKind`s, so we can split 16 kind:name bits as 6:10.
+// but less than 128 `OperandKind`s, so we can split 16 kind:name bits as 7:9.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackedOperandNameAndKind(u16);
 
@@ -393,14 +393,18 @@ impl PackedOperandNameAndKind {
 
     #[inline]
     fn pack(name_idx: usize, kind: OperandKind) -> Self {
-        let packed = Self(((name_idx as u16) << 6) | (kind.0 as u16));
-        assert_eq!(packed.unpack(), (name_idx, kind));
+        let packed = Self(((name_idx as u16) << 7) | (kind.0 as u16));
+        assert!(
+            packed.unpack() == (name_idx, kind),
+            "cannot pack ({name_idx}, {}) in `u16`",
+            kind.0
+        );
         packed
     }
 
     #[inline]
     fn unpack(self) -> (usize, OperandKind) {
-        ((self.0 >> 6) as usize, OperandKind((self.0 & ((1 << 6) - 1)) as u8))
+        ((self.0 >> 7) as usize, OperandKind((self.0 & ((1 << 7) - 1)) as u8))
     }
 
     /// Unpack this `PackedOperandNameAndKind` into just its `OperandKind`.
@@ -424,7 +428,7 @@ pub enum OperandKindDef {
     },
 
     ValueEnum {
-        variants: indexed::NamedIdxMap<u16, Enumerant, indexed::KhrSegmented>,
+        variants: indexed::NamedIdxMap<u32, Enumerant, indexed::KhrSegmented>,
     },
 
     Id,
@@ -515,18 +519,25 @@ fn sanitize_operand_name<'a>(name: &Option<raw::CowStr<'a>>) -> &'a str {
     name.as_ref()
         .and_then(|name| match name {
             &raw::CowStr::Borrowed(s) => {
-                s.strip_prefix('\'')?.strip_suffix('\'').filter(|s| {
-                    // HACK(eddyb) it's pretty bad that SPIR-V uses spaces
-                    // in operand names, but by constraining the rest of
-                    // the character set (to be identifier-like), we get
-                    // to remove spaces (to get `FooBar`), or even replace
-                    // them with `_` (to get `Foo_Bar` or even `foo_bar`).
-                    s.starts_with(|c: char| c.is_ascii_alphabetic())
-                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ')
-                })
+                let s = if s.ends_with('\'') {
+                    // HACK(eddyb) work around a mistake in `OpAbortKHR`.
+                    assert_eq!(s, "Message'");
+                    s.strip_suffix('\'').unwrap()
+                } else {
+                    s
+                };
+
+                // HACK(eddyb) it's pretty bad that SPIR-V uses spaces
+                // in operand names, but by constraining the rest of
+                // the character set (to be identifier-like), we get
+                // to remove spaces (to get `FooBar`), or even replace
+                // them with `_` (to get `Foo_Bar` or even `foo_bar`).
+                (s.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' '))
+                .then_some(s)
             }
             raw::CowStr::Owned(s) => {
-                assert!(s.contains("', +\n'"), "unexpected non-zero-copy {s:?}");
+                assert!(s.contains(", +\n"), "unexpected non-zero-copy {s:?}");
                 None
             }
         })
@@ -721,16 +732,16 @@ impl Spec {
 
                         let enumerants = o.enumerants.as_ref().unwrap();
                         let variants = indexed::KhrSegmentedVec::from_in_order_iter(
-                            enumerants.iter().map(|e| {
-                                (e.value.try_into().unwrap(), (e.enumerant, enumerant_from_raw(e)))
-                            }),
+                            enumerants
+                                .iter()
+                                .map(|e| (e.value, (e.enumerant, enumerant_from_raw(e)))),
                         );
 
                         // FIXME(eddyb) automate this in `indexed::NamedIdxMap`.
                         let variants = indexed::NamedIdxMap {
                             idx_by_name: enumerants
                                 .iter()
-                                .map(|e| (e.enumerant, e.value.try_into().unwrap()))
+                                .map(|e| (e.enumerant, e.value))
                                 .collect(),
                             storage: variants,
                         };
@@ -930,7 +941,7 @@ impl Spec {
                     assert!(def.has_result_id);
                 }
 
-                (inst.opcode, (inst.opname, def))
+                (inst.opcode.into(), (inst.opname, def))
             }),
         );
 
@@ -1016,8 +1027,8 @@ pub mod raw {
         #[serde(borrow)]
         pub copyright: Option<Vec<CowStr<'a>>>,
 
-        pub version: Option<u8>,
-        pub revision: u8,
+        pub version: Option<u32>,
+        pub revision: u32,
 
         pub instructions: Vec<Instruction<'a>>,
         #[serde(default)]
@@ -1212,6 +1223,7 @@ pub mod raw {
 pub mod indexed {
     use rustc_hash::FxHashMap;
     use smallvec::SmallVec;
+    use std::collections::BTreeMap;
 
     pub trait StorageShape<I, T> {
         type Storage;
@@ -1225,6 +1237,13 @@ pub mod indexed {
     impl FlatIdx for u16 {
         fn to_usize(self) -> usize {
             self.into()
+        }
+    }
+
+    impl FlatIdx for u32 {
+        fn to_usize(self) -> usize {
+            // HACK(eddyb) this should cost nothing on 32-bit and 64-bit hosts.
+            self.try_into().unwrap()
         }
     }
 
@@ -1271,6 +1290,14 @@ pub mod indexed {
         /// For example, if an index `i >= 4096` is present, its value can be
         /// found at `flattened[block_starts[(i - 4096) / 64] + (i % 64)]`.
         block_starts: SmallVec<[u16; 8]>,
+
+        // HACK(eddyb) all indices used to fit in `u16` (and have decently dense
+        // `64`-sized/aligned block distribution above 4096), but the operand kind
+        // `ComponentType` copied Vulkan's `enum` convention for extensions,
+        // ending up with enumerands like `1000491000` (for extension 491),
+        // so this map holds all such stragglers, however few, and is only used
+        // for indices that do not fit in `u16` (which is cheap to test for).
+        outside_16bit_range: BTreeMap<u32, T>,
     }
 
     impl<T> KhrSegmentedVec<T> {
@@ -1300,7 +1327,14 @@ pub mod indexed {
         }
 
         /// Add a new value, with an index greater than all previous indices.
-        fn insert_in_order(&mut self, idx: u16, value: T) {
+        fn insert_in_order(&mut self, idx: u32, value: T) {
+            let Ok(idx) = u16::try_from(idx) else {
+                // HACK(eddyb) special-case the rare cases that don't follow the
+                // `64`-sized/aligned block pattern, to keep everything else fast.
+                assert!(self.outside_16bit_range.insert(idx, value).is_none());
+                return;
+            };
+
             let last_idx_plus_one = self.block_starts.len().checked_sub(1).map_or(
                 self.flattened.len(),
                 |last_block_idx| {
@@ -1339,7 +1373,7 @@ pub mod indexed {
         }
 
         /// Construct a [`KhrSegmentedVec`] out of an iterator with ordered indices.
-        pub fn from_in_order_iter(it: impl IntoIterator<Item = (u16, T)>) -> Self {
+        pub fn from_in_order_iter(it: impl IntoIterator<Item = (u32, T)>) -> Self {
             let iter = it.into_iter();
 
             let mut this = Self {
@@ -1347,6 +1381,7 @@ pub mod indexed {
                     iter.size_hint().0.checked_next_power_of_two().unwrap_or(0),
                 ),
                 block_starts: SmallVec::new(),
+                outside_16bit_range: BTreeMap::new(),
             };
 
             for (idx, value) in iter {
@@ -1362,8 +1397,15 @@ pub mod indexed {
     impl<I: FlatIdx, T> StorageShape<I, T> for KhrSegmented {
         type Storage = KhrSegmentedVec<T>;
         fn get_by_idx(storage: &Self::Storage, idx: I) -> Option<&T> {
-            let (seg_range, intra_seg_idx) =
-                storage.idx_to_segmented(idx.to_usize().try_into().ok()?)?;
+            let idx = u32::try_from(idx.to_usize()).ok()?;
+
+            let Ok(idx) = u16::try_from(idx) else {
+                // HACK(eddyb) special-case the rare cases that don't follow the
+                // `64`-sized/aligned block pattern, to keep everything else fast.
+                return storage.outside_16bit_range.get(&idx);
+            };
+
+            let (seg_range, intra_seg_idx) = storage.idx_to_segmented(idx)?;
 
             storage.flattened.get(seg_range)?.get(intra_seg_idx)?.as_ref()
         }

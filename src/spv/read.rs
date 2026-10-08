@@ -133,10 +133,8 @@ impl InstParser<'_> {
             spec::OperandKindDef::ValueEnum { variants } => {
                 self.inst.imms.push(spv::Imm::Short(kind, word));
 
-                let variant_def = u16::try_from(word)
-                    .ok()
-                    .and_then(|v| variants.get(v))
-                    .ok_or(Error::UnsupportedEnumerand(kind, word))?;
+                let variant_def =
+                    variants.get(word).ok_or(Error::UnsupportedEnumerand(kind, word))?;
                 self.enumerant_params(variant_def)?;
             }
 
