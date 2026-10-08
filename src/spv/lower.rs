@@ -182,7 +182,8 @@ impl Module {
         let mut seq = None;
 
         let mut has_memory_model = false;
-        let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
+        let mut pending_spv_annotations =
+            FxHashMap::<spv::Id, Vec<(spv::Inst, SmallVec<[spv::Id; 4]>)>>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -253,8 +254,57 @@ impl Module {
             }
             current_block_id = new_block_id;
 
-            let mut attrs =
-                inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
+            let mut attrs = crate::AttrSetDef::default();
+
+            {
+                let annotations = inst
+                    .result_id
+                    .and_then(|id| pending_spv_annotations.remove(&id))
+                    .unwrap_or_default();
+
+                // HACK(eddyb) when `per_instance_const_inputs` is `Some` in
+                // `Attr::SpvAnnotation`, it must collect all "instances",
+                // i.e. all occurrences of the same `spv_inst` value, so this
+                // map papers over `Attr` not having a key/value split itself.
+                let mut instances_per_spv_inst: FxIndexMap<spv::Inst, Vec<_>> =
+                    FxIndexMap::default();
+
+                for (spv_inst, operand_ids) in annotations {
+                    if operand_ids.is_empty() {
+                        attrs.attrs.insert(Attr::SpvAnnotation {
+                            spv_inst,
+                            per_instance_const_inputs: None,
+                        });
+                        continue;
+                    }
+
+                    let const_inputs = operand_ids
+                        .iter()
+                        .map(|&id| match id_defs.get(&id) {
+                            Some(&IdDef::Const(ct)) => Ok(ct),
+                            Some(id_def) => Err(id_def.descr(&cx)),
+                            None => Err(format!("a forward reference to %{id}")),
+                        })
+                        .map(|result| {
+                            result.map_err(|descr| {
+                                invalid(&format!(
+                                    "unsupported use of {descr} in `{}`",
+                                    spv_inst.opcode.name()
+                                ))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    instances_per_spv_inst.entry(spv_inst).or_default().push(const_inputs);
+                }
+
+                attrs.attrs.extend(instances_per_spv_inst.into_iter().map(
+                    |(spv_inst, instances)| Attr::SpvAnnotation {
+                        spv_inst,
+                        per_instance_const_inputs: Some(crate::OrdAssertEq(Rc::new(instances))),
+                    },
+                ));
+            }
 
             if let Some(dbg_src_loc) = current_dbg_src_loc {
                 attrs.set_dbg_src_loc(dbg_src_loc);
@@ -477,23 +527,23 @@ impl Module {
                 Seq::EntryPoint
             } else if [
                 wk.OpExecutionMode,
-                wk.OpExecutionModeId, // FIXME(eddyb) not actually supported
+                wk.OpExecutionModeId,
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
-                wk.OpMemberDecorate,
-                wk.OpDecorateId, // FIXME(eddyb) not actually supported
+                wk.OpDecorateId,
                 wk.OpDecorateString,
+                wk.OpMemberDecorate,
+                wk.OpMemberDecorateIdEXT,
                 wk.OpMemberDecorateString,
             ]
             .contains(&opcode)
             {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
-                let target_id = inst.ids[0];
-                if inst.ids.len() > 1 {
-                    return Err(invalid("unsupported decoration with ID"));
-                }
+                let target_id = inst.ids.remove(0);
+                let operand_ids = inst.ids;
+                let inst = inst.without_ids;
 
                 match inst.imms[..] {
                     // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
@@ -506,6 +556,8 @@ impl Module {
                         && lt_kind == wk.LinkageType
                         && [wk.Import, wk.Export].contains(&linkage_type) =>
                     {
+                        assert_eq!(operand_ids.len(), 0);
+
                         let name = spv::extract_literal_string(name)
                             .map_err(|e| invalid(&format!("{} in {:?}", e, e.as_bytes())))?;
                         let name = cx.intern(name);
@@ -518,11 +570,10 @@ impl Module {
                     }
 
                     _ => {
-                        pending_attrs
+                        pending_spv_annotations
                             .entry(target_id)
                             .or_default()
-                            .attrs
-                            .insert(Attr::SpvAnnotation(inst.without_ids));
+                            .push((inst, operand_ids));
                     }
                 };
 
@@ -817,9 +868,9 @@ impl Module {
             return Err(invalid("missing OpMemoryModel"));
         }
 
-        if !pending_attrs.is_empty() {
-            let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
-            return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
+        if !pending_spv_annotations.is_empty() {
+            let ids = pending_spv_annotations.keys().collect::<BTreeSet<_>>();
+            return Err(invalid(&format!("annotated IDs never defined: {ids:?}")));
         }
 
         if current_func_body.is_some() {

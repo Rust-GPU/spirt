@@ -401,7 +401,19 @@ pub enum Attr {
     #[from]
     QPtr(qptr::QPtrAttr),
 
-    SpvAnnotation(spv::Inst),
+    SpvAnnotation {
+        spv_inst: spv::Inst,
+
+        /// If present, each "instance" represents a different use of `spv_inst`,
+        /// grouped together only because the non-ID operands (enumerand/literals)
+        /// inside `spv::Inst` are not enough to uniquely identify an annotation
+        /// (i.e. at least some of the `Const` IDs are semantically part of the
+        /// "key" side `Attr`, which should normally be outside the `OrdAssertEq`).
+        //
+        // HACK(eddyb) this is enough of a complication to furthger call into
+        // question the use of ordered sets for `AttrSet`s, in the first place.
+        per_instance_const_inputs: Option<OrdAssertEq<Rc<Vec<SmallVec<[Const; 2]>>>>>,
+    },
 
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.

@@ -399,11 +399,14 @@ impl<'a> LayoutCache<'a> {
             let mut stride_decoration = None;
             for attr in &cx[ty_def.attrs].attrs {
                 match attr {
-                    Attr::SpvAnnotation(attr_spv_inst)
+                    Attr::SpvAnnotation { spv_inst: attr_spv_inst, per_instance_const_inputs }
                         if attr_spv_inst.opcode == wk.OpDecorate
                             && attr_spv_inst.imms[0]
                                 == spv::Imm::Short(wk.Decoration, wk.ArrayStride) =>
                     {
+                        // FIXME(eddyb) support `ArrayStrideId`.
+                        assert!(per_instance_const_inputs.is_none());
+
                         stride_decoration = Some(match attr_spv_inst.imms[1] {
                             spv::Imm::Short(_, x) => x,
                             _ => unreachable!(),
@@ -445,20 +448,25 @@ impl<'a> LayoutCache<'a> {
             let mut field_offsets: SmallVec<[_; 4]> = SmallVec::with_capacity(field_layouts.len());
             for attr in &cx[ty_def.attrs].attrs {
                 match attr {
-                    Attr::SpvAnnotation(attr_spv_inst)
+                    Attr::SpvAnnotation { spv_inst: attr_spv_inst, per_instance_const_inputs }
                         if attr_spv_inst.opcode == wk.OpMemberDecorate
                             && attr_spv_inst.imms[1]
                                 == spv::Imm::Short(wk.Decoration, wk.RowMajor) =>
                     {
+                        assert!(per_instance_const_inputs.is_none());
+
                         return Err(LayoutError(Diag::bug([
                             "`RowMajor` matrix types unsupported".into(),
                         ])));
                     }
-                    Attr::SpvAnnotation(attr_spv_inst)
+                    Attr::SpvAnnotation { spv_inst: attr_spv_inst, per_instance_const_inputs }
                         if attr_spv_inst.opcode == wk.OpMemberDecorate
                             && attr_spv_inst.imms[1]
                                 == spv::Imm::Short(wk.Decoration, wk.Offset) =>
                     {
+                        // FIXME(eddyb) support `OffsetId`.
+                        assert!(per_instance_const_inputs.is_none());
+
                         let (field_idx, field_offset) = match attr_spv_inst.imms[..] {
                             [spv::Imm::Short(_, idx), _, spv::Imm::Short(_, offset)] => {
                                 (idx, offset)
@@ -597,11 +605,13 @@ impl<'a> LayoutCache<'a> {
             let mut is_interface_block = false;
             for attr in &cx[ty_def.attrs].attrs {
                 match attr {
-                    Attr::SpvAnnotation(attr_spv_inst)
+                    Attr::SpvAnnotation { spv_inst: attr_spv_inst, per_instance_const_inputs }
                         if attr_spv_inst.opcode == wk.OpDecorate
                             && attr_spv_inst.imms[0]
                                 == spv::Imm::Short(wk.Decoration, wk.Block) =>
                     {
+                        assert!(per_instance_const_inputs.is_none());
+
                         is_interface_block = true;
                         break;
                     }
