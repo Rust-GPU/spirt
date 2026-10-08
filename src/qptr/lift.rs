@@ -203,10 +203,13 @@ impl<'a> LiftToSpvPtrs<'a> {
         match usage {
             &QPtrUsage::Handles(shapes::Handle::Opaque(ty)) => Ok(ty),
             QPtrUsage::Handles(shapes::Handle::Buffer(_, data_usage)) => {
-                let attr_spv_decorate_block = Attr::SpvAnnotation(spv::Inst {
-                    opcode: wk.OpDecorate,
-                    imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
-                });
+                let attr_spv_decorate_block = Attr::SpvAnnotation {
+                    spv_inst: spv::Inst {
+                        opcode: wk.OpDecorate,
+                        imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
+                    },
+                    per_instance_const_inputs: None,
+                };
                 match &data_usage.kind {
                     QPtrMemUsageKind::Unused => {
                         self.spv_op_type_struct([], [attr_spv_decorate_block])
@@ -270,15 +273,18 @@ impl<'a> LiftToSpvPtrs<'a> {
 
         let stride_attrs = stride.map(|stride| {
             self.cx.intern(AttrSetDef {
-                attrs: [Attr::SpvAnnotation(spv::Inst {
-                    opcode: wk.OpDecorate,
-                    imms: [
-                        spv::Imm::Short(wk.Decoration, wk.ArrayStride),
-                        spv::Imm::Short(wk.LiteralInteger, stride.get()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                })]
+                attrs: [Attr::SpvAnnotation {
+                    spv_inst: spv::Inst {
+                        opcode: wk.OpDecorate,
+                        imms: [
+                            spv::Imm::Short(wk.Decoration, wk.ArrayStride),
+                            spv::Imm::Short(wk.LiteralInteger, stride.get()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    per_instance_const_inputs: None,
+                }]
                 .into(),
             })
         });
@@ -310,16 +316,19 @@ impl<'a> LiftToSpvPtrs<'a> {
             SmallVec::with_capacity(field_offsets_and_types.size_hint().0);
         for (i, field_offset_and_type) in field_offsets_and_types.enumerate() {
             let (offset, field_type) = field_offset_and_type?;
-            attrs.attrs.insert(Attr::SpvAnnotation(spv::Inst {
-                opcode: wk.OpMemberDecorate,
-                imms: [
-                    spv::Imm::Short(wk.LiteralInteger, i.try_into().unwrap()),
-                    spv::Imm::Short(wk.Decoration, wk.Offset),
-                    spv::Imm::Short(wk.LiteralInteger, offset),
-                ]
-                .into_iter()
-                .collect(),
-            }));
+            attrs.attrs.insert(Attr::SpvAnnotation {
+                spv_inst: spv::Inst {
+                    opcode: wk.OpMemberDecorate,
+                    imms: [
+                        spv::Imm::Short(wk.LiteralInteger, i.try_into().unwrap()),
+                        spv::Imm::Short(wk.Decoration, wk.Offset),
+                        spv::Imm::Short(wk.LiteralInteger, offset),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                per_instance_const_inputs: None,
+            });
             type_and_const_inputs.push(TypeOrConst::Type(field_type));
         }
         attrs.attrs.extend(extra_attrs);

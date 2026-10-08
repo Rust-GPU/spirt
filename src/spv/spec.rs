@@ -103,9 +103,10 @@ def_well_known! {
         OpModuleProcessed,
 
         OpDecorate,
-        OpMemberDecorate,
         OpDecorateId,
         OpDecorateString,
+        OpMemberDecorate,
+        OpMemberDecorateIdEXT,
         OpMemberDecorateString,
 
         // Deprecated in favor of `OpDecorate`/`OpMemberDecorate`.

@@ -232,7 +232,7 @@ impl InnerVisit for AttrSetDef {
 impl InnerVisit for Attr {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {}
+            Attr::Diagnostics(_) | Attr::SpvBitflagsOperand(_) => {}
 
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path: _,
@@ -253,6 +253,16 @@ impl InnerVisit for Attr {
 
                 QPtrAttr::Usage(usage) => usage.0.inner_visit_with(visitor),
             },
+
+            Attr::SpvAnnotation { spv_inst: _, per_instance_const_inputs } => {
+                if let Some(per_instance_const_inputs) = per_instance_const_inputs {
+                    for const_inputs in &per_instance_const_inputs.0[..] {
+                        for &ct in const_inputs {
+                            visitor.visit_const_use(ct);
+                        }
+                    }
+                }
+            }
         }
     }
 }

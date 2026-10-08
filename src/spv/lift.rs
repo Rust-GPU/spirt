@@ -1506,25 +1506,39 @@ impl Module {
                     | Attr::Diagnostics(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
-                    Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
+                    Attr::SpvAnnotation {
+                        spv_inst: inst @ spv::Inst { opcode, .. },
+                        per_instance_const_inputs,
+                    } => {
                         let target_id = result_id.expect(
                             "FIXME: it shouldn't be possible to attach \
-                                 attributes to instructions without an output",
+                             attributes to instructions without an output",
                         );
 
-                        let inst = spv::InstWithIds {
+                        let empty_const_inputs = SmallVec::new();
+                        let instances = per_instance_const_inputs
+                            .as_ref()
+                            .map_or(std::slice::from_ref(&empty_const_inputs), |instances| {
+                                &instances.0[..]
+                            });
+
+                        let insts = instances.iter().map(|const_inputs| spv::InstWithIds {
                             without_ids: inst.clone(),
                             result_type_id: None,
                             result_id: None,
-                            ids: iter::once(target_id).collect(),
-                        };
+                            ids: iter::once(target_id)
+                                .chain(
+                                    const_inputs.iter().map(|&ct| ids.globals[&Global::Const(ct)]),
+                                )
+                                .collect(),
+                        });
 
                         if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(opcode) {
-                            execution_mode_insts.push(inst);
+                            execution_mode_insts.extend(insts);
                         } else if [wk.OpName, wk.OpMemberName].contains(opcode) {
-                            debug_name_insts.push(inst);
+                            debug_name_insts.extend(insts);
                         } else {
-                            decoration_insts.push(inst);
+                            decoration_insts.extend(insts);
                         }
                     }
                 }
