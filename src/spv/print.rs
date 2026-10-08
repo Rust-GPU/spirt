@@ -213,8 +213,7 @@ impl<IMMS: Iterator<Item = spv::Imm>, ID, IDS: Iterator<Item = ID>> OperandPrint
                     None => return emit_missing_error(self),
                 };
 
-                let (variant_name, variant_def) =
-                    variants.get_named(word.try_into().unwrap()).unwrap();
+                let (variant_name, variant_def) = variants.get_named(word).unwrap();
                 self.out.tokens.extend([
                     Token::OperandKindNamespacePrefix(name),
                     Token::EnumerandName(variant_name),
