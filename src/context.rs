@@ -608,6 +608,49 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityList<E> {
         }
     }
 
+    /// Insert `new_node` (defined in `defs`) into `self`, after `prev`.
+    //
+    // FIXME(eddyb) unify this with the other insert methods, maybe with a new
+    // "insert position" type?
+    #[track_caller]
+    pub fn insert_after(&mut self, new_node: E, prev: E, defs: &mut EntityDefs<E>) {
+        let next = defs[prev].next.replace(new_node);
+
+        let new_node_def = &mut defs[new_node];
+        assert!(
+            new_node_def.next.is_none() && new_node_def.prev.is_none(),
+            "EntityList::insert_before: new node already linked into a (different?) list"
+        );
+
+        new_node_def.next = next;
+        new_node_def.prev = Some(prev);
+
+        match next {
+            Some(next) => {
+                let old_next_prev = defs[next].prev.replace(new_node);
+
+                // FIXME(eddyb) this situation should be impossible anyway, as it
+                // involves the `EntityListNode`s links, which should be unforgeable.
+                assert!(
+                    old_next_prev == Some(prev),
+                    "invalid EntityListNode: `node->next->prev != node`"
+                );
+            }
+            None => {
+                // FIXME(eddyb) this situation should be impossible anyway, as it
+                // involves the `EntityListNode`s links, which should be unforgeable,
+                // but it's still possible to keep around outdated `EntityList`s
+                // (should `EntityList` not implement `Copy`/`Clone` *at all*?)
+                assert!(
+                    self.0.map(|this| this.last) == Some(prev),
+                    "invalid EntityList: `node->next == None` but `node != last`"
+                );
+
+                self.0.as_mut().unwrap().last = new_node;
+            }
+        }
+    }
+
     /// Insert all of `list_to_prepend`'s nodes at the start of `self`.
     #[track_caller]
     pub fn prepend(&mut self, list_to_prepend: Self, defs: &mut EntityDefs<E>) {

@@ -458,7 +458,8 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr
+                TypeKind::Scalar(_)
+                | TypeKind::QPtr
                 | TypeKind::Thunk
                 | TypeKind::SpvTypeOperand
                 | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
@@ -495,6 +496,7 @@ impl InnerTransform for ConstDef {
             ty -> transformer.transform_type_use(*ty),
             kind -> match kind {
                 ConstKind::Undef
+                | ConstKind::Scalar(_)
                 | ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged,
 
                 ConstKind::PtrToGlobalVar(gv) => transform!({
@@ -652,9 +654,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
         match kind {
             DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
 
-            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            NodeKind::Select(
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+            )
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Scalar(_)
             | DataInstKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Load | MemOp::Store)
             | DataInstKind::QPtr(
                 QPtrOp::HandleArrayIndex

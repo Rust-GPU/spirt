@@ -118,9 +118,6 @@ def_well_known! {
         OpNoLine,
 
         OpTypeVoid,
-        OpTypeBool,
-        OpTypeInt,
-        OpTypeFloat,
         OpTypeVector,
         OpTypeMatrix,
         OpTypeArray,
@@ -134,9 +131,6 @@ def_well_known! {
         OpTypeSampledImage,
         OpTypeAccelerationStructureKHR,
 
-        OpConstantFalse,
-        OpConstantTrue,
-        OpConstant,
         OpConstantFunctionPointerINTEL,
 
         OpVariable,
