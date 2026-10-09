@@ -3,9 +3,8 @@
 // FIXME(eddyb) consider moving docs to the module level?
 
 use crate::cf::SelectionKind;
-use crate::cf::unstructured::{
-    ControlInst, ControlInstKind, IncomingEdgeCount, LoopFinder, TraversalState,
-};
+use crate::cf::unstructured::{ControlTarget, IncomingEdgeCount, LoopFinder, TraversalState};
+use crate::func_at::FuncAtMut;
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
@@ -145,10 +144,10 @@ enum StructurizeRegionState {
 /// **Note**: `target` has a generic type `T` to reduce redundancy when it's
 /// already implied (e.g. by the key in [`DeferredEdgeBundleSet`]'s map).
 struct IncomingEdgeBundle<T> {
-    /// Attributes from the original [`ControlInst`]s (likely debuginfo), kept
-    /// when merging only when exactly identical, which can naturally be the case
-    /// for debuginfo (e.g. for branches from inside `if`-`else`/`switch` to a
-    /// common merge point, just after the whole control-flow construct).
+    /// Attributes from the original `thunk`s (likely debuginfo), kept when
+    /// merging only when exactly identical, which can naturally be the case
+    /// for debuginfo (e.g. for branches from inside `if`-`else`/`switch` to
+    /// a common merge point, just after the whole control-flow construct).
     //
     // FIXME(eddyb) semantically filter these, maybe focus on debuginfo?
     attrs: AttrSet,
@@ -253,12 +252,14 @@ struct LazyCondDyn {
 
 /// A target for one of the edge bundles in a [`DeferredEdgeBundleSet`], mostly
 /// separate from [`Region`] to allow expressing returns as well.
+//
+// FIXME(eddyb) consider reusing `ControlTarget` for this.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum DeferredTarget {
     Region(Region),
 
     /// Structured "return" out of the function (with `target_inputs` used for
-    /// the function body `output`s, i.e. inputs of [`ControlInstKind::Return`]).
+    /// the function body `output`s).
     Return,
 }
 
@@ -587,7 +588,8 @@ impl<'a> Structurizer<'a> {
                 .as_ref()
                 .map(|cfg| {
                     let loop_header_to_exit_targets =
-                        LoopFinder::new(cfg).find_all_loops_starting_at(func_def_body.body);
+                        LoopFinder::new(cx, func_def_body.at(()), cfg)
+                            .find_all_loops_starting_at(func_def_body.body);
 
                     let mut state = TraversalState {
                         incoming_edge_counts: EntityOrientedDenseMap::new(),
@@ -881,7 +883,7 @@ impl<'a> Structurizer<'a> {
                 self.cx,
                 NodeDef {
                     // FIXME(eddyb) could it be possible to synthesize attrs
-                    // from `ControlInst`s' attrs and/or `OpLoopMerge`'s?
+                    // from thunks' attrs and/or `OpLoopMerge`'s?
                     attrs: AttrSet::default(),
                     kind: NodeKind::Loop {
                         // TODO(eddyb) make this a regular body output (first one?).
@@ -1040,54 +1042,118 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        let control_inst_on_exit = self
-            .func_def_body
-            .unstructured_cfg
-            .as_mut()
-            .unwrap()
-            .control_inst_on_exit_from
-            .remove(region)
-            .expect(
-                "cfg::Structurizer::structurize_region: missing \
-                   `ControlInst` (CFG wasn't unstructured in the first place?)",
+        // FIXME(eddyb) `ControlFlowGraph::edges_from_thunk_tailed_region`
+        // overlaps a lot with this, but is only traversing, not "stealing",
+        // so there might not be an easy way to deduplicate between the two.
+        // HACK(eddyb) only not a method because of its very limited usability
+        // (e.g. it modifies the function in such a way to guarantee that being
+        // called twice with the same arguments would result in panics).
+        //
+        // FIXME(eddyb) consider keeping `thunk`s in, initially, plumbing them
+        // in the same way that the "deferred edge" conditions and target inputs
+        // are today, but instead of generating `if`-`else` on conditions, using
+        // some kind of "`thunk` `switch`" node (handling only claimed regions),
+        // which would leave behind the subset of unhandled cases, merged with
+        // new potential destinations from within the handled cases, and doing
+        // this "unfolding" of the CFG would be the main point of structurization,
+        // with actual encodings for the remaining `thunk`s being implemented
+        // as a separate step (with optimizations such as integers replacing
+        // the "one-hot" `bool` condition encoding, reusing output slots with
+        // the same type - or even the same bit width - between targets, etc.).
+        fn steal_tail_thunk_from_region(
+            this: &mut Structurizer<'_>,
+            edge_source_region: Region,
+            thunk_binding_region: Region,
+        ) -> Result<ClaimedRegion, DeferredEdgeBundleSet> {
+            let thunk =
+                mem::take(&mut this.func_def_body.at_mut(thunk_binding_region).def().outputs)
+                    .into_iter()
+                    .exactly_one()
+                    .ok()
+                    .unwrap();
+
+            let thunk_node = match thunk {
+                Value::Var(thunk) => match this.func_def_body.at(thunk).decl().kind() {
+                    VarKind::NodeOutput { node, output_idx: 0 } => node,
+                    _ => unreachable!(),
+                },
+                Value::Const(ct) => match this.cx[ct].kind {
+                    ConstKind::Undef => return Err(DeferredEdgeBundleSet::Unreachable),
+                    _ => unreachable!(),
+                },
+            };
+
+            let thunk_node_def = mem::replace(
+                this.func_def_body.at_mut(thunk_node).def(),
+                // HACK(eddyb) there isn't a good "tombstone" to use here,
+                // but really the only thing we care about is no
+                // heap allocations remain around.
+                // FIXME(eddyb) come up with a better "nop" or add first-class
+                // tombstones (maybe with generational entity refs?).
+                NodeDef {
+                    attrs: Default::default(),
+                    kind: NodeKind::Select(SelectionKind::BoolCond),
+                    inputs: Default::default(),
+                    child_regions: Default::default(),
+                    outputs: Default::default(),
+                },
             );
 
-        // Start with the concatenation of `region` and `control_inst_on_exit`,
-        // always appending `Node`s (including the children of entire
-        // `ClaimedRegion`s) to `region`'s definition itself.
-        let mut deferred_edges = {
-            let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
+            assert!(
+                Value::Var(thunk_node_def.outputs.into_iter().exactly_one().ok().unwrap()) == thunk
+            );
 
-            let target_regions: SmallVec<[_; 8]> = targets
-                .iter()
-                .map(|&target| {
-                    self.try_claim_edge_bundle(IncomingEdgeBundle {
-                        attrs: if targets.len() == 1 { attrs } else { AttrSet::default() },
+            let thunk_binding_def = &mut this.func_def_body.regions[thunk_binding_region];
+            {
+                let thunk_binding_region_children = thunk_binding_def.children.iter();
+                assert!(thunk_binding_region_children.last == Some(thunk_node));
+                if edge_source_region != thunk_binding_region {
+                    assert!(
+                        thunk_binding_region_children.first == thunk_binding_region_children.last
+                    );
+                }
+            }
+            thunk_binding_def.children.remove(thunk_node, &mut this.func_def_body.nodes);
+
+            match thunk_node_def.kind {
+                NodeKind::ThunkBind(target) => {
+                    let target = match target {
+                        ControlTarget::Region(target) => target,
+                        ControlTarget::Return => {
+                            return Err(DeferredEdgeBundleSet::Always {
+                                target: DeferredTarget::Return,
+                                edge_bundle: IncomingEdgeBundle {
+                                    attrs: thunk_node_def.attrs,
+                                    accumulated_count: IncomingEdgeCount::default(),
+                                    target: (),
+                                    target_inputs: thunk_node_def.inputs,
+                                },
+                            });
+                        }
+                    };
+                    this.try_claim_edge_bundle(IncomingEdgeBundle {
+                        attrs: thunk_node_def.attrs,
                         target,
                         accumulated_count: IncomingEdgeCount::ONE,
-                        target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
+                        target_inputs: thunk_node_def.inputs,
                     })
                     .map_err(|edge_bundle| {
                         // HACK(eddyb) special-case "shared `unreachable`" to
                         // always inline it and avoid awkward "merges".
                         // FIXME(eddyb) should this be in a separate CFG pass?
                         // (i.e. is there a risk of other logic needing this?)
-                        let target_is_trivial_unreachable =
-                            match self.structurize_region_state.get(&edge_bundle.target) {
-                                Some(StructurizeRegionState::Ready {
-                                    region_deferred_edges: DeferredEdgeBundleSet::Unreachable,
-                                    ..
-                                }) => {
-                                    // FIXME(eddyb) DRY this "is empty region" check.
-                                    self.func_def_body
-                                        .at(edge_bundle.target)
-                                        .at_children()
-                                        .into_iter()
-                                        .next()
-                                        .is_none()
-                                }
-                                _ => false,
-                            };
+                        let target_is_trivial_unreachable = match this
+                            .structurize_region_state
+                            .get(&edge_bundle.target)
+                        {
+                            Some(StructurizeRegionState::Ready {
+                                region_deferred_edges: DeferredEdgeBundleSet::Unreachable,
+                                ..
+                            }) => {
+                                this.func_def_body.at(edge_bundle.target).def().children.is_empty()
+                            }
+                            _ => false,
+                        };
                         if target_is_trivial_unreachable {
                             DeferredEdgeBundleSet::Unreachable
                         } else {
@@ -1097,88 +1163,39 @@ impl<'a> Structurizer<'a> {
                             }
                         }
                     })
-                })
-                .collect();
-
-            match kind {
-                ControlInstKind::Unreachable => {
-                    // FIXME(eddyb) this loses `attrs`.
-                    let _ = attrs;
-
-                    assert_eq!((inputs.len(), target_regions.len()), (0, 0));
-
-                    // FIXME(eddyb) this may result in lost optimizations over
-                    // actually encoding it in `Node`/`Region`
-                    // (e.g. a new `NodeKind`, or replacing region `outputs`),
-                    // but it's simpler to handle it like this.
-                    //
-                    // NOTE(eddyb) actually, this encoding is lossless *during*
-                    // structurization, and a divergent region can only end up as:
-                    // - the function body, where it implies the function can
-                    //   never actually return: not fully structurized currently
-                    //   (but only for a silly reason, and is entirely fixable)
-                    // - a `Select` case, where it implies that case never merges
-                    //   back into the `Select` node, and potentially that the
-                    //   case can never be taken: this is where a structured
-                    //   encoding can be introduced, by pruning unreachable
-                    //   cases, and potentially even introducing `assume`s
-                    // - a `Loop` body is not actually possible when divergent
-                    //   (as there can be no backedge to form a cyclic CFG)
-                    DeferredEdgeBundleSet::Unreachable
                 }
+                // FIXME(eddyb) try to reuse the existing node and regions,
+                // which housed the individual thunks for CFG edges, in the
+                // final structured control-flow.
+                NodeKind::Select(kind) => {
+                    assert!(edge_source_region == thunk_binding_region);
 
-                ControlInstKind::ExitInvocation(kind) => {
-                    assert_eq!(target_regions.len(), 0);
+                    let scrutinee = thunk_node_def.inputs.into_iter().exactly_one().ok().unwrap();
 
-                    let node = self.func_def_body.nodes.define(
-                        self.cx,
-                        NodeDef {
-                            attrs,
-                            kind: NodeKind::ExitInvocation(kind),
-                            inputs,
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        }
-                        .into(),
-                    );
-                    self.func_def_body.regions[region]
-                        .children
-                        .insert_last(node, &mut self.func_def_body.nodes);
+                    let cases = thunk_node_def
+                        .child_regions
+                        .into_iter()
+                        .map(|case| steal_tail_thunk_from_region(this, edge_source_region, case))
+                        .collect();
 
-                    DeferredEdgeBundleSet::Unreachable
+                    Err(this.structurize_select_into(
+                        edge_source_region,
+                        thunk_node_def.attrs,
+                        kind,
+                        Ok(scrutinee),
+                        cases,
+                    ))
                 }
-
-                ControlInstKind::Return => {
-                    assert_eq!(target_regions.len(), 0);
-
-                    DeferredEdgeBundleSet::Always {
-                        target: DeferredTarget::Return,
-                        edge_bundle: IncomingEdgeBundle {
-                            attrs,
-                            accumulated_count: IncomingEdgeCount::default(),
-                            target: (),
-                            target_inputs: inputs,
-                        },
-                    }
-                }
-
-                ControlInstKind::Branch => {
-                    assert_eq!(inputs.len(), 0);
-
-                    self.append_maybe_claimed_region(
-                        region,
-                        target_regions.into_iter().exactly_one().ok().unwrap(),
-                    )
-                }
-
-                ControlInstKind::SelectBranch(kind) => {
-                    assert_eq!(inputs.len(), 1);
-
-                    let scrutinee = inputs[0];
-
-                    self.structurize_select_into(region, attrs, kind, Ok(scrutinee), target_regions)
-                }
+                _ => unreachable!(),
             }
+        }
+
+        // Start with the concatenation of `region` and its unstructured thunk,
+        // always appending `Node`s (including the children of entire
+        // `ClaimedRegion`s) to `region`'s definition itself.
+        let mut deferred_edges = {
+            let tail_thunk = steal_tail_thunk_from_region(self, region, region);
+            self.append_maybe_claimed_region(region, tail_thunk)
         };
 
         // Try to resolve deferred edges that may have accumulated, and keep
@@ -1805,8 +1822,8 @@ impl<'a> Structurizer<'a> {
     }
 
     /// When structurization is only partial, and there remain unclaimed regions,
-    /// they have to be reintegrated into the CFG, putting back [`ControlInst`]s
-    /// where `structurize_region` has taken them from.
+    /// they have to be reintegrated into the CFG, putting back `thunk`s where
+    /// `structurize_region` has taken them from.
     ///
     /// This function handles one region at a time to make it more manageable,
     /// despite it having a single call site (in a loop in `structurize_func`).
@@ -1822,118 +1839,145 @@ impl<'a> Structurizer<'a> {
              after it takes `structurize_region_state`"
         );
 
+        let cx = self.cx;
+
+        let thunk_ty = cx.intern(TypeKind::Thunk);
+        let build_thunk = |func_at_region: FuncAtMut<'_, Region>, (target, target_inputs)| {
+            let region = func_at_region.position;
+            let func = func_at_region.at(());
+
+            let target = match target {
+                DeferredTarget::Region(target) => ControlTarget::Region(target),
+                DeferredTarget::Return => ControlTarget::Return,
+            };
+
+            let thunk_node = func.nodes.define(
+                cx,
+                NodeDef {
+                    attrs: AttrSet::default(),
+                    kind: NodeKind::ThunkBind(target),
+                    inputs: target_inputs,
+                    child_regions: [].into_iter().collect(),
+                    outputs: [].into_iter().collect(),
+                }
+                .into(),
+            );
+            func.regions[region].children.insert_last(thunk_node, func.nodes);
+
+            let thunk_var = func.vars.define(
+                cx,
+                VarDecl {
+                    attrs: AttrSet::default(),
+                    ty: thunk_ty,
+
+                    def_parent: Either::Right(thunk_node),
+                    def_idx: 0,
+                },
+            );
+            func.nodes[thunk_node].outputs.push(thunk_var);
+
+            Value::Var(thunk_var)
+        };
+
         // Build a chain of conditional branches to apply deferred edges.
         let mut control_source = Some(region);
         loop {
             let taken_then;
-            (taken_then, deferred_edges) =
-                deferred_edges.split_out_matching(|deferred| match deferred.edge_bundle.target {
-                    DeferredTarget::Region(target) => {
-                        Ok((deferred.condition, (target, deferred.edge_bundle.target_inputs)))
-                    }
-                    DeferredTarget::Return => Err(deferred),
-                });
-            let Some((condition, then_target_and_inputs)) = taken_then else {
+            (taken_then, deferred_edges) = deferred_edges.split_out_matching(|deferred| {
+                Ok((
+                    deferred.condition,
+                    (deferred.edge_bundle.target, deferred.edge_bundle.target_inputs),
+                ))
+            });
+            let Some((condition, then_edge)) = taken_then else {
                 break;
             };
+
             let branch_source = control_source.take().unwrap();
-            let else_target_and_inputs = match deferred_edges {
+            let else_edge = match deferred_edges {
                 // At most one deferral left, so it can be used as the "else"
                 // case, or the branch left unconditional in its absence.
                 DeferredEdgeBundleSet::Unreachable => None,
-                DeferredEdgeBundleSet::Always {
-                    target: DeferredTarget::Region(else_target),
-                    edge_bundle,
-                } => {
+                DeferredEdgeBundleSet::Always { target: else_target, edge_bundle } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
                     Some((else_target, edge_bundle.target_inputs))
                 }
 
-                // Either more branches, or a deferred return, are needed, so
-                // the "else" case must be a `Region` that itself can
-                // have a `ControlInst` attached to it later on.
-                _ => {
+                // More branches are needed, so the "else" case must be a `Region`
+                // that itself can have a `thunk` attached to it later on.
+                DeferredEdgeBundleSet::Choice { .. } => {
                     let new_empty_region =
-                        self.func_def_body.regions.define(self.cx, RegionDef::default());
+                        self.func_def_body.regions.define(cx, RegionDef::default());
                     control_source = Some(new_empty_region);
-                    Some((new_empty_region, [].into_iter().collect()))
+                    Some((DeferredTarget::Region(new_empty_region), [].into_iter().collect()))
                 }
             };
 
-            let condition = Some(condition)
-                .filter(|_| else_target_and_inputs.is_some())
-                .map(|cond| self.materialize_lazy_cond(&cond));
-            let branch_control_inst = ControlInst {
-                attrs: AttrSet::default(),
-                kind: if condition.is_some() {
-                    ControlInstKind::SelectBranch(SelectionKind::BoolCond)
-                } else {
-                    ControlInstKind::Branch
-                },
-                inputs: condition.into_iter().collect(),
-                targets: [&then_target_and_inputs]
-                    .into_iter()
-                    .chain(&else_target_and_inputs)
-                    .map(|&(target, _)| target)
-                    .collect(),
-                target_inputs: [then_target_and_inputs]
-                    .into_iter()
-                    .chain(else_target_and_inputs)
-                    .filter(|(_, inputs)| !inputs.is_empty())
-                    .collect(),
-            };
-            assert!(
-                self.func_def_body
-                    .unstructured_cfg
-                    .as_mut()
-                    .unwrap()
-                    .control_inst_on_exit_from
-                    .insert(branch_source, branch_control_inst)
-                    .is_none()
-            );
-        }
+            let thunk = if let Some(else_edge) = else_edge {
+                let condition = self.materialize_lazy_cond(&condition);
 
-        let deferred_return = match deferred_edges {
-            DeferredEdgeBundleSet::Unreachable => None,
-            DeferredEdgeBundleSet::Always { target: DeferredTarget::Return, edge_bundle } => {
-                Some(edge_bundle.target_inputs)
-            }
-            _ => unreachable!(),
-        };
+                let cases = [then_edge, else_edge]
+                    .into_iter()
+                    .map(|target_with_inputs| {
+                        let case = self.func_def_body.regions.define(cx, RegionDef::default());
+                        let thunk =
+                            build_thunk(self.func_def_body.at_mut(case), target_with_inputs);
+                        self.func_def_body.regions[case].outputs.push(thunk);
+                        case
+                    })
+                    .collect();
+
+                let select_node = self.func_def_body.nodes.define(
+                    cx,
+                    NodeDef {
+                        attrs: AttrSet::default(),
+                        kind: NodeKind::Select(SelectionKind::BoolCond),
+                        inputs: [condition].into_iter().collect(),
+                        child_regions: cases,
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                self.func_def_body.regions[branch_source]
+                    .children
+                    .insert_last(select_node, &mut self.func_def_body.nodes);
+
+                let select_thunk_var = self.func_def_body.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: AttrSet::default(),
+                        ty: thunk_ty,
+
+                        def_parent: Either::Right(select_node),
+                        def_idx: 0,
+                    },
+                );
+                self.func_def_body.nodes[select_node].outputs.push(select_thunk_var);
+
+                Value::Var(select_thunk_var)
+            } else {
+                build_thunk(self.func_def_body.at_mut(branch_source), then_edge)
+            };
+
+            self.func_def_body.regions[branch_source].outputs = [thunk].into_iter().collect();
+        }
 
         let final_source = match control_source {
             Some(region) => region,
-            None => {
-                // The loop above handled all the targets, nothing left to do.
-                assert!(deferred_return.is_none());
-                return;
-            }
+            // The loop above handled all the targets, nothing left to do.
+            None => return,
         };
 
-        // Final deferral is either a `Return` (if needed), or an `Unreachable`
-        // (only when truly divergent, i.e. no `deferred_edges`/`deferred_return`).
-        let final_control_inst = {
-            let (kind, inputs) = match deferred_return {
-                Some(return_values) => (ControlInstKind::Return, return_values),
-                None => (ControlInstKind::Unreachable, [].into_iter().collect()),
-            };
-            ControlInst {
-                attrs: AttrSet::default(),
-                kind,
-                inputs,
-                targets: [].into_iter().collect(),
-                target_inputs: FxIndexMap::default(),
-            }
-        };
-        assert!(
-            self.func_def_body
-                .unstructured_cfg
-                .as_mut()
-                .unwrap()
-                .control_inst_on_exit_from
-                .insert(final_source, final_control_inst)
-                .is_none()
-        );
+        // Final deferral is unreachable (only when truly divergent,
+        // i.e. no `deferred_edges`).
+        // FIXME(eddyb) this should probably be special-cased at the start of
+        // this function, instead of here at the end.
+        let final_thunk = Value::Const(cx.intern(ConstDef {
+            attrs: AttrSet::default(),
+            ty: thunk_ty,
+            kind: ConstKind::Undef,
+        }));
+        self.func_def_body.regions[final_source].outputs = [final_thunk].into_iter().collect();
     }
 
     /// Create an undefined constant (as a placeholder where a value needs to be
