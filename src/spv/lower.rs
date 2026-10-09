@@ -110,6 +110,15 @@ impl Module {
         let spv_spec = spec::Spec::get();
         let wk = &spv_spec.well_known;
 
+        // HACK(eddyb) useful for embedding `Type` in `Const` whenever necessary.
+        let spv_type_operand_as_const = |ty| {
+            cx.intern(ConstDef {
+                attrs: AttrSet::default(),
+                ty: cx.intern(TypeKind::SpvTypeOperand),
+                kind: ConstKind::SpvTypeOperand(ty),
+            })
+        };
+
         // HACK(eddyb) used to quickly check whether an `OpVariable` is global.
         let storage_class_function_imm = spv::Imm::Short(wk.StorageClass, wk.Function);
 
@@ -281,6 +290,7 @@ impl Module {
                     let const_inputs = operand_ids
                         .iter()
                         .map(|&id| match id_defs.get(&id) {
+                            Some(&IdDef::Type(ty)) => Ok(spv_type_operand_as_const(ty)),
                             Some(&IdDef::Const(ct)) => Ok(ct),
                             Some(id_def) => Err(id_def.descr(&cx)),
                             None => Err(format!("a forward reference to %{id}")),
@@ -640,6 +650,7 @@ impl Module {
                     .ids
                     .iter()
                     .map(|&id| match id_defs.get(&id) {
+                        Some(&IdDef::Type(ty)) => Ok(spv_type_operand_as_const(ty)),
                         Some(&IdDef::Const(ct)) => Ok(ct),
                         Some(id_def) => Err(id_def.descr(&cx)),
                         None => Err(format!("a forward reference to %{id}")),
@@ -1188,6 +1199,9 @@ impl Module {
                 // FIXME(eddyb) this returns `LocalIdDef` even for global values.
                 let lookup_global_or_local_id_for_data_or_control_inst_input =
                     |id| match id_defs.get(&id) {
+                        Some(&IdDef::Type(ty)) => {
+                            Ok(LocalIdDef::Value(Value::Const(spv_type_operand_as_const(ty))))
+                        }
                         Some(&IdDef::Const(ct)) => Ok(LocalIdDef::Value(Value::Const(ct))),
                         Some(id_def @ IdDef::Type(_)) => Err(invalid(&format!(
                             "unsupported use of {} as an operand for \

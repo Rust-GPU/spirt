@@ -451,7 +451,9 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
+                TypeKind::QPtr
+                | TypeKind::SpvTypeOperand
+                | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
                 TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
@@ -497,6 +499,11 @@ impl InnerTransform for ConstDef {
                         spv_inst_and_const_inputs: Rc::new((spv_inst.clone(), new_iter.collect())),
                     })
                 }
+
+                ConstKind::SpvTypeOperand(ty) => transform!({
+                    ty -> transformer.transform_type_use(*ty),
+                } => ConstKind::SpvTypeOperand(ty)),
+
                 ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged
             },
         } => Self {

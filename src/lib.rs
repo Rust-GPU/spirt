@@ -567,6 +567,10 @@ pub enum TypeKind {
         type_and_const_inputs: SmallVec<[TypeOrConst; 2]>,
     },
 
+    /// The type of a [`ConstKind::SpvTypeOperand`] constant, i.e. a [`Type`]
+    /// embedded in a [`Value`] to be passed as a SPIR-V operand.
+    SpvTypeOperand,
+
     /// The type of a [`ConstKind::SpvStringLiteralForExtInst`] constant, i.e.
     /// a SPIR-V `OpString` with no actual type in SPIR-V.
     SpvStringLiteralForExtInst,
@@ -609,6 +613,9 @@ pub enum ConstKind {
     SpvInst {
         spv_inst_and_const_inputs: Rc<(spv::Inst, SmallVec<[Const; 4]>)>,
     },
+
+    /// Type used as an operand to a SPIR-V instruction (other than result type).
+    SpvTypeOperand(Type),
 
     /// SPIR-V `OpString`, but only when used as an operand for an `OpExtInst`,
     /// which can't have literals itself - for non-string literals `OpConstant*`

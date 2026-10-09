@@ -216,6 +216,9 @@ impl<'a> LayoutCache<'a> {
             TypeKind::SpvInst { spv_inst, type_and_const_inputs } => {
                 (spv_inst, type_and_const_inputs)
             }
+            TypeKind::SpvTypeOperand => {
+                return Err(LayoutError(Diag::bug(["`layout_of(type_of(type))`".into()])));
+            }
             TypeKind::SpvStringLiteralForExtInst => {
                 return Err(LayoutError(Diag::bug([
                     "`layout_of(type_of(OpString<\"...\">))`".into()
