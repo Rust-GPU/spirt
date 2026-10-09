@@ -1,15 +1,16 @@
 //! [`QPtr`](crate::TypeKind::QPtr) lowering (e.g. from SPIR-V).
 
 use crate::func_at::FuncAtMut;
-use crate::mem::{MemOp, shapes};
+use crate::mem::{MemOp, const_data, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
-    AddrSpace, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, Node, NodeDef,
-    NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl, VarKind, spv,
+    AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
+    DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, GlobalVarInit,
+    Node, NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, Var, VarDecl,
+    VarKind, scalar, spv,
 };
-use itertools::{Either, Itertools as _};
+use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -53,7 +54,29 @@ impl<'a> LowerFromSpvPtrs<'a> {
                 shapes::Handle::Buffer(addr_space, buf.mem_layout)
             }
         };
-        let mut shape_result = self.layout_of(pointee_type).and_then(|layout| {
+        let addr_space_requires_typed_interface = match global_var_decl.addr_space {
+            // These SPIR-V Storage Classes are defined to require
+            // exact types, either because they're `BuiltIn`s, or
+            // for "interface matching" between pipeline stages.
+            AddrSpace::SpvStorageClass(sc) => [
+                wk.Input,
+                wk.Output,
+                wk.IncomingRayPayloadKHR,
+                wk.IncomingCallableDataKHR,
+                wk.HitAttributeKHR,
+                wk.RayPayloadKHR,
+                wk.CallableDataKHR,
+            ]
+            .contains(&sc),
+
+            AddrSpace::Handles => false,
+        };
+        let layout_result = self.layout_of(pointee_type);
+        let concrete_mem_layout = layout_result.as_ref().ok().and_then(|layout| match layout {
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => None,
+            TypeLayout::Concrete(concrete) => Some(concrete.mem_layout),
+        });
+        let mut shape_result = layout_result.and_then(|layout| {
             Ok(match layout {
                 TypeLayout::Handle(handle) => shapes::GlobalVarShape::Handles {
                     handle: handle_layout_to_handle(handle),
@@ -71,26 +94,10 @@ impl<'a> LowerFromSpvPtrs<'a> {
                             "`".into(),
                         ])));
                     }
-                    match global_var_decl.addr_space {
-                        // These SPIR-V Storage Classes are defined to require
-                        // exact types, either because they're `BuiltIn`s, or
-                        // for "interface matching" between pipeline stages.
-                        AddrSpace::SpvStorageClass(sc)
-                            if [
-                                wk.Input,
-                                wk.Output,
-                                wk.IncomingRayPayloadKHR,
-                                wk.IncomingCallableDataKHR,
-                                wk.HitAttributeKHR,
-                                wk.RayPayloadKHR,
-                                wk.CallableDataKHR,
-                            ]
-                            .contains(&sc) =>
-                        {
-                            shapes::GlobalVarShape::TypedInterface(pointee_type)
-                        }
-
-                        _ => shapes::GlobalVarShape::UntypedData(concrete.mem_layout.fixed_base),
+                    if addr_space_requires_typed_interface {
+                        shapes::GlobalVarShape::TypedInterface(pointee_type)
+                    } else {
+                        shapes::GlobalVarShape::UntypedData(concrete.mem_layout.fixed_base)
                     }
                 }
             })
@@ -126,18 +133,239 @@ impl<'a> LowerFromSpvPtrs<'a> {
                 global_var_decl.addr_space = AddrSpace::Handles;
             }
         }
+
+        // HACK(eddyb) the interactions with `shape_result` are a bit too ad-hoc,
+        // but they help testing for now (until Rust-GPU is more accurate).
+        if let DeclDef::Present(global_var_def_body) = &mut global_var_decl.def {
+            let lowered_init = global_var_def_body.initializer.as_ref().and_then(|init| {
+                self.try_lower_global_var_init(init)
+                    .map_err(|LowerError(e)| {
+                        if shape_result.is_ok() {
+                            shape_result = Err(LowerError(e));
+                        } else {
+                            global_var_decl.attrs.push_diag(&self.cx, e);
+                        }
+                    })
+                    .ok()
+            });
+            if let Some(init) = lowered_init {
+                // HACK(eddyb) recover the shape from the initializer.
+                match (&shape_result, concrete_mem_layout, &init) {
+                    (Err(_), Some(mem_layout), GlobalVarInit::Data(data))
+                        if !addr_space_requires_typed_interface
+                            && mem_layout.dyn_unit_stride.is_some()
+                            && mem_layout.fixed_base.size <= data.size() =>
+                    {
+                        let mut fixed_layout = mem_layout.fixed_base;
+                        fixed_layout.size = data.size();
+                        shape_result = Ok(shapes::GlobalVarShape::UntypedData(fixed_layout));
+                    }
+                    _ => {}
+                }
+                if shape_result.is_ok() {
+                    global_var_def_body.initializer = Some(init);
+                }
+            }
+        }
+
+        // HACK(eddyb) in case anything goes wrong, we want to keep `OpTypePointer`.
+        let original_type_of_ptr_to = global_var_decl.type_of_ptr_to;
+
+        EraseSpvPtrs { lowerer: self }.in_place_transform_global_var_decl(global_var_decl);
+
         match shape_result {
             Ok(shape) => {
                 global_var_decl.shape = Some(shape);
-
-                // HACK(eddyb) this should handle shallow `QPtr` in the initializer, but
-                // typed initializers should be replaced with miri/linker-style ones.
-                EraseSpvPtrs { lowerer: self }.in_place_transform_global_var_decl(global_var_decl);
             }
             Err(LowerError(e)) => {
                 global_var_decl.attrs.push_diag(&self.cx, e);
+
+                // HACK(eddyb) effectively undoes `EraseSpvPtrs` for one field.
+                global_var_decl.type_of_ptr_to = original_type_of_ptr_to;
             }
         }
+    }
+    fn try_lower_global_var_init(
+        &self,
+        global_var_init: &GlobalVarInit,
+    ) -> Result<GlobalVarInit, LowerError> {
+        let (aggregate_type, aggregate_leaves) = match global_var_init {
+            &GlobalVarInit::Direct(ct) => return Ok(GlobalVarInit::Direct(ct)),
+
+            GlobalVarInit::Data(_) => {
+                return Err(LowerError(Diag::bug([
+                    "unexpected `GlobalVarInit::Data` (already lowered?)".into(),
+                ])));
+            }
+
+            GlobalVarInit::SpvAggregate { ty, leaves } => (*ty, leaves),
+        };
+        let aggregate_layout = match self.layout_of(aggregate_type)? {
+            // FIXME(eddyb) consider bad interactions with "interface blocks"?
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => {
+                return Err(LowerError(Diag::bug(["handles are not aggregates".into()])));
+            }
+            TypeLayout::Concrete(layout) => layout,
+        };
+
+        let mut leaf_values = aggregate_leaves.iter().copied();
+        let mut data = const_data::ConstData::new(aggregate_layout.mem_layout.fixed_base.size);
+        let result = aggregate_layout.deeply_flatten_if(
+            0,
+            // Whether `candidate_layout` is an aggregate (to recurse into).
+            &|candidate_layout| {
+                matches!(
+                    &self.cx[candidate_layout.original_type].kind,
+                    TypeKind::SpvInst { value_lowering: spv::ValueLowering::Disaggregate(_), .. }
+                )
+            },
+            &mut |leaf_offset, leaf| {
+                let leaf_offset = u32::try_from(leaf_offset).ok().ok_or_else(|| {
+                    LayoutError(Diag::bug([format!(
+                        "negative initializer leaf offset {leaf_offset}"
+                    )
+                    .into()]))
+                })?;
+
+                let leaf_value = leaf_values.next().ok_or_else(|| {
+                    LayoutError(Diag::bug(["fewer initializer leaves than layout".into()]))
+                })?;
+                let leaf_value_def = &self.cx[leaf_value];
+
+                // FIXME(eddyb) should this compare only size/shape?
+                let expected_ty = leaf.original_type;
+                let found_ty = leaf_value_def.ty;
+                if expected_ty != found_ty {
+                    return Err(LayoutError(Diag::bug([
+                        "initializer leaf type mismatch: expected `".into(),
+                        expected_ty.into(),
+                        "`, found `".into(),
+                        found_ty.into(),
+                        "` typed value `".into(),
+                        leaf_value.into(),
+                        "`".into(),
+                    ])));
+                }
+
+                let leaf_size =
+                    NonZeroU32::new(leaf.mem_layout.fixed_base.size).ok_or_else(|| {
+                        LayoutError(Diag::bug([
+                            format!(
+                                "zero-sized initializer leaf at offset {leaf_offset}, with value `"
+                            )
+                            .into(),
+                            leaf_value.into(),
+                            "`".into(),
+                        ]))
+                    })?;
+
+                self.try_write_to_const_data_at(&mut data, leaf_offset, leaf_size, leaf_value)
+            },
+        );
+        result.map_err(|LayoutError(e)| LowerError(e))?;
+
+        if leaf_values.next().is_some() {
+            return Err(LowerError(Diag::bug(["more initializer leaves than layout".into()])));
+        }
+
+        Ok(GlobalVarInit::Data(data))
+    }
+    // FIXME(eddyb) move this to a more general `ConstData` helper.
+    fn try_write_to_const_data_at(
+        &self,
+        data: &mut const_data::ConstData<Const>,
+        offset: u32,
+        size: NonZeroU32,
+        ct: Const,
+    ) -> Result<(), LayoutError> {
+        // HACK(eddyb) strip bitcasts as long as the input and output size match.
+        let (ct, ct_def) = {
+            let (mut ct, mut ct_def) = (ct, &self.cx[ct]);
+            while let ConstKind::SpvInst { spv_inst_and_const_inputs } = &ct_def.kind {
+                let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
+
+                if let (&[input], &[spv::Imm::Short(_, op)]) =
+                    (&const_inputs[..], &spv_inst.imms[..])
+                    && spv_inst.opcode == self.wk.OpSpecConstantOp
+                    && op == u32::from(self.wk.OpBitcast.as_u16())
+                {
+                    let input_def = &self.cx[input];
+                    let input_size =
+                        self.layout_cache.layout_of(input_def.ty).ok().and_then(|layout| {
+                            match layout {
+                                TypeLayout::Concrete(layout)
+                                    if layout.mem_layout.dyn_unit_stride.is_none() =>
+                                {
+                                    NonZeroU32::new(layout.mem_layout.fixed_base.size)
+                                }
+                                _ => None,
+                            }
+                        });
+                    if input_size == Some(size) {
+                        (ct, ct_def) = (input, input_def);
+                        continue;
+                    }
+                }
+                break;
+            }
+            (ct, ct_def)
+        };
+
+        let err_to_diag = |err| {
+            let const_data::PartialSymbolicOverlap { offsets } = err;
+            LayoutError(Diag::bug([
+                format!("initializer leaf at offset {offset}, with value `").into(),
+                ct.into(),
+                format!("`, overlaps with leaf at offsets {offsets:?} (invalid layout?)").into(),
+            ]))
+        };
+
+        let mut total_written_range = offset..offset;
+
+        // HACK(eddyb) helper shared by `Scalar` and `Vector`.
+        let mut write_next_scalar = |leaf_scalar: scalar::Const| {
+            // FIXME(eddyb) try harder to avoid panicking due to out-of-bounds
+            // offsets caused by e.g. malformed layouts (and/or guarantee certain
+            // invariants for types that didn't error during layout computation).
+            let written_range = data
+                .write_scalar(total_written_range.end, leaf_scalar, self.layout_cache.config)
+                .map_err(err_to_diag)?;
+            total_written_range.end = written_range.end;
+            Ok(())
+        };
+
+        match &ct_def.kind {
+            // HACK(eddyb) Rust-GPU still uses `undef`
+            // w/ custom attributes for some error cases,
+            // so care must be taken until that's deemed
+            // incorrect (if at all).
+            // FIXME(eddyb) handle this elsewhere, too.
+            ConstKind::Undef if ct_def.attrs == AttrSet::default() => {
+                return Ok(());
+            }
+
+            &ConstKind::Scalar(leaf_scalar) => {
+                write_next_scalar(leaf_scalar)?;
+            }
+
+            ConstKind::Vector(leaf_vector) => {
+                for elem in leaf_vector.elems() {
+                    write_next_scalar(elem)?;
+                }
+            }
+
+            // FIXME(eddyb) try harder to avoid panicking due to out-of-bounds
+            // offsets caused by e.g. malformed layouts (and/or guarantee certain
+            // invariants for types that didn't error during layout computation).
+            _ => {
+                data.write_symbolic(offset, size, ct).map_err(err_to_diag)?;
+                total_written_range.end += size.get();
+            }
+        }
+
+        assert_eq!(total_written_range, offset..(offset + size.get()));
+
+        Ok(())
     }
 
     pub fn lower_func(&self, func_decl: &mut FuncDecl) {
@@ -165,7 +393,7 @@ impl<'a> LowerFromSpvPtrs<'a> {
     // (!!! may cause bad interactions with storage class inference `Generic` abuse)
     fn as_spv_ptr_type(&self, ty: Type) -> Option<(AddrSpace, Type)> {
         match &self.cx[ty].kind {
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                 if spv_inst.opcode == self.wk.OpTypePointer =>
             {
                 let sc = match spv_inst.imms[..] {
@@ -421,17 +649,22 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         let attrs = data_inst_def.attrs;
 
-        let spv_inst = match &data_inst_def.kind {
-            DataInstKind::SpvInst(spv_inst) => spv_inst,
+        let (spv_inst, spv_inst_lowering) = match &data_inst_def.kind {
+            DataInstKind::SpvInst(spv_inst, lowering) => (spv_inst, lowering),
             _ => return Ok(Transformed::Unchanged),
         };
 
         // FIXME(eddyb) wasteful clone? (needed due to borrowing issues)
         let outputs = data_inst_def.outputs.clone();
 
+        // HACK(eddyb) this is for easy bailing/asserting.
+        let disaggregated_output_or_inputs_during_lowering =
+            spv_inst_lowering.disaggregated_output.is_some()
+                || !spv_inst_lowering.disaggregated_inputs.is_empty();
+
         // Flatten `QPtrOp::Offset`s behind `ptr` into a base pointer and offset.
         let flatten_offsets = |mut ptr| {
-            let mut offset = None::<NonZeroI32>;
+            let mut offset = 0;
             loop {
                 (ptr, offset) = if let Value::Var(ptr) = ptr
                     && let VarKind::NodeOutput { node: ptr_inst, output_idx: 0 } =
@@ -441,9 +674,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         inputs,
                         ..
                     } = func.at(ptr_inst).def()
-                    && let Some(new_offset) = ptr_offset.checked_add(offset.map_or(0, |o| o.get()))
+                    && let Some(new_offset) = ptr_offset.checked_add(offset)
                 {
-                    (inputs[0], NonZeroI32::new(new_offset))
+                    (inputs[0], new_offset)
                 } else {
                     break;
                 };
@@ -451,12 +684,31 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             (ptr, offset)
         };
 
+        // NOTE(eddyb) the ordering of some checks below is not purely aesthetic,
+        // if the types are invalid there could e.g. be disaggregation where it
+        // should never otherwise appear, so type checks should precede them.
+
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
-            assert!(data_inst_def.inputs.len() <= 1);
+            // HACK(eddyb) only needed because of potentially invalid SPIR-V.
+            let output_type = spv_inst_lowering
+                .disaggregated_output
+                .unwrap_or_else(|| func.at(outputs[0]).decl().ty);
             let (_, var_data_type) =
-                self.lowerer.as_spv_ptr_type(func.at(outputs[0]).decl().ty).ok_or_else(|| {
+                self.lowerer.as_spv_ptr_type(output_type).ok_or_else(|| {
                     LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
                 })?;
+
+            assert!(spv_inst_lowering.disaggregated_output.is_none());
+
+            // FIXME(eddyb) this can be happen due to the optional initializer.
+            // FIXME(eddyb) lower the initializer to store(s) just after variables.
+            if !spv_inst_lowering.disaggregated_inputs.is_empty() {
+                return Ok(Transformed::Unchanged);
+            }
+
+            assert_eq!(outputs.len(), 1);
+            assert!(data_inst_def.inputs.len() <= 1);
+
             match self.lowerer.layout_of(var_data_type)? {
                 TypeLayout::Concrete(concrete) if concrete.mem_layout.dyn_unit_stride.is_none() => {
                     (
@@ -466,32 +718,15 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 }
                 _ => return Ok(Transformed::Unchanged),
             }
-        } else if spv_inst.opcode == wk.OpLoad {
-            // FIXME(eddyb) support memory operands somehow.
-            if !spv_inst.imms.is_empty() {
-                return Ok(Transformed::Unchanged);
-            }
-            assert_eq!(data_inst_def.inputs.len(), 1);
-
-            let ptr = data_inst_def.inputs[0];
-
-            let (ptr, offset) = flatten_offsets(ptr);
-
-            (MemOp::Load { offset }.into(), [ptr].into_iter().collect())
-        } else if spv_inst.opcode == wk.OpStore {
-            // FIXME(eddyb) support memory operands somehow.
-            if !spv_inst.imms.is_empty() {
-                return Ok(Transformed::Unchanged);
-            }
-            assert_eq!(data_inst_def.inputs.len(), 2);
-
-            let ptr = data_inst_def.inputs[0];
-            let value = data_inst_def.inputs[1];
-
-            let (ptr, offset) = flatten_offsets(ptr);
-
-            (MemOp::Store { offset }.into(), [ptr, value].into_iter().collect())
         } else if spv_inst.opcode == wk.OpArrayLength {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
             let field_idx = match spv_inst.imms[..] {
                 [spv::Imm::Short(_, field_idx)] => field_idx,
                 _ => unreachable!(),
@@ -561,6 +796,14 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         ]
         .contains(&spv_inst.opcode)
         {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
             // FIXME(eddyb) avoid erasing the "inbounds" qualifier.
             let base_ptr = data_inst_def.inputs[0];
             let (_, base_pointee_type) =
@@ -572,11 +815,12 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             // a `OpTypeRuntimeArray`, with the original type as the element type.
             let access_chain_base_layout =
                 if [wk.OpPtrAccessChain, wk.OpInBoundsPtrAccessChain].contains(&spv_inst.opcode) {
-                    self.lowerer.layout_of(cx.intern(TypeKind::SpvInst {
-                        spv_inst: wk.OpTypeRuntimeArray.into(),
-                        type_and_const_inputs:
+                    self.lowerer.layout_of(cx.intern(
+                        spv::Inst::from(wk.OpTypeRuntimeArray).into_canonical_type_with(
+                            cx,
                             [TypeOrConst::Type(base_pointee_type)].into_iter().collect(),
-                    }))?
+                        ),
+                    ))?
                 } else {
                     self.lowerer.layout_of(base_pointee_type)?
                 };
@@ -590,9 +834,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 steps.first_mut()
             {
                 let (ptr_base_ptr, ptr_offset) = flatten_offsets(ptr);
-                if let Some(new_first_offset) =
-                    first_offset.checked_add(ptr_offset.map_or(0, |o| o.get()))
-                {
+                if let Some(new_first_offset) = first_offset.checked_add(ptr_offset) {
                     ptr = ptr_base_ptr;
                     *first_offset = new_first_offset;
                 }
@@ -610,7 +852,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 let step_data_inst = func.nodes.define(
                     cx,
                     DataInstDef {
-                        attrs: Default::default(),
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
                         kind,
                         inputs,
                         child_regions: [].into_iter().collect(),
@@ -653,7 +897,454 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 ptr = Value::Var(step_output_var);
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
+        } else if [wk.OpLoad, wk.OpStore].contains(&spv_inst.opcode) {
+            let ptr = data_inst_def.inputs[0];
+
+            // HACK(eddyb) only needed because of potentially invalid SPIR-V.
+            let type_of_ptr = match &spv_inst_lowering.disaggregated_inputs[..] {
+                [(range, _), ..] if range.start == 0 => None,
+                _ => Some(func.at(ptr).type_of(cx)),
+            };
+            let (_, pointee_type) = type_of_ptr
+                .and_then(|type_of_ptr| self.lowerer.as_spv_ptr_type(type_of_ptr))
+                .ok_or_else(|| {
+                    LowerError(Diag::bug(["pointer input not an `OpTypePointer`".into()]))
+                })?;
+
+            #[derive(Copy, Clone)]
+            enum Access {
+                Load { output: Var },
+                Store(Value),
+            }
+
+            impl Access {
+                fn to_data_inst_def(self, attrs: AttrSet, ptr: Value, offset: i32) -> DataInstDef {
+                    let offset = NonZeroI32::new(offset);
+                    match self {
+                        Access::Load { output } => DataInstDef {
+                            attrs,
+                            kind: MemOp::Load { offset }.into(),
+                            inputs: [ptr].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [output].into_iter().collect(),
+                        },
+                        Access::Store(value) => DataInstDef {
+                            attrs,
+                            kind: MemOp::Store { offset }.into(),
+                            inputs: [ptr, value].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        },
+                    }
+                }
+            }
+
+            enum Accesses<LLA: Iterator<Item = Access>> {
+                Single(Access),
+                AggregateLeaves { aggregate_type: Type, leaf_accesses: LLA },
+            }
+
+            let accesses = if spv_inst.opcode == wk.OpLoad {
+                assert!(spv_inst_lowering.disaggregated_inputs.is_empty());
+                assert_eq!(data_inst_def.inputs.len(), 1);
+
+                match spv_inst_lowering.disaggregated_output {
+                    None => Accesses::Single(Access::Load { output: outputs[0] }),
+                    Some(aggregate_type) => Accesses::AggregateLeaves {
+                        aggregate_type,
+                        leaf_accesses: Either::Left(
+                            outputs.iter().map(|&output| Access::Load { output }),
+                        ),
+                    },
+                }
+            } else {
+                assert!(spv_inst_lowering.disaggregated_output.is_none());
+
+                match spv_inst_lowering.disaggregated_inputs[..] {
+                    [] => {
+                        assert_eq!(data_inst_def.inputs.len(), 2);
+
+                        Accesses::Single(Access::Store(data_inst_def.inputs[1]))
+                    }
+                    [(ref range, aggregate_type)] => {
+                        assert_eq!(*range, 1..u32::try_from(data_inst_def.inputs.len()).unwrap());
+
+                        Accesses::AggregateLeaves {
+                            aggregate_type,
+                            leaf_accesses: Either::Right(
+                                data_inst_def.inputs[1..].iter().map(|&v| Access::Store(v)),
+                            ),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            };
+
+            let type_of_access = |access| match access {
+                Access::Load { output } => func.at(output).decl().ty,
+                Access::Store(value) => func.at(value).type_of(cx),
+            };
+
+            let original_access_type = match accesses {
+                Accesses::Single(access) => type_of_access(access),
+                Accesses::AggregateLeaves { aggregate_type, .. } => aggregate_type,
+            };
+
+            if pointee_type != original_access_type {
+                return Err(LowerError(Diag::bug([
+                    "access type different from pointee type".into()
+                ])));
+            }
+
+            let (ptr, base_offset) = flatten_offsets(ptr);
+
+            // FIXME(eddyb) support memory operands somehow.
+            if !spv_inst.imms.is_empty() {
+                return Ok(Transformed::Unchanged);
+            }
+
+            // FIXME(eddyb) consider skipping `undef` leaf stores (and even
+            // treating a non-aggregate `undef` store as a single leaf),
+            // but that might be too much of an "implicit optimization" here.
+            match accesses {
+                Accesses::Single(access) => {
+                    return Ok(Transformed::Changed(access.to_data_inst_def(
+                        attrs,
+                        ptr,
+                        base_offset,
+                    )));
+                }
+
+                // If this is an aggregate `OpLoad`/`OpStore`, we should generate
+                // one instruction per leaf, instead.
+                Accesses::AggregateLeaves { aggregate_type: _, mut leaf_accesses } => {
+                    // FIXME(eddyb) this may need to automatically generate an
+                    // intermediary `QPtrOp::BufferData` when accessing buffers.
+                    let mem_data_layout = match self.lowerer.layout_of(pointee_type)? {
+                        TypeLayout::Concrete(mem) => mem,
+                        _ => {
+                            return Err(LowerError(Diag::bug([
+                                "by-value aggregate type without memory layout: ".into(),
+                                pointee_type.into(),
+                            ])));
+                        }
+                    };
+
+                    // HACK(eddyb) we have to buffer the details of the new
+                    // instructions because we're iterating over the original
+                    // one, and can't allocate the new `DataInst`s as we go.
+                    let mut leaf_accesses_with_offsets = SmallVec::<[_; 4]>::new();
+                    mem_data_layout
+                        .deeply_flatten_if(
+                            base_offset,
+                            // Whether `candidate_layout` is an aggregate (to recurse into).
+                            &|candidate_layout| matches!(
+                                &cx[candidate_layout.original_type].kind,
+                                TypeKind::SpvInst { value_lowering: spv::ValueLowering::Disaggregate(_), .. }
+                            ),
+                            &mut |leaf_offset, leaf| {
+                                let leaf_access = leaf_accesses.next().ok_or_else(|| {
+                                    LayoutError(Diag::bug([
+                                        "`spv::lower` and `mem::layout` disagree on aggregate leaves of ".into(),
+                                        pointee_type.into(),
+                                    ]))
+                                })?;
+                                let leaf_type = type_of_access(leaf_access);
+                                if leaf_type != leaf.original_type {
+                                    return Err(LayoutError(Diag::bug([
+                                        "aggregate leaf mismatch: `".into(),
+                                        leaf_type.into(),
+                                        "` vs `".into(),
+                                        leaf.original_type.into(),
+                                        "`".into()
+                                    ])));
+                                }
+                                leaf_accesses_with_offsets.push((leaf_access, leaf_offset));
+                                Ok(())
+                            },
+                        )
+                        .map_err(|LayoutError(err)| LowerError(err))?;
+
+                    if leaf_accesses.next().is_some() {
+                        return Err(LowerError(Diag::bug([
+                            "`spv::lower` and `mem::layout` disagree on aggregate leaves of "
+                                .into(),
+                            pointee_type.into(),
+                        ])));
+                    }
+
+                    let mut func = func_at_data_inst.reborrow().at(());
+
+                    // This is the point of no return: we're inserting several
+                    // new instructions, and removing the original one entirely.
+                    for (leaf_access, leaf_offset) in leaf_accesses_with_offsets {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        let leaf_attrs = attrs;
+
+                        let leaf_data_inst = func.nodes.define(
+                            cx,
+                            leaf_access.to_data_inst_def(leaf_attrs, ptr, leaf_offset).into(),
+                        );
+
+                        // HACK(eddyb) attach any output vars to the new node.
+                        for (output_idx, &output_var) in
+                            func.nodes[leaf_data_inst].outputs.iter().enumerate()
+                        {
+                            let output_var_decl = &mut func.vars[output_var];
+                            output_var_decl.def_parent = Either::Right(leaf_data_inst);
+                            output_var_decl.def_idx = output_idx.try_into().unwrap();
+                        }
+
+                        // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
+                        // due to the need to borrow `regions` and `nodes`
+                        // at the same time - perhaps some kind of `FuncAtMut` position
+                        // types for "where a list is in a parent entity" could be used
+                        // to make this more ergonomic, although the potential need for
+                        // an actual list entity of its own, should be considered.
+                        func.regions[self.parent_region.unwrap()].children.insert_before(
+                            leaf_data_inst,
+                            data_inst,
+                            func.nodes,
+                        );
+
+                        // HACK(eddyb) account for traversal never seeing this,
+                        // while still needing value replacement and/or use tracking.
+                        func.reborrow().at(leaf_data_inst).inner_in_place_transform_with(self);
+                    }
+
+                    func.regions[self.parent_region.unwrap()]
+                        .children
+                        .remove(data_inst, func.nodes);
+
+                    // HACK(eddyb) no good "tombstone" for the original def.
+                    return Ok(Transformed::Changed(DataInstDef {
+                        attrs: AttrSet::default(),
+                        kind: DataInstKind::SpvInst(wk.OpNop.into(), spv::InstLowering::default()),
+                        inputs: [].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }));
+                }
+            }
+        } else if spv_inst.opcode == wk.OpCopyMemory {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
+            assert_eq!(data_inst_def.inputs.len(), 2);
+
+            let dst_ptr = data_inst_def.inputs[0];
+            let src_ptr = data_inst_def.inputs[1];
+
+            let (_, dst_pointee_type) =
+                self.lowerer.as_spv_ptr_type(func.at(dst_ptr).type_of(cx)).ok_or_else(|| {
+                    LowerError(Diag::bug([
+                        "destination pointer input not an `OpTypePointer`".into()
+                    ]))
+                })?;
+            let (_, src_pointee_type) =
+                self.lowerer.as_spv_ptr_type(func.at(src_ptr).type_of(cx)).ok_or_else(|| {
+                    LowerError(Diag::bug(["source pointer input not an `OpTypePointer`".into()]))
+                })?;
+
+            if dst_pointee_type != src_pointee_type {
+                return Err(LowerError(Diag::bug([
+                    "copy destination pointee type different from source pointee type".into(),
+                ])));
+            }
+
+            // FIXME(eddyb) this may need to automatically generate an
+            // intermediary `QPtrOp::BufferData` when accessing buffers.
+            let mem_data_layout = match self.lowerer.layout_of(src_pointee_type)? {
+                TypeLayout::Concrete(mem) => mem,
+                _ => {
+                    return Err(LowerError(Diag::bug([
+                        "`OpCopyMemory` of data with non-memory type: ".into(),
+                        src_pointee_type.into(),
+                    ])));
+                }
+            };
+
+            let (dst_ptr, dst_base_offset) = flatten_offsets(dst_ptr);
+            let (src_ptr, src_base_offset) = flatten_offsets(src_ptr);
+
+            // FIXME(eddyb) support memory operands somehow.
+            if !spv_inst.imms.is_empty() {
+                return Ok(Transformed::Unchanged);
+            }
+
+            // HACK(eddyb) this is speculative, so we just give up if we hit
+            // some situation we don't currently support - ideally, there would
+            // be an *untyped* `qptr.copy`, but that is harder to support overall.
+            // HACK(eddyb) this is a `try {...}`-like use of a closure.
+            let try_gather_leaf_offsets_and_types = || {
+                struct UnsupportedLargeArray;
+                let recurse_into_layout = |layout: &MemTypeLayout| {
+                    let aggregate_shape = match &cx[layout.original_type].kind {
+                        TypeKind::SpvInst {
+                            value_lowering: spv::ValueLowering::Disaggregate(aggregate_shape),
+                            ..
+                        } => aggregate_shape,
+                        _ => return Ok(false),
+                    };
+                    match *aggregate_shape {
+                        spv::AggregateShape::Struct { .. } => Ok(true),
+
+                        // HACK(eddyb) 16 leaves allows for a 4x4 matrix, even
+                        // when represented as e.g. `[f32; 16]` or `[[f32; 4]; 4]`
+                        // (this comparison gets more complex when accounting
+                        // for vectors, e.g. `[f32x4; 4]`, which is only 4 leaves),
+                        // but ideally most types accepted here will be even
+                        // smaller arrays (which could've e.g. been structs).
+                        // FIXME(eddyb) larger arrays should lower to loops that
+                        // copy a small number of leaves per iteration, or even
+                        // some general-purpose `qptr.copy`, to avoid generating
+                        // amounts of IR that scale with the array length, which
+                        // (unlike struct fields) can be arbitrarily large.
+                        spv::AggregateShape::Array { total_leaf_count, .. } => {
+                            if total_leaf_count <= 16 {
+                                Ok(true)
+                            } else {
+                                Err(UnsupportedLargeArray)
+                            }
+                        }
+                    }
+                };
+
+                // HACK(eddyb) buffering the details of the instructions we'll
+                // be generating, because we don't know ahead of time whether we
+                // even want to expand the `OpCopyMemory`, at all.
+                let mut leaf_offsets_and_types = SmallVec::<[_; 8]>::new();
+                mem_data_layout
+                    .deeply_flatten_if(
+                        0,
+                        &|candidate_layout| recurse_into_layout(candidate_layout).unwrap_or(false),
+                        &mut |leaf_offset, leaf| {
+                            // FIMXE(eddyb) ideally this would not be computed twice.
+                            recurse_into_layout(leaf).map_err(|UnsupportedLargeArray| {
+                                // HACK(eddyb) not an error, just stopping traversal.
+                                LayoutError(Diag::bug([]))
+                            })?;
+
+                            // HACK(eddyb) `deeply_flatten_if` takes a base offset,
+                            // but we have two, so we need our own overflow checks.
+                            if dst_base_offset.checked_add(leaf_offset).is_none()
+                                || src_base_offset.checked_add(leaf_offset).is_none()
+                            {
+                                // HACK(eddyb) not an error, just stopping traversal.
+                                return Err(LayoutError(Diag::bug([])));
+                            }
+
+                            leaf_offsets_and_types.push((leaf_offset, leaf.original_type));
+
+                            Ok(())
+                        },
+                    )
+                    .ok()?;
+                Some(leaf_offsets_and_types)
+            };
+            let leaf_offsets_and_types = match try_gather_leaf_offsets_and_types() {
+                Some(leaf_offsets_and_types) => leaf_offsets_and_types,
+                None => return Ok(Transformed::Unchanged),
+            };
+
+            let mut func = func_at_data_inst.reborrow().at(());
+
+            // This is the point of no return: we're inserting several
+            // new instructions, and removing the original one entirely.
+            for (leaf_offset, leaf_type) in leaf_offsets_and_types {
+                let leaf_load_data_inst = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: MemOp::Load {
+                            offset: NonZeroI32::new(
+                                src_base_offset.checked_add(leaf_offset).unwrap(),
+                            ),
+                        }
+                        .into(),
+                        inputs: [src_ptr].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                let leaf_load_output_var = func.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: leaf_type,
+                        def_parent: Either::Right(leaf_load_data_inst),
+                        def_idx: 0,
+                    },
+                );
+                func.nodes[leaf_load_data_inst].outputs.push(leaf_load_output_var);
+
+                let leaf_store_data_inst = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        // FIXME(eddyb) filter attributes into debuginfo and
+                        // semantic, and understand the semantic ones.
+                        attrs,
+                        kind: MemOp::Store {
+                            offset: NonZeroI32::new(
+                                dst_base_offset.checked_add(leaf_offset).unwrap(),
+                            ),
+                        }
+                        .into(),
+                        inputs: [dst_ptr, Value::Var(leaf_load_output_var)].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+
+                // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
+                // due to the need to borrow `regions` and `nodes`
+                // at the same time - perhaps some kind of `FuncAtMut` position
+                // types for "where a list is in a parent entity" could be used
+                // to make this more ergonomic, although the potential need for
+                // an actual list entity of its own, should be considered.
+                let parent_region_children =
+                    &mut func.regions[self.parent_region.unwrap()].children;
+                parent_region_children.insert_before(leaf_load_data_inst, data_inst, func.nodes);
+                parent_region_children.insert_before(leaf_store_data_inst, data_inst, func.nodes);
+
+                // HACK(eddyb) account for traversal never seeing these,
+                // while still needing value replacement and/or use tracking.
+                func.reborrow().at(leaf_load_data_inst).inner_in_place_transform_with(self);
+                func.reborrow().at(leaf_store_data_inst).inner_in_place_transform_with(self);
+            }
+
+            func.regions[self.parent_region.unwrap()].children.remove(data_inst, func.nodes);
+
+            // HACK(eddyb) no good "tombstone" for the original def.
+            return Ok(Transformed::Changed(DataInstDef {
+                attrs: AttrSet::default(),
+                kind: DataInstKind::SpvInst(wk.OpNop.into(), spv::InstLowering::default()),
+                inputs: [].into_iter().collect(),
+                child_regions: [].into_iter().collect(),
+                outputs: [].into_iter().collect(),
+            }));
         } else if spv_inst.opcode == wk.OpBitcast {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(data_inst_def.inputs.len(), 1);
+
             let input = data_inst_def.inputs[0];
             // Pointer-to-pointer casts are noops on `qptr`.
             if self.lowerer.as_spv_ptr_type(func.at(input).type_of(cx)).is_some()
@@ -692,7 +1383,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) is this a good convention?
         let func = func_at_data_inst_frozen.at(());
 
-        match data_inst_def.kind {
+        let spv_inst_lowering = match &data_inst_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
             NodeKind::Select(_)
             | NodeKind::Loop { .. }
@@ -704,11 +1395,17 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             | DataInstKind::QPtr(_)
             | DataInstKind::ThunkBind(_) => return,
 
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                lowering
+            }
+        };
 
         let mut old_and_new_attrs = None;
         let get_old_attrs = || AttrSetDef { attrs: cx[data_inst_def.attrs].attrs.clone() };
+
+        if let Some(LowerError(e)) = extra_error {
+            old_and_new_attrs.get_or_insert_with(get_old_attrs).push_diag(e);
+        }
 
         for (input_idx, &v) in data_inst_def.inputs.iter().enumerate() {
             if let Some((_, pointee)) = self.lowerer.as_spv_ptr_type(func.at(v).type_of(cx)) {
@@ -721,22 +1418,28 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 );
             }
         }
-        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-        if let Some(&output_var) = data_inst_def.outputs.iter().at_most_one().ok().unwrap()
-            && let Some((addr_space, pointee)) =
+        for (output_idx, &output_var) in data_inst_def.outputs.iter().enumerate() {
+            if let Some((addr_space, pointee)) =
                 self.lowerer.as_spv_ptr_type(func.at(output_var).decl().ty)
-        {
-            old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
-                QPtrAttr::FromSpvPtrOutput {
-                    addr_space: OrdAssertEq(addr_space),
-                    pointee: OrdAssertEq(pointee),
+            {
+                // FIXME(eddyb) make this impossible by lowering all instructions
+                // that may produce aggregates with pointer leaves.
+                if output_idx != 0 || spv_inst_lowering.disaggregated_output.is_some() {
+                    old_and_new_attrs.get_or_insert_with(get_old_attrs).push_diag(Diag::bug([
+                        format!("unsupported pointer as aggregate leaf (output #{output_idx})")
+                            .into(),
+                    ]));
+                    continue;
                 }
-                .into(),
-            );
-        }
 
-        if let Some(LowerError(e)) = extra_error {
-            old_and_new_attrs.get_or_insert_with(get_old_attrs).push_diag(e);
+                old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
+                    QPtrAttr::FromSpvPtrOutput {
+                        addr_space: OrdAssertEq(addr_space),
+                        pointee: OrdAssertEq(pointee),
+                    }
+                    .into(),
+                );
+            }
         }
 
         if let Some(attrs) = old_and_new_attrs {
@@ -764,28 +1467,30 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             }
         }
     }
+
+    // HACK(eddyb) this is a helper *only* for `transform_value_use` and
+    // `in_place_transform_node_def`, and should not be used elsewhere.
+    fn apply_value_replacements(&self, mut value: Value) -> Value {
+        while let Value::Var(var) = value {
+            value = if let Some(&base_ptr) = self.noop_offsets_to_base_ptr.get(&var) {
+                base_ptr
+            } else {
+                break;
+            };
+        }
+        value
+    }
 }
 
 impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
     // NOTE(eddyb) it's important that this only gets invoked on already lowered
     // `Value`s, so we can rely on e.g. `noop_offsets_to_base_ptr` being filled.
     fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
-        let mut v = *v;
+        let new_v = self.apply_value_replacements(*v);
 
-        let transformed = match v {
-            Value::Var(v) => self
-                .noop_offsets_to_base_ptr
-                .get(&v)
-                .copied()
-                .map_or(Transformed::Unchanged, Transformed::Changed),
+        self.add_value_uses(&[new_v]);
 
-            Value::Const(_) => Transformed::Unchanged,
-        };
-
-        transformed.apply_to(&mut v);
-        self.add_value_uses(&[v]);
-
-        transformed
+        if *v == new_v { Transformed::Unchanged } else { Transformed::Changed(new_v) }
     }
 
     fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
@@ -813,13 +1518,7 @@ impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
                     ));
 
                     if let QPtrOp::Offset(0) = op {
-                        let mut base_ptr = new_def.inputs[0];
-                        if let Value::Var(base_ptr_var) = base_ptr
-                            && let Some(&base_ptr_base_ptr) =
-                                self.noop_offsets_to_base_ptr.get(&base_ptr_var)
-                        {
-                            base_ptr = base_ptr_base_ptr;
-                        }
+                        let base_ptr = self.apply_value_replacements(new_def.inputs[0]);
                         self.noop_offsets_to_base_ptr
                             .insert(func_at_node.reborrow().def().outputs[0], base_ptr);
                     }
@@ -838,6 +1537,102 @@ impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
     }
 
     fn in_place_transform_func_decl(&mut self, func_decl: &mut FuncDecl) {
+        // HACK(eddyb) separately pre-process all `OpVariable`s with initializers,
+        // as the `OpStore`s needed to initialize them, have to be injected
+        // *after* the last `OpVariable`
+        if let DeclDef::Present(func_def_body) = &mut func_decl.def {
+            let last_func_local_var = func_def_body
+                .at_body()
+                .at_children()
+                .into_iter()
+                .take_while(|func_at_node| match &func_at_node.def().kind {
+                    DataInstKind::SpvInst(spv_inst, _) => {
+                        spv_inst.opcode == self.lowerer.wk.OpVariable
+                    }
+                    _ => false,
+                })
+                .map(|func_at_node| func_at_node.position)
+                .last();
+
+            // FIXME(eddyb) a cursor abstraction would be clearer.
+            let mut insert_after = last_func_local_var;
+
+            let body = func_def_body.body;
+            let mut func_at_body_children = func_def_body.at_mut_body().at_children().into_iter();
+            while let Some(func_at_node) = func_at_body_children.next() {
+                let node = func_at_node.position;
+                let func = func_at_node.at(());
+
+                let node_def = &mut *func.nodes[node];
+                let spv_inst_lowering = match &mut node_def.kind {
+                    DataInstKind::SpvInst(spv_inst, lowering)
+                        if spv_inst.opcode == self.lowerer.wk.OpVariable =>
+                    {
+                        lowering
+                    }
+                    _ => break,
+                };
+
+                let Some(local_var_ptr) = (spv_inst_lowering.disaggregated_output.is_none())
+                    .then(|| {
+                        assert!(node_def.outputs.len() == 1);
+                        node_def.outputs[0]
+                    })
+                    .filter(|&output_var| {
+                        self.lowerer.as_spv_ptr_type(func.vars[output_var].ty).is_some()
+                    })
+                    .map(Value::Var)
+                else {
+                    continue;
+                };
+
+                // FIXME(eddyb) filter attributes into debuginfo and
+                // semantic, and understand the semantic ones.
+                let init_attrs = node_def.attrs;
+                let mut init_inputs = mem::take(&mut node_def.inputs);
+                let mut init_input_lowering =
+                    mem::take(&mut spv_inst_lowering.disaggregated_inputs);
+
+                init_inputs.insert(0, local_var_ptr);
+                match &mut init_input_lowering[..] {
+                    [] => {
+                        if init_inputs.len() == 1 {
+                            continue;
+                        }
+                    }
+                    [(old_range, _)] => {
+                        let new_range = 1..u32::try_from(init_inputs.len()).unwrap();
+                        assert_eq!(*old_range, 0..(new_range.end - 1));
+                        *old_range = new_range;
+                    }
+                    _ => unreachable!(),
+                }
+
+                let store_inst = func.nodes.define(
+                    &self.lowerer.cx,
+                    DataInstDef {
+                        attrs: init_attrs,
+                        kind: DataInstKind::SpvInst(
+                            self.lowerer.wk.OpStore.into(),
+                            spv::InstLowering {
+                                disaggregated_output: None,
+                                disaggregated_inputs: init_input_lowering,
+                            },
+                        ),
+                        inputs: init_inputs,
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+
+                // FIXME(eddyb) a cursor abstraction would be clearer.
+                let insert_after = insert_after.as_mut().unwrap();
+                func.regions[body].children.insert_after(store_inst, *insert_after, func.nodes);
+                *insert_after = store_inst;
+            }
+        }
+
         func_decl.inner_in_place_transform_with(self);
 
         // Apply all `remove_inst_if_dead_output_with_parent_region` removals, that are truly unused.

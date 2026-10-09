@@ -83,7 +83,7 @@ fn main() -> std::io::Result<()> {
             let layout_config = &spirt::mem::LayoutConfig {
                 abstract_bool_size_align: (1, 1),
                 logical_ptr_size_align: (4, 4),
-                ..spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT
+                ..spirt::mem::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE
             };
 
             eprint_duration(|| {
