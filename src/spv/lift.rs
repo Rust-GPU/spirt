@@ -127,6 +127,14 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             }
 
             TypeKind::SpvInst { .. } => {}
+
+            TypeKind::SpvTypeOperand => {
+                unreachable!(
+                    "`TypeKind::SpvTypeOperand` should not be used \
+                     as a type outside of `ConstKind::SpvTypeOperand`"
+                );
+            }
+
             TypeKind::SpvStringLiteralForExtInst => {
                 unreachable!(
                     "`TypeKind::SpvStringLiteralForExtInst` should not be used \
@@ -147,6 +155,21 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             ConstKind::PtrToGlobalVar(_) | ConstKind::SpvInst { .. } => {
                 self.visit_const_def(ct_def);
                 self.globals.insert(global);
+            }
+
+            // HACK(eddyb) because this is merely a way to refer to `wrapped_type`
+            // as a `Value` (for a SPIR-V operand), it needs to be special-cased,
+            // without visiting its type, or an entry in `self.globals`.
+            ConstKind::SpvTypeOperand(wrapped_type) => {
+                let ConstDef { attrs, ty, kind: _ } = ct_def;
+
+                assert!(*attrs == AttrSet::default());
+                assert!(
+                    self.cx[*ty]
+                        == TypeDef { attrs: AttrSet::default(), kind: TypeKind::SpvTypeOperand }
+                );
+
+                self.visit_type_use(wrapped_type);
             }
 
             // HACK(eddyb) because this is an `OpString` and needs to go earlier
@@ -229,6 +252,9 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
 }
 
 struct AllocatedIds<'a> {
+    // HACK(eddyb) only for `Index<Const>` impl.
+    cx: &'a Context,
+
     ext_inst_imports: BTreeMap<&'a str, spv::Id>,
     debug_strings: BTreeMap<&'a str, spv::Id>,
 
@@ -236,6 +262,19 @@ struct AllocatedIds<'a> {
     globals: FxIndexMap<Global, spv::Id>,
     // FIXME(eddyb) use `EntityOrientedDenseMap` here.
     funcs: FxIndexMap<Func, FuncLifting<'a>>,
+}
+
+// HACK(eddyb) this makes accessing the right ID a bit easier.
+impl std::ops::Index<Const> for AllocatedIds<'_> {
+    type Output = spv::Id;
+    fn index(&self, ct: Const) -> &Self::Output {
+        match self.cx[ct].kind {
+            ConstKind::SpvTypeOperand(ty) => &self.globals[&Global::Type(ty)],
+            ConstKind::SpvStringLiteralForExtInst(s) => &self.debug_strings[&self.cx[s]],
+
+            _ => &self.globals[&Global::Const(ct)],
+        }
+    }
 }
 
 // FIXME(eddyb) should this use ID ranges instead of `SmallVec<[spv::Id; 4]>`?
@@ -358,6 +397,8 @@ impl<'a> NeedsIdsCollector<'a> {
         } = self;
 
         Ok(AllocatedIds {
+            cx,
+
             ext_inst_imports: ext_inst_imports
                 .into_iter()
                 .map(|name| Ok((name, alloc_id()?)))
@@ -1035,7 +1076,8 @@ impl LazyInst<'_, '_> {
                             ConstKind::SpvInst { .. } => (ct_def.attrs, None),
 
                             // Not inserted into `globals` while visiting.
-                            ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
+                            ConstKind::SpvTypeOperand(_)
+                            | ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
                         }
                     }
                 };
@@ -1069,11 +1111,7 @@ impl LazyInst<'_, '_> {
         let cx = module.cx_ref();
 
         let value_to_id = |parent_func: &FuncLifting<'_>, v| match v {
-            Value::Const(ct) => match cx[ct].kind {
-                ConstKind::SpvStringLiteralForExtInst(s) => ids.debug_strings[&cx[s]],
-
-                _ => ids.globals[&Global::Const(ct)],
-            },
+            Value::Const(ct) => ids[ct],
             Value::RegionInput { region, input_idx } => {
                 let input_idx = usize::try_from(input_idx).unwrap();
                 match parent_func.region_inputs_source.get(&region) {
@@ -1105,17 +1143,17 @@ impl LazyInst<'_, '_> {
                         result_id,
                         ids: type_and_const_inputs
                             .iter()
-                            .map(|&ty_or_ct| {
-                                ids.globals[&match ty_or_ct {
-                                    TypeOrConst::Type(ty) => Global::Type(ty),
-                                    TypeOrConst::Const(ct) => Global::Const(ct),
-                                }]
+                            .map(|&ty_or_ct| match ty_or_ct {
+                                TypeOrConst::Type(ty) => ids.globals[&Global::Type(ty)],
+                                TypeOrConst::Const(ct) => ids[ct],
                             })
                             .collect(),
                     },
 
                     // Not inserted into `globals` while visiting.
-                    TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => unreachable!(),
+                    TypeKind::QPtr
+                    | TypeKind::SpvTypeOperand
+                    | TypeKind::SpvStringLiteralForExtInst => unreachable!(),
                 },
                 Global::Const(ct) => {
                     let ct_def = &cx[ct];
@@ -1139,8 +1177,9 @@ impl LazyInst<'_, '_> {
                             };
                             let initializer = match gv_decl.def {
                                 DeclDef::Imported(_) => None,
-                                DeclDef::Present(GlobalVarDefBody { initializer }) => initializer
-                                    .map(|initializer| ids.globals[&Global::Const(initializer)]),
+                                DeclDef::Present(GlobalVarDefBody { initializer }) => {
+                                    initializer.map(|initializer| ids[initializer])
+                                }
                             };
                             spv::InstWithIds {
                                 without_ids: spv::Inst {
@@ -1159,15 +1198,14 @@ impl LazyInst<'_, '_> {
                                 without_ids: spv_inst.clone(),
                                 result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
                                 result_id,
-                                ids: const_inputs
-                                    .iter()
-                                    .map(|&ct| ids.globals[&Global::Const(ct)])
-                                    .collect(),
+                                ids: const_inputs.iter().map(|&ct| ids[ct]).collect(),
                             }
                         }
 
                         // Not inserted into `globals` while visiting.
-                        ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
+                        ConstKind::SpvTypeOperand(_) | ConstKind::SpvStringLiteralForExtInst(_) => {
+                            unreachable!()
+                        }
                     }
                 }
             },
@@ -1527,9 +1565,7 @@ impl Module {
                             result_type_id: None,
                             result_id: None,
                             ids: iter::once(target_id)
-                                .chain(
-                                    const_inputs.iter().map(|&ct| ids.globals[&Global::Const(ct)]),
-                                )
+                                .chain(const_inputs.iter().map(|&ct| ids[ct]))
                                 .collect(),
                         });
 
