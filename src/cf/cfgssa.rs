@@ -135,11 +135,11 @@ struct BlockAcc {
 
     /// All definitions used in this block (or any other block reachable from it),
     /// excluding its own definitions, and represented as a sparse bitset.
-    uses: data::SparseMap<ChunkIdx, data::FixedBitSet<usize>>,
+    uses: data::Sparse2Map<ChunkIdx, data::FixedBitSet<usize>>,
 
     /// All chunks `c` where `uses[c]` has changed since this block has last
     /// propagated any of its `uses` to its predecessors.
-    dirty_chunks: data::BitSet<ChunkIdx>,
+    dirty_chunks: data::SparseBitSet<ChunkIdx>,
 }
 
 enum AddUsesSource {
@@ -586,6 +586,29 @@ mod data {
         pub fn iter(&self) -> impl Iterator<Item = (K, &V)> + '_ {
             self.keys().map(|k| (k, self.get(k).unwrap()))
         }
+        pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> + '_ {
+            (self.occupied != 0)
+                .then(|| {
+                    let mut keys = self.keys();
+                    let mut slots = VS::lazy_box_unwrap_mut_or_alloc(&mut self.slots, || {
+                        std::array::from_fn(|_| Default::default())
+                    })
+                    .iter_mut();
+
+                    let mut next_slot_idx = 0;
+                    iter::from_fn(move || {
+                        let k = keys.next()?;
+                        let slot_idx = k.into();
+                        let slot = VS::slot_unwrap_mut(
+                            slots.nth(slot_idx.checked_sub(next_slot_idx).unwrap()).unwrap(),
+                        );
+                        next_slot_idx = slot_idx + 1;
+                        Some((k, slot))
+                    })
+                })
+                .into_iter()
+                .flatten()
+        }
         pub fn drain(&mut self) -> impl Iterator<Item = (K, V)> + '_ {
             self.keys().map(|k| (k, self.remove(k).unwrap()))
         }
@@ -631,7 +654,11 @@ mod data {
     // FIXME(eddyb) not a sparse bitset because of how `SparseMap` is only sparse
     // wrt not allocating space to store values until needed, but `BitSet` has no
     // real values (and uses `IgnoreValue` to completely remove that allocation).
+    // HACK(eddyb) hence `SparseBitSet`, which adds an extra level of sparseness.
+    // FIXME(eddyb) figure out what to do with the unused APIs.
+    #[expect(unused, reason = "`BitSet` uses replaced with `SparseBitSet`")]
     pub type BitSet<K> = SparseMap<K, (), IgnoreValue>;
+    pub type SparseBitSet<K> = Sparse2Map<K, (), IgnoreValue>;
 
     pub struct SparseMap<K, V, VS: ValueStorage<V> = EfficientValue> {
         // NOTE(eddyb) this is really efficient when the keys don't exceed
@@ -687,7 +714,21 @@ mod data {
                 .into_iter()
                 .flatten()
         }
+        pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> + '_ {
+            (!self.is_empty())
+                .then(|| {
+                    self.outer_map.iter_mut().enumerate().flat_map(|(outer_key, inner_map)| {
+                        inner_map.iter_mut().map(move |(inner_key, v)| {
+                            (K::from(outer_key * FixedBitSet::SIZE + inner_key), v)
+                        })
+                    })
+                })
+                .into_iter()
+                .flatten()
+        }
 
+        // FIXME(eddyb) figure out what to do with the unused APIs.
+        #[expect(unused, reason = "`SparseMap` uses replaced with `Sparse2Map`")]
         pub fn clear(&mut self) {
             for inner_map in &mut self.outer_map {
                 inner_map.clear();
@@ -720,6 +761,79 @@ mod data {
                 *self.count += 1;
             }
             self.inner.insert(v);
+        }
+    }
+
+    // FIXME(eddyb) find a better name for this? ("2" hints at "2-level trie")
+    // FIXME(eddyb) why is this necessary at all? especially, repeating
+    // this pattern: `(k / FixedBitSet::SIZE, k % FixedBitSet::SIZE)`
+    // (the only difference between the maps is whether something more akin to
+    // a `KeyedVec` - even if `SmallVec`'d - or another `SparseMap`, is used for
+    // the outer map, so in theory this could take like a GAT-based type ctor?)
+    pub struct Sparse2Map<K, V, VS: ValueStorage<V> = EfficientValue> {
+        outer_map: SparseMap<usize, FixedFlatMap<usize, V, VS>>,
+        count: usize,
+        _marker: PhantomData<K>,
+    }
+
+    impl<K: Copy + Into<usize> + From<usize>, V, VS: ValueStorage<V>> Default for Sparse2Map<K, V, VS> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl<K: Copy + Into<usize> + From<usize>, V, VS: ValueStorage<V>> Sparse2Map<K, V, VS> {
+        pub fn new() -> Self {
+            Self { outer_map: Default::default(), count: 0, _marker: PhantomData }
+        }
+        pub fn is_empty(&self) -> bool {
+            self.count == 0
+        }
+        pub fn get(&self, k: K) -> Option<&V> {
+            let k = k.into();
+            let (outer_key, inner_key) = (k / FixedBitSet::SIZE, k % FixedBitSet::SIZE);
+            self.outer_map.get(outer_key)?.get(inner_key)
+        }
+        pub fn entry(&mut self, k: K) -> SparseMapEntry<'_, V, VS> {
+            let k = k.into();
+            let (outer_key, inner_key) = (k / FixedBitSet::SIZE, k % FixedBitSet::SIZE);
+            SparseMapEntry {
+                inner: self.outer_map.entry(outer_key).or_default().entry(inner_key),
+                count: &mut self.count,
+            }
+        }
+
+        pub fn iter(&self) -> impl Iterator<Item = (K, &V)> + '_ {
+            (!self.is_empty())
+                .then(|| {
+                    self.outer_map.iter().flat_map(|(outer_key, inner_map)| {
+                        inner_map.iter().map(move |(inner_key, v)| {
+                            (K::from(outer_key * FixedBitSet::SIZE + inner_key), v)
+                        })
+                    })
+                })
+                .into_iter()
+                .flatten()
+        }
+        // FIXME(eddyb) figure out what to do with the unused APIs.
+        #[expect(unused, reason = "method only exists for parity with `SparseMap`")]
+        pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> + '_ {
+            (!self.is_empty())
+                .then(|| {
+                    self.outer_map.iter_mut().flat_map(|(outer_key, inner_map)| {
+                        inner_map.iter_mut().map(move |(inner_key, v)| {
+                            (K::from(outer_key * FixedBitSet::SIZE + inner_key), v)
+                        })
+                    })
+                })
+                .into_iter()
+                .flatten()
+        }
+
+        pub fn clear(&mut self) {
+            for (_, inner_map) in self.outer_map.iter_mut() {
+                inner_map.clear();
+            }
+            self.count = 0;
         }
     }
 }
