@@ -136,14 +136,14 @@ fn main() -> @location(0) i32 {
 global_var GV0 in spv.StorageClass.Output: s32
 
 func F0() -> spv.OpTypeVoid {
-  (_: s32, _: s32, v0: s32) = loop(v1: s32 <- 1s32, v2: s32 <- 1s32, _: s32 <- spv.OpUndef: s32) {
+  (_: s32, _: s32, v0: s32) = loop(v1: s32 <- 1s32, v2: s32 <- 1s32, _: s32 <- undef: s32) {
     v3 = spv.OpSLessThan(v2, 10s32): bool
     (v4: s32, v5: s32) = if v3 {
       v6 = spv.OpIMul(v1, v2): s32
       v7 = spv.OpIAdd(v2, 1s32): s32
       (v6, v7)
     } else {
-      (spv.OpUndef: s32, spv.OpUndef: s32)
+      (undef: s32, undef: s32)
     }
     (v4, v5, v1) -> (v1, v2, _)
   } while v3

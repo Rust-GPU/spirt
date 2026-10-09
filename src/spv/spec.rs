@@ -137,7 +137,6 @@ def_well_known! {
         OpConstantFalse,
         OpConstantTrue,
         OpConstant,
-        OpUndef,
         OpConstantFunctionPointerINTEL,
 
         OpVariable,
