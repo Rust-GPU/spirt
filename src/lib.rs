@@ -169,6 +169,7 @@ pub mod mem;
 pub mod qptr;
 pub mod scalar;
 pub mod spv;
+pub mod vector;
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -555,6 +556,13 @@ pub enum TypeKind {
     #[from]
     Scalar(scalar::Type),
 
+    /// Vector (small array of [`scalar`]s) type, with some limitations on the
+    /// supported component counts (but all standard ones should be included).
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    #[from]
+    Vector(vector::Type),
+
     /// "Quasi-pointer", an untyped pointer-like abstract scalar that can represent
     /// both memory locations (in any address space) and other kinds of locations
     /// (e.g. SPIR-V `OpVariable`s in non-memory "storage classes").
@@ -600,7 +608,7 @@ macro_rules! impl_intern_type_kind {
         })+
     }
 }
-impl_intern_type_kind!(TypeKind, scalar::Type);
+impl_intern_type_kind!(TypeKind, scalar::Type, vector::Type);
 
 // HACK(eddyb) this is like `Either<Type, Const>`, only used in `TypeKind::SpvInst`,
 // and only because SPIR-V type definitions can references both types and consts.
@@ -615,6 +623,12 @@ impl Type {
     pub fn as_scalar(self, cx: &Context) -> Option<scalar::Type> {
         match cx[self].kind {
             TypeKind::Scalar(ty) => Some(ty),
+            _ => None,
+        }
+    }
+    pub fn as_vector(self, cx: &Context) -> Option<vector::Type> {
+        match cx[self].kind {
+            TypeKind::Vector(ty) => Some(ty),
             _ => None,
         }
     }
@@ -652,6 +666,18 @@ pub enum ConstKind {
     // enforce that interning simply doesn't allow such scenarios?).
     #[from]
     Scalar(scalar::Const),
+
+    /// Vector (small array of [`scalar`]s) constant, which must have
+    /// a type of [`TypeKind::Vector`] (of the same [`vector::Type`]).
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    //
+    // FIXME(eddyb) maybe document the 128-bit limitation inherited from `scalar::Const`?
+    // FIXME(eddyb) this technically makes the `vector::Type` redundant, could
+    // it get out of sync? (perhaps "forced canonicalization" could be used to
+    // enforce that interning simply doesn't allow such scenarios?).
+    #[from]
+    Vector(vector::Const),
 
     // FIXME(eddyb) maybe merge these? however, their connection is somewhat
     // tenuous (being one of the LLVM-isms SPIR-V inherited, among other things),
@@ -692,13 +718,19 @@ macro_rules! impl_intern_const_kind {
         })+
     }
 }
-impl_intern_const_kind!(scalar::Const);
+impl_intern_const_kind!(scalar::Const, vector::Const);
 
 // HACK(eddyb) on `Const` instead of `ConstDef` for ergonomics reasons.
 impl Const {
     pub fn as_scalar(self, cx: &Context) -> Option<&scalar::Const> {
         match &cx[self].kind {
             ConstKind::Scalar(ct) => Some(ct),
+            _ => None,
+        }
+    }
+    pub fn as_vector(self, cx: &Context) -> Option<&vector::Const> {
+        match &cx[self].kind {
+            ConstKind::Vector(ct) => Some(ct),
             _ => None,
         }
     }
@@ -985,6 +1017,12 @@ pub enum NodeKind {
     /// See also the [`scalar`] module for more documentation and definitions.
     #[from]
     Scalar(scalar::Op),
+
+    /// Vector (small array of [`scalar`]s) pure operations.
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    #[from]
+    Vector(vector::Op),
 
     FuncCall(Func),
 
