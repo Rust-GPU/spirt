@@ -6,9 +6,10 @@ use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Type, TypeKind,
-    TypeOrConst, Value, spv,
+    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, NodeOutputDecl, OrdAssertEq,
+    Region, Type, TypeKind, TypeOrConst, Value, spv,
 };
+use itertools::Itertools as _;
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::num::NonZeroU32;
@@ -142,7 +143,8 @@ impl<'a> LowerFromSpvPtrs<'a> {
         // separately - so `LowerFromSpvPtrInstsInFunc` will leave all value defs
         // (including replaced instructions!) with unchanged `OpTypePointer`
         // types, that only `EraseSpvPtrs`, later, replaces with `QPtr`.
-        LowerFromSpvPtrInstsInFunc { lowerer: self }.in_place_transform_func_decl(func_decl);
+        LowerFromSpvPtrInstsInFunc { lowerer: self, parent_region: None }
+            .in_place_transform_func_decl(func_decl);
         EraseSpvPtrs { lowerer: self }.in_place_transform_func_decl(func_decl);
     }
 
@@ -245,6 +247,8 @@ impl Transformer for EraseSpvPtrs<'_> {
 
 struct LowerFromSpvPtrInstsInFunc<'a> {
     lowerer: &'a LowerFromSpvPtrs<'a>,
+
+    parent_region: Option<Region>,
 }
 
 /// One `QPtr`->`QPtr` step used in the lowering of `Op*AccessChain`.
@@ -392,7 +396,6 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
     fn try_lower_data_inst_def(
         &self,
         mut func_at_data_inst: FuncAtMut<'_, DataInst>,
-        parent_block: Node,
     ) -> Result<Transformed<DataInstDef>, LowerError> {
         let cx = &self.lowerer.cx;
         let wk = self.lowerer.wk;
@@ -405,17 +408,19 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let func = func_at_data_inst_frozen.at(());
 
         let mut attrs = data_inst_def.attrs;
-        let output_type = data_inst_def.output_type;
 
         let spv_inst = match &data_inst_def.kind {
             DataInstKind::SpvInst(spv_inst) => spv_inst,
             _ => return Ok(Transformed::Unchanged),
         };
 
+        // FIXME(eddyb) wasteful clone? (needed due to borrowing issues)
+        let outputs = data_inst_def.outputs.clone();
+
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
             assert!(data_inst_def.inputs.len() <= 1);
             let (_, var_data_type) =
-                self.lowerer.as_spv_ptr_type(output_type.unwrap()).ok_or_else(|| {
+                self.lowerer.as_spv_ptr_type(outputs[0].ty).ok_or_else(|| {
                     LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
                 })?;
             match self.lowerer.layout_of(var_data_type)? {
@@ -541,39 +546,44 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             let mut ptr = base_ptr;
             for step in steps {
                 let (kind, inputs) = step.into_data_inst_kind_and_inputs(ptr);
-                let step_data_inst = func_at_data_inst.reborrow().data_insts.define(
+                let step_data_inst = func_at_data_inst.reborrow().nodes.define(
                     cx,
                     DataInstDef {
                         attrs: Default::default(),
                         kind,
                         inputs,
-                        output_type: Some(self.lowerer.qptr_type()),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [NodeOutputDecl {
+                            attrs: Default::default(),
+                            ty: self.lowerer.qptr_type(),
+                        }]
+                        .into_iter()
+                        .collect(),
                     }
                     .into(),
                 );
 
                 // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
-                // due to the need to borrow `nodes` and `data_insts`
+                // due to the need to borrow `regions` and `nodes`
                 // at the same time - perhaps some kind of `FuncAtMut` position
                 // types for "where a list is in a parent entity" could be used
                 // to make this more ergonomic, although the potential need for
                 // an actual list entity of its own, should be considered.
                 let func = func_at_data_inst.reborrow().at(());
-                match &mut func.nodes[parent_block].kind {
-                    NodeKind::Block { insts } => {
-                        insts.insert_before(step_data_inst, data_inst, func.data_insts);
-                    }
-                    _ => unreachable!(),
-                }
+                func.regions[self.parent_region.unwrap()].children.insert_before(
+                    step_data_inst,
+                    data_inst,
+                    func.nodes,
+                );
 
-                ptr = Value::DataInstOutput(step_data_inst);
+                ptr = Value::NodeOutput { node: step_data_inst, output_idx: 0 };
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
         } else if spv_inst.opcode == wk.OpBitcast {
             let input = data_inst_def.inputs[0];
             // Pointer-to-pointer casts are noops on `qptr`.
             if self.lowerer.as_spv_ptr_type(func.at(input).type_of(cx)).is_some()
-                && self.lowerer.as_spv_ptr_type(output_type.unwrap()).is_some()
+                && self.lowerer.as_spv_ptr_type(outputs[0].ty).is_some()
             {
                 // HACK(eddyb) noop cases should not use any `DataInst`s at all,
                 // but that would require the ability to replace all uses of a `Value`.
@@ -596,7 +606,8 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             attrs,
             kind: new_kind,
             inputs: new_inputs,
-            output_type,
+            child_regions: [].into_iter().collect(),
+            outputs,
         }))
     }
 
@@ -615,7 +626,12 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         match data_inst_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
-            DataInstKind::FuncCall(_) | DataInstKind::Mem(_) | DataInstKind::QPtr(_) => return,
+            NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_)
+            | DataInstKind::FuncCall(_)
+            | DataInstKind::Mem(_)
+            | DataInstKind::QPtr(_) => return,
 
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
         }
@@ -634,8 +650,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 );
             }
         }
-        if let Some(output_type) = data_inst_def.output_type
-            && let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type)
+        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+        if let Some(output) = data_inst_def.outputs.iter().at_most_one().ok().unwrap()
+            && let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output.ty)
         {
             old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
                 QPtrAttr::FromSpvPtrOutput {
@@ -657,29 +674,21 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 }
 
 impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
-    // HACK(eddyb) while we want to transform `DataInstDef`s, we can't inject
-    // adjacent instructions without access to the parent `NodeKind::Block`,
-    // and to fix this would likely require list nodes to carry some handle to
-    // the list they're part of, either the whole semantic parent, or something
-    // more contrived, where lists are actually allocated entities of their own,
-    // perhaps something where an `EntityListDefs<DataInstDef>` contains both:
-    // - an `EntityDefs<EntityListNode<DataInstDef>>` (keyed by `DataInst`)
-    // - an `EntityDefs<EntityListDef<DataInst>>` (keyed by `EntityList<DataInst>`)
+    fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
+        let outer_region = self.parent_region.replace(func_at_region.position);
+        func_at_region.inner_in_place_transform_with(self);
+        self.parent_region = outer_region;
+    }
+
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.reborrow().inner_in_place_transform_with(self);
 
-        let node = func_at_node.position;
-        if let NodeKind::Block { insts } = func_at_node.reborrow().def().kind {
-            let mut func_at_inst_iter = func_at_node.reborrow().at(insts).into_iter();
-            while let Some(mut func_at_inst) = func_at_inst_iter.next() {
-                match self.try_lower_data_inst_def(func_at_inst.reborrow(), node) {
-                    Ok(Transformed::Changed(new_def)) => {
-                        *func_at_inst.def() = new_def;
-                    }
-                    result @ (Ok(Transformed::Unchanged) | Err(_)) => {
-                        self.add_fallback_attrs_to_data_inst_def(func_at_inst, result.err());
-                    }
-                }
+        match self.try_lower_data_inst_def(func_at_node.reborrow()) {
+            Ok(Transformed::Changed(new_def)) => {
+                *func_at_node.def() = new_def;
+            }
+            result @ (Ok(Transformed::Unchanged) | Err(_)) => {
+                self.add_fallback_attrs_to_data_inst_def(func_at_node, result.err());
             }
         }
     }
