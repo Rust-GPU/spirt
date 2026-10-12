@@ -9,6 +9,7 @@ use crate::{
     Module, NodeDef, NodeKind, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
     TypeKind, TypeOrConst, Value, cfg, print,
 };
+use itertools::Itertools as _;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +23,15 @@ enum IdDef {
     Type(Type),
     Const(Const),
 
+    // HACK(eddyb) for illegal cycles caused by global initializers.
+    PtrToGlobalVarForwardRef(Const),
+
     Func(Func),
+
+    // HACK(eddyb) despite `FuncBody` deferring ID resolution to allow forward
+    // references *between* functions, function pointer *constants* need a `Func`
+    // long before any `OpFunction`s, so they're pre-defined as dummy imports.
+    FuncForwardRef(Func),
 
     SpvExtInstImport(InternedStr),
     SpvDebugString(InternedStr),
@@ -34,9 +43,9 @@ impl IdDef {
             // FIXME(eddyb) print these with some kind of "maximum depth",
             // instead of just describing the kind of definition.
             IdDef::Type(_) => "a type".into(),
-            IdDef::Const(_) => "a constant".into(),
+            IdDef::Const(_) | IdDef::PtrToGlobalVarForwardRef(_) => "a constant".into(),
 
-            IdDef::Func(_) => "a function".into(),
+            IdDef::Func(_) | IdDef::FuncForwardRef(_) => "a function".into(),
 
             IdDef::SpvExtInstImport(name) => {
                 format!("`OpExtInstImport {:?}`", &cx[name])
@@ -110,8 +119,94 @@ impl Module {
         let spv_spec = spec::Spec::get();
         let wk = &spv_spec.well_known;
 
+        // HACK(eddyb) useful for embedding `Type` in `Const` whenever necessary.
+        let spv_type_operand_as_const = |ty| {
+            cx.intern(ConstDef {
+                attrs: AttrSet::default(),
+                ty: cx.intern(TypeKind::SpvTypeOperand),
+                kind: ConstKind::SpvTypeOperand(ty),
+            })
+        };
+
         // HACK(eddyb) used to quickly check whether an `OpVariable` is global.
         let storage_class_function_imm = spv::Imm::Short(wk.StorageClass, wk.Function);
+
+        // HACK(eddyb) used as the `GlobalVarDecl` for an `IdDef::PtrToGlobalVarForwardRef`.
+        let dummy_decl_for_global_var_forward_ref =
+            |spv_inst: &spv::InstWithIds, type_of_ptr_to| {
+                assert!(spv_inst.opcode == wk.OpVariable);
+
+                let storage_class = match spv_inst.imms[..] {
+                    [spv::Imm::Short(kind, storage_class)] => {
+                        assert_eq!(kind, wk.StorageClass);
+                        storage_class
+                    }
+                    _ => unreachable!(),
+                };
+
+                GlobalVarDecl {
+                    attrs: {
+                        let mut attrs = AttrSet::default();
+                        attrs.push_diag(
+                            &cx,
+                            Diag::err([
+                                "global ID used as forward reference but never defined".into()
+                            ]),
+                        );
+                        attrs
+                    },
+                    type_of_ptr_to,
+                    shape: None,
+                    addr_space: AddrSpace::SpvStorageClass(storage_class),
+                    def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
+                }
+            };
+        // HACK(eddyb) no `PartialEq` on `GlobalVarDecl`.
+        let assert_is_dummy_decl_for_global_var_forward_ref =
+            |decl: &GlobalVarDecl, spv_inst: &spv::InstWithIds| {
+                let dummy_decl =
+                    dummy_decl_for_global_var_forward_ref(spv_inst, decl.type_of_ptr_to);
+                let [expected, found] = [&dummy_decl, decl].map(
+                    |GlobalVarDecl { attrs, type_of_ptr_to, shape, addr_space, def }| {
+                        let DeclDef::Imported(import) = def else {
+                            unreachable!();
+                        };
+                        (attrs, type_of_ptr_to, shape, addr_space, import)
+                    },
+                );
+                assert!(expected == found);
+            };
+
+        // HACK(eddyb) used as the `FuncDecl` for an `IdDef::FuncForwardRef`.
+        let dummy_decl_for_func_forward_ref = FuncDecl {
+            attrs: {
+                let mut attrs = AttrSet::default();
+                attrs.push_diag(
+                    &cx,
+                    Diag::err(["function ID used as forward reference but never defined".into()]),
+                );
+                attrs
+            },
+            // FIXME(eddyb) this gets simpler w/ disaggregation.
+            ret_type: cx.intern(TypeKind::SpvInst {
+                spv_inst: wk.OpTypeVoid.into(),
+                type_and_const_inputs: [].into_iter().collect(),
+            }),
+            params: [].into_iter().collect(),
+            def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
+        };
+        // HACK(eddyb) no `PartialEq` on `FuncDecl`.
+        let assert_is_dummy_decl_for_func_forward_ref = |decl: &FuncDecl| {
+            let [expected, found] = [&dummy_decl_for_func_forward_ref, decl].map(
+                |FuncDecl { attrs, ret_type, params, def }| {
+                    let DeclDef::Imported(import) = def else {
+                        unreachable!();
+                    };
+                    (attrs, ret_type, params, import)
+                },
+            );
+            assert!(expected == found);
+        };
 
         let mut module = {
             let [magic, version, generator_magic, id_bound, reserved_inst_schema] = parser.header;
@@ -182,7 +277,8 @@ impl Module {
         let mut seq = None;
 
         let mut has_memory_model = false;
-        let mut pending_attrs = FxHashMap::<spv::Id, crate::AttrSetDef>::default();
+        let mut pending_spv_annotations =
+            FxHashMap::<spv::Id, Vec<(spv::Inst, SmallVec<[spv::Id; 4]>)>>::default();
         let mut pending_imports = FxHashMap::<spv::Id, Import>::default();
         let mut pending_exports = vec![];
         let mut current_dbg_src_loc = None;
@@ -191,7 +287,7 @@ impl Module {
         let mut pending_func_bodies = vec![];
         let mut current_func_body = None;
 
-        let mut spv_insts = parser.peekable();
+        let mut spv_insts = parser.multipeek();
         while let Some(mut inst) = spv_insts.next().transpose()? {
             let opcode = inst.opcode;
 
@@ -253,8 +349,58 @@ impl Module {
             }
             current_block_id = new_block_id;
 
-            let mut attrs =
-                inst.result_id.and_then(|id| pending_attrs.remove(&id)).unwrap_or_default();
+            let mut attrs = crate::AttrSetDef::default();
+
+            {
+                let annotations = inst
+                    .result_id
+                    .and_then(|id| pending_spv_annotations.remove(&id))
+                    .unwrap_or_default();
+
+                // HACK(eddyb) when `per_instance_const_inputs` is `Some` in
+                // `Attr::SpvAnnotation`, it must collect all "instances",
+                // i.e. all occurrences of the same `spv_inst` value, so this
+                // map papers over `Attr` not having a key/value split itself.
+                let mut instances_per_spv_inst: FxIndexMap<spv::Inst, Vec<_>> =
+                    FxIndexMap::default();
+
+                for (spv_inst, operand_ids) in annotations {
+                    if operand_ids.is_empty() {
+                        attrs.attrs.insert(Attr::SpvAnnotation {
+                            spv_inst,
+                            per_instance_const_inputs: None,
+                        });
+                        continue;
+                    }
+
+                    let const_inputs = operand_ids
+                        .iter()
+                        .map(|&id| match id_defs.get(&id) {
+                            Some(&IdDef::Type(ty)) => Ok(spv_type_operand_as_const(ty)),
+                            Some(&IdDef::Const(ct)) => Ok(ct),
+                            Some(id_def) => Err(id_def.descr(&cx)),
+                            None => Err(format!("a forward reference to %{id}")),
+                        })
+                        .map(|result| {
+                            result.map_err(|descr| {
+                                invalid(&format!(
+                                    "unsupported use of {descr} in `{}`",
+                                    spv_inst.opcode.name()
+                                ))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    instances_per_spv_inst.entry(spv_inst).or_default().push(const_inputs);
+                }
+
+                attrs.attrs.extend(instances_per_spv_inst.into_iter().map(
+                    |(spv_inst, instances)| Attr::SpvAnnotation {
+                        spv_inst,
+                        per_instance_const_inputs: Some(crate::OrdAssertEq(Rc::new(instances))),
+                    },
+                ));
+            }
 
             if let Some(dbg_src_loc) = current_dbg_src_loc {
                 attrs.set_dbg_src_loc(dbg_src_loc);
@@ -404,6 +550,7 @@ impl Module {
                         // Absorb all following `OpSourceContinued` into `contents`.
                         while let Some(Ok(cont_inst)) = spv_insts.peek() {
                             if cont_inst.opcode != wk.OpSourceContinued {
+                                spv_insts.reset_peek();
                                 break;
                             }
                             let cont_inst = spv_insts.next().unwrap().unwrap();
@@ -477,23 +624,23 @@ impl Module {
                 Seq::EntryPoint
             } else if [
                 wk.OpExecutionMode,
-                wk.OpExecutionModeId, // FIXME(eddyb) not actually supported
+                wk.OpExecutionModeId,
                 wk.OpName,
                 wk.OpMemberName,
                 wk.OpDecorate,
-                wk.OpMemberDecorate,
-                wk.OpDecorateId, // FIXME(eddyb) not actually supported
+                wk.OpDecorateId,
                 wk.OpDecorateString,
+                wk.OpMemberDecorate,
+                wk.OpMemberDecorateIdEXT,
                 wk.OpMemberDecorateString,
             ]
             .contains(&opcode)
             {
                 assert!(inst.result_type_id.is_none() && inst.result_id.is_none());
 
-                let target_id = inst.ids[0];
-                if inst.ids.len() > 1 {
-                    return Err(invalid("unsupported decoration with ID"));
-                }
+                let target_id = inst.ids.remove(0);
+                let operand_ids = inst.ids;
+                let inst = inst.without_ids;
 
                 match inst.imms[..] {
                     // Special-case `OpDecorate LinkageAttributes ... Import|Export`.
@@ -506,6 +653,8 @@ impl Module {
                         && lt_kind == wk.LinkageType
                         && [wk.Import, wk.Export].contains(&linkage_type) =>
                     {
+                        assert_eq!(operand_ids.len(), 0);
+
                         let name = spv::extract_literal_string(name)
                             .map_err(|e| invalid(&format!("{} in {:?}", e, e.as_bytes())))?;
                         let name = cx.intern(name);
@@ -518,11 +667,10 @@ impl Module {
                     }
 
                     _ => {
-                        pending_attrs
+                        pending_spv_annotations
                             .entry(target_id)
                             .or_default()
-                            .attrs
-                            .insert(Attr::SpvAnnotation(inst.without_ids));
+                            .push((inst, operand_ids));
                     }
                 };
 
@@ -566,8 +714,11 @@ impl Module {
                     .map(|&id| match id_defs.get(&id) {
                         Some(&IdDef::Type(ty)) => Ok(TypeOrConst::Type(ty)),
                         Some(&IdDef::Const(ct)) => Ok(TypeOrConst::Const(ct)),
+                        None
+                        | Some(IdDef::PtrToGlobalVarForwardRef(_) | IdDef::FuncForwardRef(_)) => {
+                            Err(format!("a forward reference to %{id}"))
+                        }
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
                     })
                     .map(|result| {
                         result.map_err(|descr| {
@@ -583,15 +734,83 @@ impl Module {
                 id_defs.insert(id, IdDef::Type(ty));
 
                 Seq::TypeConstOrGlobalVar
+            } else if opcode == wk.OpConstantFunctionPointerINTEL {
+                use std::collections::hash_map::Entry;
+
+                let id = inst.result_id.unwrap();
+
+                let func_id = inst.ids[0];
+                let func = match id_defs.entry(func_id) {
+                    Entry::Occupied(entry) => match entry.get() {
+                        &IdDef::FuncForwardRef(func) => Ok(func),
+                        id_def => Err(id_def.descr(&cx)),
+                    },
+                    Entry::Vacant(entry) => {
+                        let func =
+                            module.funcs.define(&cx, dummy_decl_for_func_forward_ref.clone());
+                        entry.insert(IdDef::FuncForwardRef(func));
+                        Ok(func)
+                    }
+                }
+                .map_err(|descr| {
+                    invalid(&format!(
+                        "unsupported use of {descr} as the `OpConstantFunctionPointerINTEL` operand"
+                    ))
+                })?;
+
+                let ct = cx.intern(ConstDef {
+                    attrs: mem::take(&mut attrs),
+                    ty: result_type.unwrap(),
+                    kind: ConstKind::PtrToFunc(func),
+                });
+                id_defs.insert(id, IdDef::Const(ct));
+
+                Seq::TypeConstOrGlobalVar
             } else if inst_category == spec::InstructionCategory::Const || opcode == wk.OpUndef {
                 let id = inst.result_id.unwrap();
                 let const_inputs = inst
                     .ids
                     .iter()
                     .map(|&id| match id_defs.get(&id) {
-                        Some(&IdDef::Const(ct)) => Ok(ct),
+                        Some(&IdDef::Type(ty)) => Ok(spv_type_operand_as_const(ty)),
+                        Some(&IdDef::Const(ct) | &IdDef::PtrToGlobalVarForwardRef(ct)) => Ok(ct),
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
+                        None => {
+                            // HACK(eddyb) search for a matching `OpVariable`
+                            // later on, just in case this is a cycle caused
+                            // by the initializer value of a global.
+                            let mut found = None;
+                            while let Some(Ok(later_inst)) = spv_insts.peek() {
+                                if later_inst.opcode == wk.OpFunction {
+                                    break;
+                                }
+                                if later_inst.opcode == wk.OpVariable
+                                    && later_inst.result_id == Some(id)
+                                    && let Some(&IdDef::Type(ty)) =
+                                        id_defs.get(&later_inst.result_type_id.unwrap())
+                                {
+                                    let global_var = module.global_vars.define(
+                                        &cx,
+                                        dummy_decl_for_global_var_forward_ref(later_inst, ty),
+                                    );
+                                    let ptr_to_global_var = cx.intern(ConstDef {
+                                        attrs: AttrSet::default(),
+                                        ty,
+                                        kind: ConstKind::PtrToGlobalVar(global_var),
+                                    });
+                                    id_defs.insert(
+                                        id,
+                                        IdDef::PtrToGlobalVarForwardRef(ptr_to_global_var),
+                                    );
+                                    found = Some(ptr_to_global_var);
+                                    break;
+                                }
+                            }
+
+                            let ct =
+                                found.ok_or_else(|| format!("a forward reference to %{id}"))?;
+                            Ok(ct)
+                        }
                     })
                     .map(|result| {
                         result.map_err(|descr| {
@@ -640,8 +859,11 @@ impl Module {
                 let initializer = initializer
                     .map(|id| match id_defs.get(&id) {
                         Some(&IdDef::Const(ct)) => Ok(ct),
+                        None
+                        | Some(IdDef::PtrToGlobalVarForwardRef(_) | IdDef::FuncForwardRef(_)) => {
+                            Err(format!("a forward reference to %{id}"))
+                        }
                         Some(id_def) => Err(id_def.descr(&cx)),
-                        None => Err(format!("a forward reference to %{id}")),
                     })
                     .transpose()
                     .map_err(|descr| {
@@ -663,22 +885,48 @@ impl Module {
                     None => DeclDef::Present(GlobalVarDefBody { initializer }),
                 };
 
-                let global_var = module.global_vars.define(
-                    &cx,
-                    GlobalVarDecl {
-                        attrs: mem::take(&mut attrs),
-                        type_of_ptr_to: type_of_ptr_to_global_var,
-                        shape: None,
-                        addr_space: AddrSpace::SpvStorageClass(storage_class),
-                        def,
-                    },
-                );
-                let ptr_to_global_var = cx.intern(ConstDef {
-                    attrs: AttrSet::default(),
-                    ty: type_of_ptr_to_global_var,
-                    kind: ConstKind::PtrToGlobalVar(global_var),
-                });
-                id_defs.insert(global_var_id, IdDef::Const(ptr_to_global_var));
+                let decl = GlobalVarDecl {
+                    attrs: mem::take(&mut attrs),
+                    type_of_ptr_to: type_of_ptr_to_global_var,
+                    shape: None,
+                    addr_space: AddrSpace::SpvStorageClass(storage_class),
+                    def,
+                };
+
+                {
+                    use std::collections::hash_map::Entry;
+
+                    match id_defs.entry(global_var_id) {
+                        Entry::Occupied(mut entry) => match entry.get() {
+                            &IdDef::PtrToGlobalVarForwardRef(ct) => {
+                                let ConstKind::PtrToGlobalVar(global_var) = cx[ct].kind else {
+                                    unreachable!();
+                                };
+                                let decl_slot = &mut module.global_vars[global_var];
+                                assert_is_dummy_decl_for_global_var_forward_ref(decl_slot, &inst);
+                                *decl_slot = decl;
+
+                                entry.insert(IdDef::Const(ct));
+                            }
+                            id_def => {
+                                return Err(invalid(&format!(
+                                    "invalid redefinition of {} as a new global",
+                                    id_def.descr(&cx)
+                                )));
+                            }
+                        },
+                        Entry::Vacant(entry) => {
+                            let ptr_to_global_var = cx.intern(ConstDef {
+                                attrs: AttrSet::default(),
+                                ty: type_of_ptr_to_global_var,
+                                kind: ConstKind::PtrToGlobalVar(
+                                    module.global_vars.define(&cx, decl),
+                                ),
+                            });
+                            entry.insert(IdDef::Const(ptr_to_global_var));
+                        }
+                    }
+                }
 
                 Seq::TypeConstOrGlobalVar
             } else if opcode == wk.OpFunction {
@@ -754,19 +1002,40 @@ impl Module {
                         })
                     }
                 };
+                let decl = FuncDecl {
+                    attrs: mem::take(&mut attrs),
+                    ret_type: func_ret_type,
+                    params: func_type_param_types
+                        .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
+                        .collect(),
+                    def,
+                };
 
-                let func = module.funcs.define(
-                    &cx,
-                    FuncDecl {
-                        attrs: mem::take(&mut attrs),
-                        ret_type: func_ret_type,
-                        params: func_type_param_types
-                            .map(|ty| FuncParam { attrs: AttrSet::default(), ty })
-                            .collect(),
-                        def,
-                    },
-                );
-                id_defs.insert(func_id, IdDef::Func(func));
+                let func = {
+                    use std::collections::hash_map::Entry;
+
+                    match id_defs.entry(func_id) {
+                        Entry::Occupied(mut entry) => match entry.get() {
+                            &IdDef::FuncForwardRef(func) => {
+                                let decl_slot = &mut module.funcs[func];
+                                assert_is_dummy_decl_for_func_forward_ref(decl_slot);
+                                *decl_slot = decl;
+
+                                entry.insert(IdDef::Func(func));
+                                Ok(func)
+                            }
+                            id_def => Err(id_def.descr(&cx)),
+                        },
+                        Entry::Vacant(entry) => {
+                            let func = module.funcs.define(&cx, decl);
+                            entry.insert(IdDef::Func(func));
+                            Ok(func)
+                        }
+                    }
+                    .map_err(|descr| {
+                        invalid(&format!("invalid redefinition of {descr} as a new function"))
+                    })?
+                };
 
                 current_func_body = Some(FuncBody { func_id, func, insts: vec![] });
 
@@ -817,9 +1086,9 @@ impl Module {
             return Err(invalid("missing OpMemoryModel"));
         }
 
-        if !pending_attrs.is_empty() {
-            let ids = pending_attrs.keys().collect::<BTreeSet<_>>();
-            return Err(invalid(&format!("decorated IDs never defined: {ids:?}")));
+        if !pending_spv_annotations.is_empty() {
+            let ids = pending_spv_annotations.keys().collect::<BTreeSet<_>>();
+            return Err(invalid(&format!("annotated IDs never defined: {ids:?}")));
         }
 
         if current_func_body.is_some() {
@@ -1135,46 +1404,47 @@ impl Module {
 
                 // FIXME(eddyb) find a more compact name and/or make this a method.
                 // FIXME(eddyb) this returns `LocalIdDef` even for global values.
-                let lookup_global_or_local_id_for_data_or_control_inst_input =
-                    |id| match id_defs.get(&id) {
-                        Some(&IdDef::Const(ct)) => Ok(LocalIdDef::Value(Value::Const(ct))),
-                        Some(id_def @ IdDef::Type(_)) => Err(invalid(&format!(
-                            "unsupported use of {} as an operand for \
-                             an instruction in a function",
-                            id_def.descr(&cx),
-                        ))),
-                        Some(id_def @ IdDef::Func(_)) => Err(invalid(&format!(
-                            "unsupported use of {} outside `OpFunctionCall`",
-                            id_def.descr(&cx),
-                        ))),
-                        Some(id_def @ IdDef::SpvDebugString(s)) => {
-                            if opcode == wk.OpExtInst {
-                                // HACK(eddyb) intern `OpString`s as `Const`s on
-                                // the fly, as it's a less likely usage than the
-                                // `OpLine` one.
-                                let ct = cx.intern(ConstDef {
-                                    attrs: AttrSet::default(),
-                                    ty: cx.intern(TypeKind::SpvStringLiteralForExtInst),
-                                    kind: ConstKind::SpvStringLiteralForExtInst(*s),
-                                });
-                                Ok(LocalIdDef::Value(Value::Const(ct)))
-                            } else {
-                                Err(invalid(&format!(
-                                    "unsupported use of {} outside `OpSource`, \
+                let lookup_global_or_local_id_for_data_or_control_inst_input = |id| match id_defs
+                    .get(&id)
+                {
+                    Some(&IdDef::Type(ty)) => {
+                        Ok(LocalIdDef::Value(Value::Const(spv_type_operand_as_const(ty))))
+                    }
+                    Some(&IdDef::Const(ct)) => Ok(LocalIdDef::Value(Value::Const(ct))),
+                    Some(id_def @ IdDef::Func(_)) => Err(invalid(&format!(
+                        "unsupported use of {} outside `OpFunctionCall`",
+                        id_def.descr(&cx),
+                    ))),
+                    Some(id_def @ IdDef::SpvDebugString(s)) => {
+                        if opcode == wk.OpExtInst {
+                            // HACK(eddyb) intern `OpString`s as `Const`s on
+                            // the fly, as it's a less likely usage than the
+                            // `OpLine` one.
+                            let ct = cx.intern(ConstDef {
+                                attrs: AttrSet::default(),
+                                ty: cx.intern(TypeKind::SpvStringLiteralForExtInst),
+                                kind: ConstKind::SpvStringLiteralForExtInst(*s),
+                            });
+                            Ok(LocalIdDef::Value(Value::Const(ct)))
+                        } else {
+                            Err(invalid(&format!(
+                                "unsupported use of {} outside `OpSource`, \
                                      `OpLine`, or `OpExtInst`",
-                                    id_def.descr(&cx),
-                                )))
-                            }
+                                id_def.descr(&cx),
+                            )))
                         }
-                        Some(id_def @ IdDef::SpvExtInstImport(_)) => Err(invalid(&format!(
-                            "unsupported use of {} outside `OpExtInst`",
-                            id_def.descr(&cx),
-                        ))),
-                        None => local_id_defs
+                    }
+                    Some(id_def @ IdDef::SpvExtInstImport(_)) => Err(invalid(&format!(
+                        "unsupported use of {} outside `OpExtInst`",
+                        id_def.descr(&cx),
+                    ))),
+                    None | Some(IdDef::PtrToGlobalVarForwardRef(_) | IdDef::FuncForwardRef(_)) => {
+                        local_id_defs
                             .get(&id)
                             .copied()
-                            .ok_or_else(|| invalid(&format!("undefined ID %{id}",))),
-                    };
+                            .ok_or_else(|| invalid(&format!("undefined ID %{id}",)))
+                    }
+                };
 
                 if opcode == wk.OpFunctionParameter {
                     if current_block.is_some() {
@@ -1221,13 +1491,12 @@ impl Module {
                         details,
 
                         // HACK(eddyb) reuse `shadowed_local_id_defs` storage.
-                        shadowed_local_id_defs: current_block
-                            .take()
-                            .map(|CurrentBlock { mut shadowed_local_id_defs, .. }| {
+                        shadowed_local_id_defs: current_block.take().map_or_default(
+                            |CurrentBlock { mut shadowed_local_id_defs, .. }| {
                                 shadowed_local_id_defs.clear();
                                 shadowed_local_id_defs
-                            })
-                            .unwrap_or_default(),
+                            },
+                        ),
                     });
                     continue;
                 }

@@ -71,7 +71,6 @@
     clippy::dbg_macro,
     clippy::debug_assert_with_mut_call,
     clippy::doc_markdown,
-    clippy::empty_enum,
     clippy::enum_glob_use,
     clippy::exit,
     clippy::expl_impl_clone_on_copy,
@@ -82,7 +81,6 @@
     clippy::flat_map_option,
     clippy::float_cmp_const,
     clippy::fn_params_excessive_bools,
-    clippy::from_iter_instead_of_collect,
     clippy::if_let_mutex,
     clippy::implicit_clone,
     clippy::imprecise_flops,
@@ -121,7 +119,6 @@
     clippy::string_add_assign,
     clippy::string_add,
     clippy::string_lit_as_bytes,
-    clippy::string_to_string,
     clippy::todo,
     clippy::trait_duplication_in_bounds,
     clippy::unimplemented,
@@ -169,6 +166,7 @@ pub mod passes {
     pub mod link;
     pub mod qptr;
 }
+pub mod mem;
 pub mod qptr;
 pub mod spv;
 
@@ -397,11 +395,28 @@ pub enum Attr {
     // of `AttrSetDef::{dbg_src_loc,set_dbg_src_loc}`.
     DbgSrcLoc(OrdAssertEq<DbgSrcLoc>),
 
+    /// Memory-specific attributes (see [`mem::MemAttr`]).
+    #[from]
+    Mem(mem::MemAttr),
+
     /// `QPtr`-specific attributes (see [`qptr::QPtrAttr`]).
     #[from]
     QPtr(qptr::QPtrAttr),
 
-    SpvAnnotation(spv::Inst),
+    SpvAnnotation {
+        spv_inst: spv::Inst,
+
+        /// If present, each "instance" represents a different use of `spv_inst`,
+        /// grouped together only because the non-ID operands (enumerand/literals)
+        /// inside `spv::Inst` are not enough to uniquely identify an annotation
+        /// (i.e. at least some of the `Const` IDs are semantically part of the
+        /// "key" side `Attr`, which should normally be outside the `OrdAssertEq`).
+        //
+        // HACK(eddyb) this is enough of a complication to furthger call into
+        // question the use of ordered sets for `AttrSet`s, in the first place.
+        #[allow(clippy::type_complexity)]
+        per_instance_const_inputs: Option<OrdAssertEq<Rc<Vec<SmallVec<[Const; 2]>>>>>,
+    },
 
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
@@ -489,7 +504,7 @@ pub enum DiagMsgPart {
     Attrs(AttrSet),
     Type(Type),
     Const(Const),
-    QPtrUsage(qptr::QPtrUsage),
+    MemAccesses(mem::MemAccesses),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])
@@ -555,6 +570,10 @@ pub enum TypeKind {
         type_and_const_inputs: SmallVec<[TypeOrConst; 2]>,
     },
 
+    /// The type of a [`ConstKind::SpvTypeOperand`] constant, i.e. a [`Type`]
+    /// embedded in a [`Value`] to be passed as a SPIR-V operand.
+    SpvTypeOperand,
+
     /// The type of a [`ConstKind::SpvStringLiteralForExtInst`] constant, i.e.
     /// a SPIR-V `OpString` with no actual type in SPIR-V.
     SpvStringLiteralForExtInst,
@@ -590,13 +609,22 @@ pub struct ConstDef {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ConstKind {
+    // FIXME(eddyb) maybe merge these? however, their connection is somewhat
+    // tenuous (being one of the LLVM-isms SPIR-V inherited, among other things),
+    // there's still the need to rename "global variable" post-`Var`-refactor,
+    // and last but not least, `PtrToFunc` needs `SPV_INTEL_function_pointers`,
+    // an OpenCL-only extension Intel came up with for their own SPIR-V tooling.
     PtrToGlobalVar(GlobalVar),
+    PtrToFunc(Func),
 
     // HACK(eddyb) this is a fallback case that should become increasingly rare
     // (especially wrt recursive consts), `Rc` means it can't bloat `ConstDef`.
     SpvInst {
         spv_inst_and_const_inputs: Rc<(spv::Inst, SmallVec<[Const; 4]>)>,
     },
+
+    /// Type used as an operand to a SPIR-V instruction (other than result type).
+    SpvTypeOperand(Type),
 
     /// SPIR-V `OpString`, but only when used as an operand for an `OpExtInst`,
     /// which can't have literals itself - for non-string literals `OpConstant*`
@@ -638,7 +666,7 @@ pub struct GlobalVarDecl {
 
     /// When `type_of_ptr_to` is `QPtr`, `shape` must be used to describe the
     /// global variable (see `GlobalVarShape`'s documentation for more details).
-    pub shape: Option<qptr::shapes::GlobalVarShape>,
+    pub shape: Option<mem::shapes::GlobalVarShape>,
 
     /// The address space the global variable will be allocated into.
     pub addr_space: AddrSpace,
@@ -679,7 +707,7 @@ pub struct FuncDecl {
     pub def: DeclDef<FuncDefBody>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct FuncParam {
     pub attrs: AttrSet,
 
@@ -946,6 +974,10 @@ pub enum DataInstKind {
     // FIXME(eddyb) try to split this into recursive and non-recursive calls,
     // to avoid needing special handling for recursion where it's impossible.
     FuncCall(Func),
+
+    /// Memory-specific operations (see [`mem::MemOp`]).
+    #[from]
+    Mem(mem::MemOp),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]

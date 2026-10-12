@@ -1,10 +1,10 @@
-//! [`QPtr`](crate::TypeKind::QPtr) usage analysis (for legalizing/lifting).
+//! Memory access analysis (for "type recovery", i.e. untyped -> typed memory).
+//
+// TODO(eddyb) consider renaming this to `mem::typed`.
 
-// HACK(eddyb) sharing layout code with other modules.
-use super::{QPtrMemUsageKind, layout::*};
-
-use super::{QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage, shapes};
 use crate::func_at::FuncAt;
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInst, DataInstKind,
@@ -19,14 +19,18 @@ use std::num::NonZeroU32;
 use std::ops::Bound;
 use std::rc::Rc;
 
+// HACK(eddyb) sharing layout code with other modules.
+// FIXME(eddyb) can this just be a non-glob import?
+use crate::mem::layout::*;
+
 #[derive(Clone)]
 struct AnalysisError(Diag);
 
-struct UsageMerger<'a> {
+struct AccessMerger<'a> {
     layout_cache: &'a LayoutCache<'a>,
 }
 
-/// Result type for `UsageMerger` methods - unlike `Result<T, AnalysisError>`,
+/// Result type for `AccessMerger` methods - unlike `Result<T, AnalysisError>`,
 /// this always keeps the `T` value, even in the case of an error.
 struct MergeResult<T> {
     merged: T,
@@ -53,28 +57,28 @@ impl<T> MergeResult<T> {
     }
 }
 
-impl UsageMerger<'_> {
-    fn merge(&self, a: QPtrUsage, b: QPtrUsage) -> MergeResult<QPtrUsage> {
+impl AccessMerger<'_> {
+    fn merge(&self, a: MemAccesses, b: MemAccesses) -> MergeResult<MemAccesses> {
         match (a, b) {
             (
-                QPtrUsage::Handles(shapes::Handle::Opaque(a)),
-                QPtrUsage::Handles(shapes::Handle::Opaque(b)),
-            ) if a == b => MergeResult::ok(QPtrUsage::Handles(shapes::Handle::Opaque(a))),
+                MemAccesses::Handles(shapes::Handle::Opaque(a)),
+                MemAccesses::Handles(shapes::Handle::Opaque(b)),
+            ) if a == b => MergeResult::ok(MemAccesses::Handles(shapes::Handle::Opaque(a))),
 
             (
-                QPtrUsage::Handles(shapes::Handle::Buffer(a_as, a)),
-                QPtrUsage::Handles(shapes::Handle::Buffer(b_as, b)),
+                MemAccesses::Handles(shapes::Handle::Buffer(a_as, a)),
+                MemAccesses::Handles(shapes::Handle::Buffer(b_as, b)),
             ) => {
                 // HACK(eddyb) the `AddrSpace` field is entirely redundant.
                 assert!(a_as == AddrSpace::Handles && b_as == AddrSpace::Handles);
 
-                self.merge_mem(a, b).map(|usage| {
-                    QPtrUsage::Handles(shapes::Handle::Buffer(AddrSpace::Handles, usage))
+                self.merge_data(a, b).map(|happ| {
+                    MemAccesses::Handles(shapes::Handle::Buffer(AddrSpace::Handles, happ))
                 })
             }
 
-            (QPtrUsage::Memory(a), QPtrUsage::Memory(b)) => {
-                self.merge_mem(a, b).map(QPtrUsage::Memory)
+            (MemAccesses::Data(a), MemAccesses::Data(b)) => {
+                self.merge_data(a, b).map(MemAccesses::Data)
             }
 
             (a, b) => {
@@ -94,9 +98,9 @@ impl UsageMerger<'_> {
         }
     }
 
-    fn merge_mem(&self, a: QPtrMemUsage, b: QPtrMemUsage) -> MergeResult<QPtrMemUsage> {
-        // NOTE(eddyb) this is possible because it's currently impossible for
-        // the merged usage to be outside the bounds of *both* `a` and `b`.
+    fn merge_data(&self, a: DataHapp, b: DataHapp) -> MergeResult<DataHapp> {
+        // NOTE(eddyb) this is doable because it's currently impossible for
+        // the merged HAPP to be outside the bounds of *both* `a` and `b`.
         let max_size = match (a.max_size, b.max_size) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (None, _) | (_, None) => None,
@@ -107,14 +111,14 @@ impl UsageMerger<'_> {
         // to make it easier to handle all the possible interactions below,
         // by skipping (or deprioritizing, if supported) the "wrong direction".
         let mut sorted = [a, b];
-        sorted.sort_by_key(|usage| {
+        sorted.sort_by_key(|happ| {
             #[derive(PartialEq, Eq, PartialOrd, Ord)]
             enum MaxSize<T> {
                 Fixed(T),
                 // FIXME(eddyb) this probably needs to track "min size"?
                 Dynamic,
             }
-            let max_size = usage.max_size.map_or(MaxSize::Dynamic, MaxSize::Fixed);
+            let max_size = happ.max_size.map_or(MaxSize::Dynamic, MaxSize::Fixed);
 
             // When sizes are equal, pick the more restrictive side.
             #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -124,21 +128,21 @@ impl UsageMerger<'_> {
                 Exact,
             }
             #[allow(clippy::match_same_arms)]
-            let type_strictness = match usage.kind {
-                QPtrMemUsageKind::Unused | QPtrMemUsageKind::OffsetBase(_) => TypeStrictness::Any,
+            let type_strictness = match happ.kind {
+                DataHappKind::Dead | DataHappKind::Disjoint(_) => TypeStrictness::Any,
 
-                QPtrMemUsageKind::DynOffsetBase { .. } => TypeStrictness::Array,
+                DataHappKind::Repeated { .. } => TypeStrictness::Array,
 
                 // FIXME(eddyb) this should be `Any`, even if in theory it
                 // could contain arrays or structs that need decomposition
                 // (note that, for typed reads/write, arrays do not need to be
                 // *indexed* to work, i.e. they *do not* require `DynOffset`s,
-                // `Offset`s suffice, and for them `DynOffsetBase` is at most
-                // a "run-length"/deduplication optimization over `OffsetBase`).
-                // NOTE(eddyb) this should still prefer `OpTypeVector` over `DynOffsetBase`!
-                QPtrMemUsageKind::DirectAccess(_) => TypeStrictness::Exact,
+                // `Offset`s suffice, and for them `Repeated` is at most
+                // a "run-length"/deduplication optimization over `Disjoint`).
+                // NOTE(eddyb) this should still prefer `OpTypeVector` over `Repeated`!
+                DataHappKind::Direct(_) => TypeStrictness::Exact,
 
-                QPtrMemUsageKind::StrictlyTyped(_) => TypeStrictness::Exact,
+                DataHappKind::StrictlyTyped(_) => TypeStrictness::Exact,
             };
 
             (max_size, type_strictness)
@@ -146,33 +150,28 @@ impl UsageMerger<'_> {
         let [b, a] = sorted;
         assert_eq!(max_size, a.max_size);
 
-        self.merge_mem_at(a, 0, b)
+        self.merge_data_at(a, 0, b)
     }
 
     // FIXME(eddyb) make the name of this clarify the asymmetric effect, something
     // like "make `a` compatible with `offset => b`".
-    fn merge_mem_at(
-        &self,
-        a: QPtrMemUsage,
-        b_offset_in_a: u32,
-        b: QPtrMemUsage,
-    ) -> MergeResult<QPtrMemUsage> {
-        // NOTE(eddyb) this is possible because it's currently impossible for
-        // the merged usage to be outside the bounds of *both* `a` and `b`.
+    fn merge_data_at(&self, a: DataHapp, b_offset_in_a: u32, b: DataHapp) -> MergeResult<DataHapp> {
+        // NOTE(eddyb) this is doable because it's currently impossible for
+        // the merged HAPP to be outside the bounds of *both* `a` and `b`.
         let max_size = match (a.max_size, b.max_size) {
             (Some(a), Some(b)) => Some(a.max(b.checked_add(b_offset_in_a).unwrap())),
             (None, _) | (_, None) => None,
         };
 
-        // HACK(eddyb) we require biased `a` vs `b` (see `merge_mem` method above).
+        // HACK(eddyb) we require biased `a` vs `b` (see `merge_data` method above).
         assert_eq!(max_size, a.max_size);
 
         // Decompose the "smaller" and/or "less strict" side (`b`) first.
         match b.kind {
-            // `Unused`s are always ignored.
-            QPtrMemUsageKind::Unused => return MergeResult::ok(a),
+            // `Dead`s are always ignored.
+            DataHappKind::Dead => return MergeResult::ok(a),
 
-            QPtrMemUsageKind::OffsetBase(b_entries)
+            DataHappKind::Disjoint(b_entries)
                 if {
                     // HACK(eddyb) this check was added later, after it turned out
                     // that *deep* flattening of arbitrary offsets in `b` would've
@@ -190,11 +189,11 @@ impl UsageMerger<'_> {
 
                 let mut ab = a;
                 let mut all_errors = None;
-                for (b_offset, b_sub_usage) in b_entries {
-                    let MergeResult { merged, error: new_error } = self.merge_mem_at(
+                for (b_offset, b_sub_happ) in b_entries {
+                    let MergeResult { merged, error: new_error } = self.merge_data_at(
                         ab,
                         b_offset.checked_add(b_offset_in_a).unwrap(),
-                        b_sub_usage,
+                        b_sub_happ,
                     );
                     ab = merged;
 
@@ -218,7 +217,7 @@ impl UsageMerger<'_> {
                     // FIXME(eddyb) should this mean `MergeResult` should
                     // use `errors: Vec<AnalysisError>` instead of `Option`?
                     error: all_errors.map(|AnalysisError(mut e)| {
-                        e.message.insert(0, "merge_mem: conflicts:\n".into());
+                        e.message.insert(0, "merge_data: conflicts:\n".into());
                         AnalysisError(e)
                     }),
                 };
@@ -228,16 +227,15 @@ impl UsageMerger<'_> {
         }
 
         let kind = match a.kind {
-            // `Unused`s are always ignored.
-            QPtrMemUsageKind::Unused => MergeResult::ok(b.kind),
+            // `Dead`s are always ignored.
+            DataHappKind::Dead => MergeResult::ok(b.kind),
 
-            // Typed leaves must support any possible usage applied to them
-            // (when they match, or overtake, that usage, in size, like here),
+            // Typed leaves must support any possible accesses applied to them
+            // (when they match, or overtake, that access, in size, like here),
             // with their inherent hierarchy (i.e. their array/struct nesting).
-            QPtrMemUsageKind::StrictlyTyped(a_type) | QPtrMemUsageKind::DirectAccess(a_type) => {
+            DataHappKind::StrictlyTyped(a_type) | DataHappKind::Direct(a_type) => {
                 let b_type_at_offset_0 = match b.kind {
-                    QPtrMemUsageKind::StrictlyTyped(b_type)
-                    | QPtrMemUsageKind::DirectAccess(b_type)
+                    DataHappKind::StrictlyTyped(b_type) | DataHappKind::Direct(b_type)
                         if b_offset_in_a == 0 =>
                     {
                         Some(b_type)
@@ -247,11 +245,11 @@ impl UsageMerger<'_> {
                 let ty = if Some(a_type) == b_type_at_offset_0 {
                     MergeResult::ok(a_type)
                 } else {
-                    // Returns `Some(MergeResult::ok(ty))` iff `usage` is valid
+                    // Returns `Some(MergeResult::ok(ty))` iff `happ` is valid
                     // for type `ty`, and `None` iff invalid w/o layout errors
-                    // (see `mem_layout_supports_usage_at_offset` for more details).
-                    let type_supporting_usage_at_offset = |ty, usage_offset, usage| {
-                        let supports_usage = match self.layout_of(ty) {
+                    // (see `mem_layout_supports_happ_at_offset` for more details).
+                    let type_supporting_happ_at_offset = |ty, happ_offset, happ| {
+                        let supports_happ = match self.layout_of(ty) {
                             // FIXME(eddyb) should this be `unreachable!()`? also, is
                             // it possible to end up with `ty` being an `OpTypeStruct`
                             // decorated with `Block`, showing up as a `Buffer` handle?
@@ -261,27 +259,27 @@ impl UsageMerger<'_> {
                             // conflict with our own `Block`-annotated wrapper.
                             Ok(TypeLayout::Handle(_) | TypeLayout::HandleArray(..)) => {
                                 Err(AnalysisError(Diag::bug([
-                                    "merge_mem: impossible handle type for QPtrMemUsage".into(),
+                                    "merge_data: impossible handle type for DataHapp".into(),
                                 ])))
                             }
                             Ok(TypeLayout::Concrete(concrete)) => {
-                                Ok(concrete.supports_usage_at_offset(usage_offset, usage))
+                                Ok(concrete.supports_happ_at_offset(happ_offset, happ))
                             }
 
                             Err(e) => Err(e),
                         };
-                        match supports_usage {
+                        match supports_happ {
                             Ok(false) => None,
                             Ok(true) | Err(_) => {
-                                Some(MergeResult { merged: ty, error: supports_usage.err() })
+                                Some(MergeResult { merged: ty, error: supports_happ.err() })
                             }
                         }
                     };
 
-                    type_supporting_usage_at_offset(a_type, b_offset_in_a, &b)
+                    type_supporting_happ_at_offset(a_type, b_offset_in_a, &b)
                         .or_else(|| {
                             b_type_at_offset_0.and_then(|b_type_at_offset_0| {
-                                type_supporting_usage_at_offset(b_type_at_offset_0, 0, &a)
+                                type_supporting_happ_at_offset(b_type_at_offset_0, 0, &a)
                             })
                         })
                         .unwrap_or_else(|| {
@@ -290,11 +288,11 @@ impl UsageMerger<'_> {
                                 // FIXME(eddyb) this should ideally embed the types in the
                                 // error somehow.
                                 error: Some(AnalysisError(Diag::bug([
-                                    "merge_mem: type subcomponents incompatible with usage ("
+                                    "merge_data: type subcomponents incompatible with accesses ("
                                         .into(),
-                                    QPtrUsage::Memory(a.clone()).into(),
+                                    MemAccesses::Data(a.clone()).into(),
                                     " vs ".into(),
-                                    QPtrUsage::Memory(b.clone()).into(),
+                                    MemAccesses::Data(b.clone()).into(),
                                     ")".into(),
                                 ]))),
                             }
@@ -307,19 +305,19 @@ impl UsageMerger<'_> {
 
                 // FIXME(eddyb) this might not enough because the
                 // strict leaf could be *nested* inside `b`!!!
-                let is_strict = |kind| matches!(kind, &QPtrMemUsageKind::StrictlyTyped(_));
+                let is_strict = |kind| matches!(kind, &DataHappKind::StrictlyTyped(_));
                 if is_strict(&a.kind) || is_strict(&b.kind) {
-                    ty.map(QPtrMemUsageKind::StrictlyTyped)
+                    ty.map(DataHappKind::StrictlyTyped)
                 } else {
-                    ty.map(QPtrMemUsageKind::DirectAccess)
+                    ty.map(DataHappKind::Direct)
                 }
             }
 
-            QPtrMemUsageKind::DynOffsetBase { element: mut a_element, stride: a_stride } => {
+            DataHappKind::Repeated { element: mut a_element, stride: a_stride } => {
                 let b_offset_in_a_element = b_offset_in_a % a_stride;
 
-                // Array-like dynamic offsetting needs to always merge any usage that
-                // fits inside the stride, with its "element" usage, no matter how
+                // Array-like dynamic offsetting needs to always merge any HAPP that
+                // fits inside the stride, with its "element" HAPP, no matter how
                 // complex it may be (notably, this is needed for nested arrays).
                 if b.max_size
                     .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
@@ -328,50 +326,44 @@ impl UsageMerger<'_> {
                     // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
                     ({
                         let a_element_mut = Rc::make_mut(&mut a_element);
-                        let a_element = mem::replace(a_element_mut, QPtrMemUsage::UNUSED);
-                        // FIXME(eddyb) remove this silliness by making `merge_mem_at` do symmetrical sorting.
+                        let a_element = mem::replace(a_element_mut, DataHapp::DEAD);
+                        // FIXME(eddyb) remove this silliness by making `merge_data_at` do symmetrical sorting.
                         if b_offset_in_a_element == 0 {
-                            self.merge_mem(a_element, b)
+                            self.merge_data(a_element, b)
                         } else {
-                            self.merge_mem_at(a_element, b_offset_in_a_element, b)
+                            self.merge_data_at(a_element, b_offset_in_a_element, b)
                         }
                         .map(|merged| *a_element_mut = merged)
                     })
-                    .map(|()| QPtrMemUsageKind::DynOffsetBase {
-                        element: a_element,
-                        stride: a_stride,
-                    })
+                    .map(|()| DataHappKind::Repeated { element: a_element, stride: a_stride })
                 } else {
                     match b.kind {
-                        QPtrMemUsageKind::DynOffsetBase {
-                            element: b_element,
-                            stride: b_stride,
-                        } if b_offset_in_a_element == 0 && a_stride == b_stride => {
+                        DataHappKind::Repeated { element: b_element, stride: b_stride }
+                            if b_offset_in_a_element == 0 && a_stride == b_stride =>
+                        {
                             // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
                             ({
                                 let a_element_mut = Rc::make_mut(&mut a_element);
-                                let a_element = mem::replace(a_element_mut, QPtrMemUsage::UNUSED);
+                                let a_element = mem::replace(a_element_mut, DataHapp::DEAD);
                                 let b_element =
                                     Rc::try_unwrap(b_element).unwrap_or_else(|e| (*e).clone());
-                                self.merge_mem(a_element, b_element)
+                                self.merge_data(a_element, b_element)
                                     .map(|merged| *a_element_mut = merged)
                             })
-                            .map(|()| {
-                                QPtrMemUsageKind::DynOffsetBase {
-                                    element: a_element,
-                                    stride: a_stride,
-                                }
+                            .map(|()| DataHappKind::Repeated {
+                                element: a_element,
+                                stride: a_stride,
                             })
                         }
                         _ => {
                             // FIXME(eddyb) implement somehow (by adjusting stride?).
-                            // NOTE(eddyb) with `b` as an `DynOffsetBase`/`OffsetBase`, it could
+                            // NOTE(eddyb) with `b` as an `Repeated`/`Disjoint`, it could
                             // also be possible to superimpose its offset patterns onto `a`,
-                            // though that's easier for `OffsetBase` than `DynOffsetBase`.
+                            // though that's easier for `Disjoint` than `Repeated`.
                             // HACK(eddyb) needed due to `a` being moved out of.
-                            let a = QPtrMemUsage {
+                            let a = DataHapp {
                                 max_size: a.max_size,
-                                kind: QPtrMemUsageKind::DynOffsetBase {
+                                kind: DataHappKind::Repeated {
                                     element: a_element,
                                     stride: a_stride,
                                 },
@@ -380,13 +372,13 @@ impl UsageMerger<'_> {
                                 merged: a.kind.clone(),
                                 error: Some(AnalysisError(Diag::bug([
                                     format!(
-                                        "merge_mem: unimplemented \
+                                        "merge_data: unimplemented \
                                          non-intra-element merging into stride={a_stride} ("
                                     )
                                     .into(),
-                                    QPtrUsage::Memory(a).into(),
+                                    MemAccesses::Data(a).into(),
                                     " vs ".into(),
-                                    QPtrUsage::Memory(b).into(),
+                                    MemAccesses::Data(b).into(),
                                     ")".into(),
                                 ]))),
                             }
@@ -395,7 +387,7 @@ impl UsageMerger<'_> {
                 }
             }
 
-            QPtrMemUsageKind::OffsetBase(mut a_entries) => {
+            DataHappKind::Disjoint(mut a_entries) => {
                 let overlapping_entries = a_entries
                     .range((
                         Bound::Unbounded,
@@ -404,8 +396,8 @@ impl UsageMerger<'_> {
                         }),
                     ))
                     .rev()
-                    .take_while(|(a_sub_offset, a_sub_usage)| {
-                        a_sub_usage.max_size.is_none_or(|a_sub_max_size| {
+                    .take_while(|(a_sub_offset, a_sub_happ)| {
+                        a_sub_happ.max_size.is_none_or(|a_sub_max_size| {
                             a_sub_offset.checked_add(a_sub_max_size).unwrap() > b_offset_in_a
                         })
                     });
@@ -418,15 +410,15 @@ impl UsageMerger<'_> {
                 let mut all_errors = None;
                 let (mut b_offset_in_a, mut b) = (b_offset_in_a, b);
                 for a_sub_offset in overlapping_offsets {
-                    let a_sub_usage = a_entries_mut.remove(&a_sub_offset).unwrap();
+                    let a_sub_happ = a_entries_mut.remove(&a_sub_offset).unwrap();
 
                     // HACK(eddyb) this replicates the condition in which
-                    // `merge_mem_at` would fail its similar assert, some of
+                    // `merge_data_at` would fail its similar assert, some of
                     // the cases denied here might be legal, but they're rare
                     // enough that we can do this for now.
                     let is_illegal = a_sub_offset != b_offset_in_a && {
                         let (a_sub_total_max_size, b_total_max_size) = (
-                            a_sub_usage.max_size.map(|a| a.checked_add(a_sub_offset).unwrap()),
+                            a_sub_happ.max_size.map(|a| a.checked_add(a_sub_offset).unwrap()),
                             b.max_size.map(|b| b.checked_add(b_offset_in_a).unwrap()),
                         );
                         let total_max_size_merged = match (a_sub_total_max_size, b_total_max_size) {
@@ -442,24 +434,21 @@ impl UsageMerger<'_> {
                     };
                     if is_illegal {
                         // HACK(eddyb) needed due to `a` being moved out of.
-                        let a = QPtrMemUsage {
+                        let a = DataHapp {
                             max_size: a.max_size,
-                            kind: QPtrMemUsageKind::OffsetBase(a_entries.clone()),
+                            kind: DataHappKind::Disjoint(a_entries.clone()),
                         };
                         return MergeResult {
-                            merged: QPtrMemUsage {
-                                max_size,
-                                kind: QPtrMemUsageKind::OffsetBase(a_entries),
-                            },
+                            merged: DataHapp { max_size, kind: DataHappKind::Disjoint(a_entries) },
                             error: Some(AnalysisError(Diag::bug([
                                 format!(
-                                    "merge_mem: unsupported straddling overlap \
+                                    "merge_data: unsupported straddling overlap \
                                      at offsets {a_sub_offset} vs {b_offset_in_a} ("
                                 )
                                 .into(),
-                                QPtrUsage::Memory(a).into(),
+                                MemAccesses::Data(a).into(),
                                 " vs ".into(),
-                                QPtrUsage::Memory(b).into(),
+                                MemAccesses::Data(b).into(),
                                 ")".into(),
                             ]))),
                         };
@@ -470,16 +459,16 @@ impl UsageMerger<'_> {
                         if a_sub_offset < b_offset_in_a {
                             (
                                 a_sub_offset,
-                                self.merge_mem_at(a_sub_usage, b_offset_in_a - a_sub_offset, b),
+                                self.merge_data_at(a_sub_happ, b_offset_in_a - a_sub_offset, b),
                             )
                         } else {
-                            // FIXME(eddyb) remove this silliness by making `merge_mem_at` do symmetrical sorting.
+                            // FIXME(eddyb) remove this silliness by making `merge_data_at` do symmetrical sorting.
                             if a_sub_offset - b_offset_in_a == 0 {
-                                (b_offset_in_a, self.merge_mem(b, a_sub_usage))
+                                (b_offset_in_a, self.merge_data(b, a_sub_happ))
                             } else {
                                 (
                                     b_offset_in_a,
-                                    self.merge_mem_at(b, a_sub_offset - b_offset_in_a, a_sub_usage),
+                                    self.merge_data_at(b, a_sub_offset - b_offset_in_a, a_sub_happ),
                                 )
                             }
                         };
@@ -501,17 +490,17 @@ impl UsageMerger<'_> {
                 }
                 a_entries_mut.insert(b_offset_in_a, b);
                 MergeResult {
-                    merged: QPtrMemUsageKind::OffsetBase(a_entries),
+                    merged: DataHappKind::Disjoint(a_entries),
                     // FIXME(eddyb) should this mean `MergeResult` should
                     // use `errors: Vec<AnalysisError>` instead of `Option`?
                     error: all_errors.map(|AnalysisError(mut e)| {
-                        e.message.insert(0, "merge_mem: conflicts:\n".into());
+                        e.message.insert(0, "merge_data: conflicts:\n".into());
                         AnalysisError(e)
                     }),
                 }
             }
         };
-        kind.map(|kind| QPtrMemUsage { max_size, kind })
+        kind.map(|kind| DataHapp { max_size, kind })
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
@@ -521,85 +510,84 @@ impl UsageMerger<'_> {
 }
 
 impl MemTypeLayout {
-    /// Determine if this layout is compatible with `usage` at `usage_offset`.
+    /// Determine if this layout is compatible with `happ` at `happ_offset`.
     ///
-    /// That is, all typed leaves of `usage` must be found inside `self`, at
-    /// their respective offsets, and all [`QPtrMemUsageKind::DynOffsetBase`]s
-    /// must find a same-stride array inside `self` (to allow dynamic indexing).
+    /// That is, all typed leaves of `happ` must be found inside `self`, at
+    /// their respective offsets, and all [`DataHappKind::Repeated`]s must
+    /// find a same-stride array inside `self` (to allow dynamic indexing).
     //
     // FIXME(eddyb) consider using `Result` to make it unambiguous.
-    fn supports_usage_at_offset(&self, usage_offset: u32, usage: &QPtrMemUsage) -> bool {
-        if let QPtrMemUsageKind::Unused = usage.kind {
+    fn supports_happ_at_offset(&self, happ_offset: u32, happ: &DataHapp) -> bool {
+        if let DataHappKind::Dead = happ.kind {
             return true;
         }
 
         // "Fast accept" based on type alone (expected as recursion base case).
-        if let QPtrMemUsageKind::StrictlyTyped(usage_type)
-        | QPtrMemUsageKind::DirectAccess(usage_type) = usage.kind
-            && usage_offset == 0
-            && self.original_type == usage_type
+        if let DataHappKind::StrictlyTyped(happ_type) | DataHappKind::Direct(happ_type) = happ.kind
+            && happ_offset == 0
+            && self.original_type == happ_type
         {
             return true;
         }
 
         {
-            // FIXME(eddyb) should `QPtrMemUsage` track a `min_size` as well?
+            // FIXME(eddyb) should `DataHapp` track a `min_size` as well?
             // FIXME(eddyb) duplicated below.
-            let min_usage_offset_range =
-                usage_offset..usage_offset.saturating_add(usage.max_size.unwrap_or(0));
+            let min_happ_offset_range =
+                happ_offset..happ_offset.saturating_add(happ.max_size.unwrap_or(0));
 
             // "Fast reject" based on size alone (expected w/ multiple attempts).
             if self.mem_layout.dyn_unit_stride.is_none()
-                && (self.mem_layout.fixed_base.size < min_usage_offset_range.end
-                    || usage.max_size.is_none())
+                && (self.mem_layout.fixed_base.size < min_happ_offset_range.end
+                    || happ.max_size.is_none())
             {
                 return false;
             }
         }
 
-        let any_component_supports = |usage_offset: u32, usage: &QPtrMemUsage| {
-            // FIXME(eddyb) should `QPtrMemUsage` track a `min_size` as well?
+        let any_component_supports = |happ_offset: u32, happ: &DataHapp| {
+            // FIXME(eddyb) should `DataHapp` track a `min_size` as well?
             // FIXME(eddyb) duplicated above.
-            let min_usage_offset_range =
-                usage_offset..usage_offset.saturating_add(usage.max_size.unwrap_or(0));
+            let min_happ_offset_range =
+                happ_offset..happ_offset.saturating_add(happ.max_size.unwrap_or(0));
 
             // FIXME(eddyb) `find_components_containing` is linear today but
             // could be made logarithmic (via binary search).
-            self.components.find_components_containing(min_usage_offset_range).any(
-                |idx| match &self.components {
-                    Components::Scalar => unreachable!(),
-                    Components::Elements { stride, elem, .. } => {
-                        elem.supports_usage_at_offset(usage_offset % stride.get(), usage)
-                    }
-                    Components::Fields { offsets, layouts, .. } => {
-                        layouts[idx].supports_usage_at_offset(usage_offset - offsets[idx], usage)
-                    }
-                },
-            )
+            self.components.find_components_containing(min_happ_offset_range).any(|idx| match &self
+                .components
+            {
+                Components::Scalar => unreachable!(),
+                Components::Elements { stride, elem, .. } => {
+                    elem.supports_happ_at_offset(happ_offset % stride.get(), happ)
+                }
+                Components::Fields { offsets, layouts, .. } => {
+                    layouts[idx].supports_happ_at_offset(happ_offset - offsets[idx], happ)
+                }
+            })
         };
-        match &usage.kind {
-            _ if any_component_supports(usage_offset, usage) => true,
+        match &happ.kind {
+            _ if any_component_supports(happ_offset, happ) => true,
 
-            QPtrMemUsageKind::Unused => unreachable!(),
+            DataHappKind::Dead => unreachable!(),
 
-            QPtrMemUsageKind::StrictlyTyped(_) | QPtrMemUsageKind::DirectAccess(_) => false,
+            DataHappKind::StrictlyTyped(_) | DataHappKind::Direct(_) => false,
 
-            QPtrMemUsageKind::OffsetBase(entries) => {
-                entries.iter().all(|(&sub_offset, sub_usage)| {
+            DataHappKind::Disjoint(entries) => {
+                entries.iter().all(|(&sub_offset, sub_happ)| {
                     // FIXME(eddyb) maybe this overflow should be propagated up,
-                    // as a sign that `usage` is malformed?
-                    usage_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
+                    // as a sign that `happ` is malformed?
+                    happ_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
                         // NOTE(eddyb) the reason this is only applicable to
                         // offset `0` is that *in all other cases*, every
-                        // individual `OffsetBase` requires its own type, to
+                        // individual `Disjoint` requires its own type, to
                         // allow performing offsets *in steps* (even if the
                         // offsets could easily be constant-folded, they'd
                         // *have to* be constant-folded *before* analysis,
                         // to ensure there is no need for the intermediaries).
                         if combined_offset == 0 {
-                            self.supports_usage_at_offset(0, sub_usage)
+                            self.supports_happ_at_offset(0, sub_happ)
                         } else {
-                            any_component_supports(combined_offset, sub_usage)
+                            any_component_supports(combined_offset, sub_happ)
                         }
                     })
                 })
@@ -607,16 +595,16 @@ impl MemTypeLayout {
 
             // Finding an array entirely nested in a component was handled above,
             // so here `layout` can only be a matching array (same stride and length).
-            QPtrMemUsageKind::DynOffsetBase { element: usage_elem, stride: usage_stride } => {
-                let usage_fixed_len = usage
+            DataHappKind::Repeated { element: happ_elem, stride: happ_stride } => {
+                let happ_fixed_len = happ
                     .max_size
                     .map(|size| {
-                        if !size.is_multiple_of(usage_stride.get()) {
+                        if !size.is_multiple_of(happ_stride.get()) {
                             // FIXME(eddyb) maybe this should be propagated up,
-                            // as a sign that `usage` is malformed?
+                            // as a sign that `happ` is malformed?
                             return Err(());
                         }
-                        NonZeroU32::new(size / usage_stride.get()).ok_or(())
+                        NonZeroU32::new(size / happ_stride.get()).ok_or(())
                     })
                     .transpose();
 
@@ -631,17 +619,17 @@ impl MemTypeLayout {
                         elem: layout_elem,
                         fixed_len: layout_fixed_len,
                     } => {
-                        // HACK(eddyb) extend the max length implied by `usage`,
+                        // HACK(eddyb) extend the max length implied by `happ`,
                         // such that the array can start at offset `0`.
-                        let ext_usage_offset = usage_offset % usage_stride.get();
-                        let ext_usage_fixed_len = usage_fixed_len.and_then(|usage_fixed_len| {
-                            usage_fixed_len
-                                .map(|usage_fixed_len| {
+                        let ext_happ_offset = happ_offset % happ_stride.get();
+                        let ext_happ_fixed_len = happ_fixed_len.and_then(|happ_fixed_len| {
+                            happ_fixed_len
+                                .map(|happ_fixed_len| {
                                     NonZeroU32::new(
                                         // FIXME(eddyb) maybe this overflow should be propagated up,
-                                        // as a sign that `usage` is malformed?
-                                        (usage_offset / usage_stride.get())
-                                            .checked_add(usage_fixed_len.get())
+                                        // as a sign that `happ` is malformed?
+                                        (happ_offset / happ_stride.get())
+                                            .checked_add(happ_fixed_len.get())
                                             .ok_or(())?,
                                     )
                                     .ok_or(())
@@ -651,13 +639,13 @@ impl MemTypeLayout {
 
                         // FIXME(eddyb) this could maybe be allowed if there is still
                         // some kind of divisibility relation between the strides.
-                        if ext_usage_offset != 0 {
+                        if ext_happ_offset != 0 {
                             return false;
                         }
 
-                        layout_stride == usage_stride
-                            && Ok(*layout_fixed_len) == ext_usage_fixed_len
-                            && layout_elem.supports_usage_at_offset(0, usage_elem)
+                        layout_stride == happ_stride
+                            && Ok(*layout_fixed_len) == ext_happ_fixed_len
+                            && layout_elem.supports_happ_at_offset(0, happ_elem)
                     }
                 }
             }
@@ -665,59 +653,59 @@ impl MemTypeLayout {
     }
 }
 
-struct FuncInferUsageResults {
-    param_usages: SmallVec<[Option<Result<QPtrUsage, AnalysisError>>; 2]>,
-    usage_or_err_attrs_to_attach: Vec<(Value, Result<QPtrUsage, AnalysisError>)>,
+struct FuncGatherAccessesResults {
+    param_accesses: SmallVec<[Option<Result<MemAccesses, AnalysisError>>; 2]>,
+    accesses_or_err_attrs_to_attach: Vec<(Value, Result<MemAccesses, AnalysisError>)>,
 }
 
 #[derive(Clone)]
-enum FuncInferUsageState {
+enum FuncGatherAccessesState {
     InProgress,
-    Complete(Rc<FuncInferUsageResults>),
+    Complete(Rc<FuncGatherAccessesResults>),
 }
 
-pub struct InferUsage<'a> {
+pub struct GatherAccesses<'a> {
     cx: Rc<Context>,
     layout_cache: LayoutCache<'a>,
 
-    global_var_usages: FxIndexMap<GlobalVar, Option<Result<QPtrUsage, AnalysisError>>>,
-    func_states: FxIndexMap<Func, FuncInferUsageState>,
+    global_var_accesses: FxIndexMap<GlobalVar, Option<Result<MemAccesses, AnalysisError>>>,
+    func_states: FxIndexMap<Func, FuncGatherAccessesState>,
 }
 
-impl<'a> InferUsage<'a> {
+impl<'a> GatherAccesses<'a> {
     pub fn new(cx: Rc<Context>, layout_config: &'a LayoutConfig) -> Self {
         Self {
             cx: cx.clone(),
             layout_cache: LayoutCache::new(cx, layout_config),
 
-            global_var_usages: Default::default(),
+            global_var_accesses: Default::default(),
             func_states: Default::default(),
         }
     }
 
-    pub fn infer_usage_in_module(mut self, module: &mut Module) {
+    pub fn gather_accesses_in_module(mut self, module: &mut Module) {
         for (export_key, &exportee) in &module.exports {
             if let Exportee::Func(func) = exportee {
-                self.infer_usage_in_func(module, func);
+                self.gather_accesses_in_func(module, func);
             }
 
-            // Ensure even unused interface variables get their `qptr.usage`.
+            // Ensure even unused interface variables get their `mem.accesses`.
             match export_key {
                 ExportKey::LinkName(_) => {}
                 ExportKey::SpvEntryPoint { imms: _, interface_global_vars } => {
                     for &gv in interface_global_vars {
-                        self.global_var_usages.entry(gv).or_insert_with(|| {
+                        self.global_var_accesses.entry(gv).or_insert_with(|| {
                             Some(Ok(match module.global_vars[gv].shape {
                                 Some(shapes::GlobalVarShape::Handles { handle, .. }) => {
-                                    QPtrUsage::Handles(match handle {
+                                    MemAccesses::Handles(match handle {
                                         shapes::Handle::Opaque(ty) => shapes::Handle::Opaque(ty),
                                         shapes::Handle::Buffer(..) => shapes::Handle::Buffer(
                                             AddrSpace::Handles,
-                                            QPtrMemUsage::UNUSED,
+                                            DataHapp::DEAD,
                                         ),
                                     })
                                 }
-                                _ => QPtrUsage::Memory(QPtrMemUsage::UNUSED),
+                                _ => MemAccesses::Data(DataHapp::DEAD),
                             }))
                         });
                     }
@@ -726,18 +714,18 @@ impl<'a> InferUsage<'a> {
         }
 
         // Analysis over, write all attributes back to the module.
-        for (gv, usage) in self.global_var_usages {
-            if let Some(usage) = usage {
+        for (gv, accesses) in self.global_var_accesses {
+            if let Some(accesses) = accesses {
                 let global_var_def = &mut module.global_vars[gv];
-                match usage {
-                    Ok(usage) => {
+                match accesses {
+                    Ok(accesses) => {
                         // FIXME(eddyb) deduplicate attribute manipulation.
                         global_var_def.attrs = self.cx.intern(AttrSetDef {
                             attrs: self.cx[global_var_def.attrs]
                                 .attrs
                                 .iter()
                                 .cloned()
-                                .chain([Attr::QPtr(QPtrAttr::Usage(OrdAssertEq(usage)))])
+                                .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(accesses)))])
                                 .collect(),
                         });
                     }
@@ -749,24 +737,26 @@ impl<'a> InferUsage<'a> {
         }
         for (func, state) in self.func_states {
             match state {
-                FuncInferUsageState::InProgress => unreachable!(),
-                FuncInferUsageState::Complete(func_results) => {
-                    let FuncInferUsageResults { param_usages, usage_or_err_attrs_to_attach } =
-                        Rc::try_unwrap(func_results).ok().unwrap();
+                FuncGatherAccessesState::InProgress => unreachable!(),
+                FuncGatherAccessesState::Complete(func_results) => {
+                    let FuncGatherAccessesResults {
+                        param_accesses,
+                        accesses_or_err_attrs_to_attach,
+                    } = Rc::try_unwrap(func_results).ok().unwrap();
 
                     let func_decl = &mut module.funcs[func];
-                    for (param_decl, usage) in func_decl.params.iter_mut().zip(param_usages) {
-                        if let Some(usage) = usage {
-                            match usage {
-                                Ok(usage) => {
+                    for (param_decl, accesses) in func_decl.params.iter_mut().zip(param_accesses) {
+                        if let Some(accesses) = accesses {
+                            match accesses {
+                                Ok(accesses) => {
                                     // FIXME(eddyb) deduplicate attribute manipulation.
                                     param_decl.attrs = self.cx.intern(AttrSetDef {
                                         attrs: self.cx[param_decl.attrs]
                                             .attrs
                                             .iter()
                                             .cloned()
-                                            .chain([Attr::QPtr(QPtrAttr::Usage(OrdAssertEq(
-                                                usage,
+                                            .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(
+                                                accesses,
                                             )))])
                                             .collect(),
                                     });
@@ -783,7 +773,7 @@ impl<'a> InferUsage<'a> {
                         DeclDef::Imported(_) => continue,
                     };
 
-                    for (v, usage) in usage_or_err_attrs_to_attach {
+                    for (v, accesses) in accesses_or_err_attrs_to_attach {
                         let attrs = match v {
                             Value::Const(_) => unreachable!(),
                             Value::RegionInput { region, input_idx } => {
@@ -798,15 +788,17 @@ impl<'a> InferUsage<'a> {
                                 &mut func_def_body.at_mut(data_inst).def().attrs
                             }
                         };
-                        match usage {
-                            Ok(usage) => {
+                        match accesses {
+                            Ok(accesses) => {
                                 // FIXME(eddyb) deduplicate attribute manipulation.
                                 *attrs = self.cx.intern(AttrSetDef {
                                     attrs: self.cx[*attrs]
                                         .attrs
                                         .iter()
                                         .cloned()
-                                        .chain([Attr::QPtr(QPtrAttr::Usage(OrdAssertEq(usage)))])
+                                        .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(
+                                            accesses,
+                                        )))])
                                         .collect(),
                                 });
                             }
@@ -820,62 +812,66 @@ impl<'a> InferUsage<'a> {
         }
     }
 
-    // HACK(eddyb) `FuncInferUsageState` also serves to indicate recursion errors.
-    fn infer_usage_in_func(&mut self, module: &Module, func: Func) -> FuncInferUsageState {
+    // HACK(eddyb) `FuncGatherAccessesState` also serves to indicate recursion errors.
+    fn gather_accesses_in_func(&mut self, module: &Module, func: Func) -> FuncGatherAccessesState {
         if let Some(cached) = self.func_states.get(&func).cloned() {
             return cached;
         }
 
-        self.func_states.insert(func, FuncInferUsageState::InProgress);
+        self.func_states.insert(func, FuncGatherAccessesState::InProgress);
 
-        let completed_state =
-            FuncInferUsageState::Complete(Rc::new(self.infer_usage_in_func_uncached(module, func)));
+        let completed_state = FuncGatherAccessesState::Complete(Rc::new(
+            self.gather_accesses_in_func_uncached(module, func),
+        ));
 
         self.func_states.insert(func, completed_state.clone());
         completed_state
     }
-    fn infer_usage_in_func_uncached(
+    fn gather_accesses_in_func_uncached(
         &mut self,
         module: &Module,
         func: Func,
-    ) -> FuncInferUsageResults {
+    ) -> FuncGatherAccessesResults {
         let cx = self.cx.clone();
         let is_qptr = |ty: Type| matches!(cx[ty].kind, TypeKind::QPtr);
 
         let func_decl = &module.funcs[func];
-        let mut param_usages: SmallVec<[_; 2]> =
+        let mut param_accesses: SmallVec<[_; 2]> =
             (0..func_decl.params.len()).map(|_| None).collect();
-        let mut usage_or_err_attrs_to_attach = vec![];
+        let mut accesses_or_err_attrs_to_attach = vec![];
 
         let func_def_body = match &module.funcs[func].def {
             DeclDef::Present(func_def_body) => func_def_body,
             DeclDef::Imported(_) => {
-                for (param, param_usage) in func_decl.params.iter().zip(&mut param_usages) {
+                for (param, param_accesses) in func_decl.params.iter().zip(&mut param_accesses) {
                     if is_qptr(param.ty) {
-                        *param_usage = Some(Err(AnalysisError(Diag::bug([
+                        *param_accesses = Some(Err(AnalysisError(Diag::bug([
                             "pointer param of imported func".into(),
                         ]))));
                     }
                 }
-                return FuncInferUsageResults { param_usages, usage_or_err_attrs_to_attach };
+                return FuncGatherAccessesResults {
+                    param_accesses,
+                    accesses_or_err_attrs_to_attach,
+                };
             }
         };
 
         let mut all_data_insts = CollectAllDataInsts::default();
         func_def_body.inner_visit_with(&mut all_data_insts);
 
-        let mut data_inst_output_usages = FxHashMap::default();
+        let mut data_inst_output_accesses = FxHashMap::default();
         for insts in all_data_insts.0.into_iter().rev() {
             for func_at_inst in func_def_body.at(insts).into_iter().rev() {
                 let data_inst = func_at_inst.position;
                 let data_inst_def = func_at_inst.def();
-                let output_usage = data_inst_output_usages.remove(&data_inst).flatten();
+                let output_accesses = data_inst_output_accesses.remove(&data_inst).flatten();
 
-                let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
+                let mut generate_accesses = |this: &mut Self, ptr: Value, new_accesses| {
                     let slot = match ptr {
                         Value::Const(ct) => match cx[ct].kind {
                             ConstKind::PtrToGlobalVar(gv) => {
-                                this.global_var_usages.entry(gv).or_default()
+                                this.global_var_accesses.entry(gv).or_default()
                             }
                             // FIXME(eddyb) may be relevant?
                             _ => unreachable!(),
@@ -883,43 +879,43 @@ impl<'a> InferUsage<'a> {
                         Value::RegionInput { region, input_idx }
                             if region == func_def_body.body =>
                         {
-                            &mut param_usages[input_idx as usize]
+                            &mut param_accesses[input_idx as usize]
                         }
                         // FIXME(eddyb) implement
                         Value::RegionInput { .. } | Value::NodeOutput { .. } => {
-                            usage_or_err_attrs_to_attach.push((
+                            accesses_or_err_attrs_to_attach.push((
                                 ptr,
                                 Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
                             ));
                             return;
                         }
                         Value::DataInstOutput(ptr_inst) => {
-                            data_inst_output_usages.entry(ptr_inst).or_default()
+                            data_inst_output_accesses.entry(ptr_inst).or_default()
                         }
                     };
                     *slot = Some(match slot.take() {
                         Some(old) => old.and_then(|old| {
-                            UsageMerger { layout_cache: &this.layout_cache }
-                                .merge(old, new_usage?)
+                            AccessMerger { layout_cache: &this.layout_cache }
+                                .merge(old, new_accesses?)
                                 .into_result()
                         }),
-                        None => new_usage,
+                        None => new_accesses,
                     });
                 };
                 match &data_inst_def.kind {
                     &DataInstKind::FuncCall(callee) => {
-                        match self.infer_usage_in_func(module, callee) {
-                            FuncInferUsageState::Complete(callee_results) => {
-                                for (&arg, param_usage) in
-                                    data_inst_def.inputs.iter().zip(&callee_results.param_usages)
+                        match self.gather_accesses_in_func(module, callee) {
+                            FuncGatherAccessesState::Complete(callee_results) => {
+                                for (&arg, param_accesses) in
+                                    data_inst_def.inputs.iter().zip(&callee_results.param_accesses)
                                 {
-                                    if let Some(param_usage) = param_usage {
-                                        generate_usage(self, arg, param_usage.clone());
+                                    if let Some(param_accesses) = param_accesses {
+                                        generate_accesses(self, arg, param_accesses.clone());
                                     }
                                 }
                             }
-                            FuncInferUsageState::InProgress => {
-                                usage_or_err_attrs_to_attach.push((
+                            FuncGatherAccessesState::InProgress => {
+                                accesses_or_err_attrs_to_attach.push((
                                     Value::DataInstOutput(data_inst),
                                     Err(AnalysisError(Diag::bug([
                                         "unsupported recursive call".into()
@@ -928,55 +924,57 @@ impl<'a> InferUsage<'a> {
                             }
                         };
                         if data_inst_def.output_type.is_some_and(is_qptr)
-                            && let Some(usage) = output_usage
+                            && let Some(accesses) = output_accesses
                         {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::DataInstOutput(data_inst), usage));
+                            accesses_or_err_attrs_to_attach
+                                .push((Value::DataInstOutput(data_inst), accesses));
                         }
                     }
 
-                    DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
-                        if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::DataInstOutput(data_inst), usage));
+                    DataInstKind::Mem(MemOp::FuncLocalVar(_)) => {
+                        if let Some(accesses) = output_accesses {
+                            accesses_or_err_attrs_to_attach
+                                .push((Value::DataInstOutput(data_inst), accesses));
                         }
                     }
                     DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
+                            output_accesses
                                 .unwrap_or_else(|| {
                                     Err(AnalysisError(Diag::bug([
                                         "HandleArrayIndex: unknown element".into(),
                                     ])))
                                 })
-                                .and_then(|usage| match usage {
-                                    QPtrUsage::Handles(handle) => Ok(QPtrUsage::Handles(handle)),
-                                    QPtrUsage::Memory(_) => Err(AnalysisError(Diag::bug([
-                                        "HandleArrayIndex: cannot be used as Memory".into(),
+                                .and_then(|accesses| match accesses {
+                                    MemAccesses::Handles(handle) => {
+                                        Ok(MemAccesses::Handles(handle))
+                                    }
+                                    MemAccesses::Data(_) => Err(AnalysisError(Diag::bug([
+                                        "HandleArrayIndex: cannot be accessed as data".into(),
                                     ]))),
                                 }),
                         );
                     }
                     DataInstKind::QPtr(QPtrOp::BufferData) => {
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
+                            output_accesses
+                                .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                                .and_then(|accesses| {
+                                    let happ = match accesses {
+                                        MemAccesses::Handles(_) => {
                                             return Err(AnalysisError(Diag::bug([
-                                                "BufferData: cannot be used as Handles".into(),
+                                                "BufferData: cannot be accessed as handles".into(),
                                             ])));
                                         }
-                                        QPtrUsage::Memory(usage) => usage,
+                                        MemAccesses::Data(happ) => happ,
                                     };
-                                    Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
+                                    Ok(MemAccesses::Handles(shapes::Handle::Buffer(
                                         AddrSpace::Handles,
-                                        usage,
+                                        happ,
                                     )))
                                 }),
                         );
@@ -985,47 +983,47 @@ impl<'a> InferUsage<'a> {
                         fixed_base_size,
                         dyn_unit_stride,
                     }) => {
-                        let array_usage = QPtrMemUsage {
+                        let array_happ = DataHapp {
                             max_size: None,
-                            kind: QPtrMemUsageKind::DynOffsetBase {
-                                element: Rc::new(QPtrMemUsage::UNUSED),
+                            kind: DataHappKind::Repeated {
+                                element: Rc::new(DataHapp::DEAD),
                                 stride: dyn_unit_stride,
                             },
                         };
-                        let buf_data_usage = if fixed_base_size == 0 {
-                            array_usage
+                        let buf_data_happ = if fixed_base_size == 0 {
+                            array_happ
                         } else {
-                            QPtrMemUsage {
+                            DataHapp {
                                 max_size: None,
-                                kind: QPtrMemUsageKind::OffsetBase(Rc::new(
-                                    [(fixed_base_size, array_usage)].into(),
+                                kind: DataHappKind::Disjoint(Rc::new(
+                                    [(fixed_base_size, array_happ)].into(),
                                 )),
                             }
                         };
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
-                            Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
+                            Ok(MemAccesses::Handles(shapes::Handle::Buffer(
                                 AddrSpace::Handles,
-                                buf_data_usage,
+                                buf_data_happ,
                             ))),
                         );
                     }
                     &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
+                            output_accesses
+                                .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                                .and_then(|accesses| {
+                                    let happ = match accesses {
+                                        MemAccesses::Handles(_) => {
                                             return Err(AnalysisError(Diag::bug([format!(
-                                                "Offset({offset}): cannot offset Handles"
+                                                "Offset({offset}): cannot offset in handle memory"
                                             )
                                             .into()])));
                                         }
-                                        QPtrUsage::Memory(usage) => usage,
+                                        MemAccesses::Data(happ) => happ,
                                     };
                                     let offset = u32::try_from(offset).ok().ok_or_else(|| {
                                         AnalysisError(Diag::bug([format!(
@@ -1038,11 +1036,11 @@ impl<'a> InferUsage<'a> {
                                     // (e.g. constant-folded) out of existence,
                                     // but while they exist, they should be noops.
                                     if offset == 0 {
-                                        return Ok(QPtrUsage::Memory(usage));
+                                        return Ok(MemAccesses::Data(happ));
                                     }
 
-                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                        max_size: usage
+                                    Ok(MemAccesses::Data(DataHapp {
+                                        max_size: happ
                                             .max_size
                                             .map(|max_size| {
                                                 offset.checked_add(max_size).ok_or_else(|| {
@@ -1057,36 +1055,36 @@ impl<'a> InferUsage<'a> {
                                         // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                         // to represent the one-element case, seems
                                         // quite wasteful when it's likely consumed.
-                                        kind: QPtrMemUsageKind::OffsetBase(Rc::new(
-                                            [(offset, usage)].into(),
+                                        kind: DataHappKind::Disjoint(Rc::new(
+                                            [(offset, happ)].into(),
                                         )),
                                     }))
                                 }),
                         );
                     }
                     DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
+                            output_accesses
+                                .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                                .and_then(|accesses| {
+                                    let happ = match accesses {
+                                        MemAccesses::Handles(_) => {
                                             return Err(AnalysisError(Diag::bug([
-                                                "DynOffset: cannot offset Handles".into(),
+                                                "DynOffset: cannot offset in handle memory".into(),
                                             ])));
                                         }
-                                        QPtrUsage::Memory(usage) => usage,
+                                        MemAccesses::Data(happ) => happ,
                                     };
-                                    match usage.max_size {
+                                    match happ.max_size {
                                         None => {
                                             return Err(AnalysisError(Diag::bug([
                                                 "DynOffset: unsized element".into(),
                                             ])));
                                         }
                                         // FIXME(eddyb) support this by "folding"
-                                        // the usage onto itself (i.e. applying
+                                        // the HAPP onto itself (i.e. applying
                                         // `%= stride` on all offsets inside).
                                         Some(max_size) if max_size > stride.get() => {
                                             return Err(AnalysisError(Diag::bug([
@@ -1095,7 +1093,7 @@ impl<'a> InferUsage<'a> {
                                         }
                                         Some(_) => {}
                                     }
-                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                    Ok(MemAccesses::Data(DataHapp {
                                         // FIXME(eddyb) does the `None` case allow
                                         // for negative offsets?
                                         max_size: index_bounds
@@ -1120,23 +1118,25 @@ impl<'a> InferUsage<'a> {
                                                     })
                                             })
                                             .transpose()?,
-                                        kind: QPtrMemUsageKind::DynOffsetBase {
-                                            element: Rc::new(usage),
+                                        kind: DataHappKind::Repeated {
+                                            element: Rc::new(happ),
                                             stride: *stride,
                                         },
                                     }))
                                 }),
                         );
                     }
-                    DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
+                    DataInstKind::Mem(op @ (MemOp::Load | MemOp::Store)) => {
+                        // HACK(eddyb) `_` will match multiple variants soon.
+                        #[allow(clippy::match_wildcard_for_single_variants)]
                         let (op_name, access_type) = match op {
-                            QPtrOp::Load => ("Load", data_inst_def.output_type.unwrap()),
-                            QPtrOp::Store => {
+                            MemOp::Load => ("Load", data_inst_def.output_type.unwrap()),
+                            MemOp::Store => {
                                 ("Store", func_at_inst.at(data_inst_def.inputs[1]).type_of(&cx))
                             }
                             _ => unreachable!(),
                         };
-                        generate_usage(
+                        generate_accesses(
                             self,
                             data_inst_def.inputs[0],
                             self.layout_cache
@@ -1144,7 +1144,7 @@ impl<'a> InferUsage<'a> {
                                 .map_err(|LayoutError(e)| AnalysisError(e))
                                 .and_then(|layout| match layout {
                                     TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
-                                        Ok(QPtrUsage::Handles(shapes::Handle::Opaque(ty)))
+                                        Ok(MemAccesses::Handles(shapes::Handle::Opaque(ty)))
                                     }
                                     TypeLayout::Handle(shapes::Handle::Buffer(..)) => {
                                         Err(AnalysisError(Diag::bug([format!(
@@ -1167,9 +1167,9 @@ impl<'a> InferUsage<'a> {
                                         .into()])))
                                     }
                                     TypeLayout::Concrete(concrete) => {
-                                        Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                        Ok(MemAccesses::Data(DataHapp {
                                             max_size: Some(concrete.mem_layout.fixed_base.size),
-                                            kind: QPtrMemUsageKind::DirectAccess(access_type),
+                                            kind: DataHappKind::Direct(access_type),
                                         }))
                                     }
                                 }),
@@ -1182,7 +1182,7 @@ impl<'a> InferUsage<'a> {
                             match *attr {
                                 Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) => {
                                     let ty = pointee.0;
-                                    generate_usage(
+                                    generate_accesses(
                                         self,
                                         data_inst_def.inputs[input_idx as usize],
                                         self.layout_cache
@@ -1210,11 +1210,11 @@ impl<'a> InferUsage<'a> {
                                                                 ));
                                                             }
                                                         };
-                                                        Ok(QPtrUsage::Handles(handle))
+                                                        Ok(MemAccesses::Handles(handle))
                                                     }
                                                     // NOTE(eddyb) because we can't represent
                                                     // the original type, in the same way we
-                                                    // use `QPtrMemUsageKind::StrictlyTyped`
+                                                    // use `DataHappKind::StrictlyTyped`
                                                     // for non-handles, we can't guarantee
                                                     // a generated type that matches the
                                                     // desired `pointee` type.
@@ -1227,7 +1227,7 @@ impl<'a> InferUsage<'a> {
                                                         ])))
                                                     }
                                                     TypeLayout::Concrete(concrete) => {
-                                                        Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                                        Ok(MemAccesses::Data(DataHapp {
                                                             max_size: if concrete
                                                                 .mem_layout
                                                                 .dyn_unit_stride
@@ -1242,9 +1242,7 @@ impl<'a> InferUsage<'a> {
                                                                         .size,
                                                                 )
                                                             },
-                                                            kind: QPtrMemUsageKind::StrictlyTyped(
-                                                                ty,
-                                                            ),
+                                                            kind: DataHappKind::StrictlyTyped(ty),
                                                         }))
                                                     }
                                                 }
@@ -1263,9 +1261,9 @@ impl<'a> InferUsage<'a> {
 
                         if has_from_spv_ptr_output_attr {
                             // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
+                            if let Some(accesses) = output_accesses {
+                                accesses_or_err_attrs_to_attach
+                                    .push((Value::DataInstOutput(data_inst), accesses));
                             }
                         }
                     }
@@ -1273,7 +1271,7 @@ impl<'a> InferUsage<'a> {
             }
         }
 
-        FuncInferUsageResults { param_usages, usage_or_err_attrs_to_attach }
+        FuncGatherAccessesResults { param_accesses, accesses_or_err_attrs_to_attach }
     }
 }
 

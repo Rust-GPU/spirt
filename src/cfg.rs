@@ -1022,41 +1022,37 @@ impl<'a> Structurizer<'a> {
         });
 
         let (loop_header_to_exit_targets, incoming_edge_counts_including_loop_exits) =
-            func_def_body
-                .unstructured_cfg
-                .as_ref()
-                .map(|cfg| {
-                    let loop_header_to_exit_targets = {
-                        let mut loop_finder = LoopFinder::new(cfg);
-                        loop_finder.find_earliest_scc_root_of(func_def_body.body);
-                        loop_finder.loop_header_to_exit_targets
-                    };
+            func_def_body.unstructured_cfg.as_ref().map_or_default(|cfg| {
+                let loop_header_to_exit_targets = {
+                    let mut loop_finder = LoopFinder::new(cfg);
+                    loop_finder.find_earliest_scc_root_of(func_def_body.body);
+                    loop_finder.loop_header_to_exit_targets
+                };
 
-                    let mut state = TraversalState {
-                        incoming_edge_counts: EntityOrientedDenseMap::new(),
+                let mut state = TraversalState {
+                    incoming_edge_counts: EntityOrientedDenseMap::new(),
 
-                        pre_order_visit: |_| {},
-                        post_order_visit: |_| {},
-                        reverse_targets: false,
-                    };
-                    cfg.traverse_whole_func(func_def_body, &mut state);
+                    pre_order_visit: |_| {},
+                    post_order_visit: |_| {},
+                    reverse_targets: false,
+                };
+                cfg.traverse_whole_func(func_def_body, &mut state);
 
-                    // HACK(eddyb) treat loop exits as "false edges", that their
-                    // respective loop header "owns", such that structurization
-                    // naturally stops at those loop exits, instead of continuing
-                    // greedily into the loop exterior (producing "maximal loops").
-                    for loop_exit_targets in loop_header_to_exit_targets.values() {
-                        for &exit_target in loop_exit_targets {
-                            *state
-                                .incoming_edge_counts
-                                .entry(exit_target)
-                                .get_or_insert(Default::default()) += IncomingEdgeCount::ONE;
-                        }
+                // HACK(eddyb) treat loop exits as "false edges", that their
+                // respective loop header "owns", such that structurization
+                // naturally stops at those loop exits, instead of continuing
+                // greedily into the loop exterior (producing "maximal loops").
+                for loop_exit_targets in loop_header_to_exit_targets.values() {
+                    for &exit_target in loop_exit_targets {
+                        *state
+                            .incoming_edge_counts
+                            .entry(exit_target)
+                            .get_or_insert(Default::default()) += IncomingEdgeCount::ONE;
                     }
+                }
 
-                    (loop_header_to_exit_targets, state.incoming_edge_counts)
-                })
-                .unwrap_or_default();
+                (loop_header_to_exit_targets, state.incoming_edge_counts)
+            });
 
         Self {
             cx,
@@ -1548,8 +1544,7 @@ impl<'a> Structurizer<'a> {
         // Cache the edge count for backedges (which later get turned into loops).
         let accumulated_backedge_count = deferred_edges
             .get_edge_bundle_by_target(DeferredTarget::Region(region))
-            .map(|backedge| backedge.accumulated_count)
-            .unwrap_or_default();
+            .map_or_default(|backedge| backedge.accumulated_count);
 
         let old_state = self.structurize_region_state.insert(
             region,
@@ -2035,8 +2030,9 @@ impl<'a> Structurizer<'a> {
                 }
             };
 
-            let condition = Some(condition)
-                .filter(|_| else_target_and_inputs.is_some())
+            let condition = else_target_and_inputs
+                .is_some()
+                .then_some(condition)
                 .map(|cond| self.materialize_lazy_cond(&cond));
             let branch_control_inst = ControlInst {
                 attrs: AttrSet::default(),

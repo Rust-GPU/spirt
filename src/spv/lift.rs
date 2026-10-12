@@ -127,6 +127,14 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             }
 
             TypeKind::SpvInst { .. } => {}
+
+            TypeKind::SpvTypeOperand => {
+                unreachable!(
+                    "`TypeKind::SpvTypeOperand` should not be used \
+                     as a type outside of `ConstKind::SpvTypeOperand`"
+                );
+            }
+
             TypeKind::SpvStringLiteralForExtInst => {
                 unreachable!(
                     "`TypeKind::SpvStringLiteralForExtInst` should not be used \
@@ -144,9 +152,24 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         }
         let ct_def = &self.cx[ct];
         match ct_def.kind {
-            ConstKind::PtrToGlobalVar(_) | ConstKind::SpvInst { .. } => {
+            ConstKind::PtrToGlobalVar(_) | ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
                 self.visit_const_def(ct_def);
                 self.globals.insert(global);
+            }
+
+            // HACK(eddyb) because this is merely a way to refer to `wrapped_type`
+            // as a `Value` (for a SPIR-V operand), it needs to be special-cased,
+            // without visiting its type, or an entry in `self.globals`.
+            ConstKind::SpvTypeOperand(wrapped_type) => {
+                let ConstDef { attrs, ty, kind: _ } = ct_def;
+
+                assert!(*attrs == AttrSet::default());
+                assert!(
+                    self.cx[*ty]
+                        == TypeDef { attrs: AttrSet::default(), kind: TypeKind::SpvTypeOperand }
+                );
+
+                self.visit_type_use(wrapped_type);
             }
 
             // HACK(eddyb) because this is an `OpString` and needs to go earlier
@@ -198,6 +221,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_attr(&mut self, attr: &Attr) {
         match *attr {
             Attr::Diagnostics(_)
+            | Attr::Mem(_)
             | Attr::QPtr(_)
             | Attr::SpvAnnotation { .. }
             | Attr::SpvBitflagsOperand(_) => {}
@@ -211,6 +235,12 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
     fn visit_data_inst_def(&mut self, data_inst_def: &DataInstDef) {
         #[allow(clippy::match_same_arms)]
         match data_inst_def.kind {
+            // FIXME(eddyb) this should be a proper `Result`-based error instead,
+            // and/or `spv::lift` should mutate the module for legalization.
+            DataInstKind::Mem(_) => {
+                unreachable!("`DataInstKind::Mem` should be legalized away before lifting");
+            }
+
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
             // and/or `spv::lift` should mutate the module for legalization.
             DataInstKind::QPtr(_) => {
@@ -229,6 +259,9 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
 }
 
 struct AllocatedIds<'a> {
+    // HACK(eddyb) only for `Index<Const>` impl.
+    cx: &'a Context,
+
     ext_inst_imports: BTreeMap<&'a str, spv::Id>,
     debug_strings: BTreeMap<&'a str, spv::Id>,
 
@@ -236,6 +269,19 @@ struct AllocatedIds<'a> {
     globals: FxIndexMap<Global, spv::Id>,
     // FIXME(eddyb) use `EntityOrientedDenseMap` here.
     funcs: FxIndexMap<Func, FuncLifting<'a>>,
+}
+
+// HACK(eddyb) this makes accessing the right ID a bit easier.
+impl std::ops::Index<Const> for AllocatedIds<'_> {
+    type Output = spv::Id;
+    fn index(&self, ct: Const) -> &Self::Output {
+        match self.cx[ct].kind {
+            ConstKind::SpvTypeOperand(ty) => &self.globals[&Global::Type(ty)],
+            ConstKind::SpvStringLiteralForExtInst(s) => &self.debug_strings[&self.cx[s]],
+
+            _ => &self.globals[&Global::Const(ct)],
+        }
+    }
 }
 
 // FIXME(eddyb) should this use ID ranges instead of `SmallVec<[spv::Id; 4]>`?
@@ -358,6 +404,8 @@ impl<'a> NeedsIdsCollector<'a> {
         } = self;
 
         Ok(AllocatedIds {
+            cx,
+
             ext_inst_imports: ext_inst_imports
                 .into_iter()
                 .map(|name| Ok((name, alloc_id()?)))
@@ -863,22 +911,70 @@ impl<'a> FuncLifting<'a> {
         // HACK(eddyb) this takes advantage of `blocks` being an `IndexMap`,
         // to iterate at the same time as mutating other entries.
         for block_idx in (0..blocks.len()).rev() {
-            let BlockLifting { terminator: original_terminator, .. } = &blocks[block_idx];
+            // HACK(eddyb) elide empty cases of an `if`-`else`/`switch`, as
+            // SPIR-V allows their targets to just be the whole merge block
+            // (the same one that `OpSelectionMerge` describes).
+            let block = &blocks[block_idx];
+            if let (cfg::ControlInstKind::SelectBranch(_), Some(Merge::Selection(merge_point))) =
+                (&*block.terminator.kind, block.terminator.merge)
+            {
+                for target_idx in 0..block.terminator.targets.len() {
+                    let block = &blocks[block_idx];
+                    let target = block.terminator.targets[target_idx];
+                    if !block
+                        .terminator
+                        .target_phi_values
+                        .get(&target)
+                        .copied()
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        continue;
+                    }
 
+                    let target_is_trivial_branch = {
+                        let BlockLifting {
+                            phis,
+                            insts,
+                            terminator:
+                                Terminator { attrs, kind, inputs, targets, target_phi_values, merge },
+                        } = &blocks[&target];
+
+                        (phis.is_empty()
+                            && insts.iter().all(|insts| insts.is_empty())
+                            && *attrs == AttrSet::default()
+                            && matches!(**kind, cfg::ControlInstKind::Branch)
+                            && inputs.is_empty()
+                            && targets.len() == 1
+                            && target_phi_values.is_empty()
+                            && merge.is_none())
+                        .then(|| targets[0])
+                    };
+                    if let Some(target_of_target) = target_is_trivial_branch
+                        && target_of_target == merge_point
+                    {
+                        blocks[block_idx].terminator.targets[target_idx] = target_of_target;
+                        *use_counts.get_mut(&target).unwrap() -= 1;
+                        *use_counts.get_mut(&target_of_target).unwrap() += 1;
+                    }
+                }
+            }
+
+            let block = &blocks[block_idx];
             let is_trivial_branch = {
                 let Terminator { attrs, kind, inputs, targets, target_phi_values, merge } =
-                    original_terminator;
+                    &block.terminator;
 
-                *attrs == AttrSet::default()
+                (*attrs == AttrSet::default()
                     && matches!(**kind, cfg::ControlInstKind::Branch)
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
-                    && merge.is_none()
+                    && merge.is_none())
+                .then(|| targets[0])
             };
 
-            if is_trivial_branch {
-                let target = original_terminator.targets[0];
+            if let Some(target) = is_trivial_branch {
                 let target_use_count = use_counts.get_mut(&target).unwrap();
 
                 if *target_use_count == 1 {
@@ -1032,10 +1128,13 @@ impl LazyInst<'_, '_> {
                                 };
                                 (gv_decl.attrs, import)
                             }
-                            ConstKind::SpvInst { .. } => (ct_def.attrs, None),
+                            ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
+                                (ct_def.attrs, None)
+                            }
 
                             // Not inserted into `globals` while visiting.
-                            ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
+                            ConstKind::SpvTypeOperand(_)
+                            | ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
                         }
                     }
                 };
@@ -1069,11 +1168,7 @@ impl LazyInst<'_, '_> {
         let cx = module.cx_ref();
 
         let value_to_id = |parent_func: &FuncLifting<'_>, v| match v {
-            Value::Const(ct) => match cx[ct].kind {
-                ConstKind::SpvStringLiteralForExtInst(s) => ids.debug_strings[&cx[s]],
-
-                _ => ids.globals[&Global::Const(ct)],
-            },
+            Value::Const(ct) => ids[ct],
             Value::RegionInput { region, input_idx } => {
                 let input_idx = usize::try_from(input_idx).unwrap();
                 match parent_func.region_inputs_source.get(&region) {
@@ -1105,17 +1200,17 @@ impl LazyInst<'_, '_> {
                         result_id,
                         ids: type_and_const_inputs
                             .iter()
-                            .map(|&ty_or_ct| {
-                                ids.globals[&match ty_or_ct {
-                                    TypeOrConst::Type(ty) => Global::Type(ty),
-                                    TypeOrConst::Const(ct) => Global::Const(ct),
-                                }]
+                            .map(|&ty_or_ct| match ty_or_ct {
+                                TypeOrConst::Type(ty) => ids.globals[&Global::Type(ty)],
+                                TypeOrConst::Const(ct) => ids[ct],
                             })
                             .collect(),
                     },
 
                     // Not inserted into `globals` while visiting.
-                    TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => unreachable!(),
+                    TypeKind::QPtr
+                    | TypeKind::SpvTypeOperand
+                    | TypeKind::SpvStringLiteralForExtInst => unreachable!(),
                 },
                 Global::Const(ct) => {
                     let ct_def = &cx[ct];
@@ -1139,8 +1234,9 @@ impl LazyInst<'_, '_> {
                             };
                             let initializer = match gv_decl.def {
                                 DeclDef::Imported(_) => None,
-                                DeclDef::Present(GlobalVarDefBody { initializer }) => initializer
-                                    .map(|initializer| ids.globals[&Global::Const(initializer)]),
+                                DeclDef::Present(GlobalVarDefBody { initializer }) => {
+                                    initializer.map(|initializer| ids[initializer])
+                                }
                             };
                             spv::InstWithIds {
                                 without_ids: spv::Inst {
@@ -1153,21 +1249,27 @@ impl LazyInst<'_, '_> {
                             }
                         }
 
+                        &ConstKind::PtrToFunc(func) => spv::InstWithIds {
+                            without_ids: wk.OpConstantFunctionPointerINTEL.into(),
+                            result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
+                            result_id,
+                            ids: [ids.funcs[&func].func_id].into_iter().collect(),
+                        },
+
                         ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                             let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                             spv::InstWithIds {
                                 without_ids: spv_inst.clone(),
                                 result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
                                 result_id,
-                                ids: const_inputs
-                                    .iter()
-                                    .map(|&ct| ids.globals[&Global::Const(ct)])
-                                    .collect(),
+                                ids: const_inputs.iter().map(|&ct| ids[ct]).collect(),
                             }
                         }
 
                         // Not inserted into `globals` while visiting.
-                        ConstKind::SpvStringLiteralForExtInst(_) => unreachable!(),
+                        ConstKind::SpvTypeOperand(_) | ConstKind::SpvStringLiteralForExtInst(_) => {
+                            unreachable!()
+                        }
                     }
                 }
             },
@@ -1225,7 +1327,7 @@ impl LazyInst<'_, '_> {
             Self::DataInst { parent_func, result_id: _, data_inst_def } => {
                 let (inst, extra_initial_id_operand) = match &data_inst_def.kind {
                     // Disallowed while visiting.
-                    DataInstKind::QPtr(_) => unreachable!(),
+                    DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
 
                     &DataInstKind::FuncCall(callee) => {
                         (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
@@ -1504,27 +1606,40 @@ impl Module {
                 match attr {
                     Attr::DbgSrcLoc(_)
                     | Attr::Diagnostics(_)
+                    | Attr::Mem(_)
                     | Attr::QPtr(_)
                     | Attr::SpvBitflagsOperand(_) => {}
-                    Attr::SpvAnnotation(inst @ spv::Inst { opcode, .. }) => {
+                    Attr::SpvAnnotation {
+                        spv_inst: inst @ spv::Inst { opcode, .. },
+                        per_instance_const_inputs,
+                    } => {
                         let target_id = result_id.expect(
                             "FIXME: it shouldn't be possible to attach \
-                                 attributes to instructions without an output",
+                             attributes to instructions without an output",
                         );
 
-                        let inst = spv::InstWithIds {
+                        let empty_const_inputs = SmallVec::new();
+                        let instances = per_instance_const_inputs
+                            .as_ref()
+                            .map_or(std::slice::from_ref(&empty_const_inputs), |instances| {
+                                &instances.0[..]
+                            });
+
+                        let insts = instances.iter().map(|const_inputs| spv::InstWithIds {
                             without_ids: inst.clone(),
                             result_type_id: None,
                             result_id: None,
-                            ids: iter::once(target_id).collect(),
-                        };
+                            ids: iter::once(target_id)
+                                .chain(const_inputs.iter().map(|&ct| ids[ct]))
+                                .collect(),
+                        });
 
                         if [wk.OpExecutionMode, wk.OpExecutionModeId].contains(opcode) {
-                            execution_mode_insts.push(inst);
+                            execution_mode_insts.extend(insts);
                         } else if [wk.OpName, wk.OpMemberName].contains(opcode) {
-                            debug_name_insts.push(inst);
+                            debug_name_insts.extend(insts);
                         } else {
-                            decoration_insts.push(inst);
+                            decoration_insts.extend(insts);
                         }
                     }
                 }
