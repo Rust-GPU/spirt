@@ -1221,13 +1221,12 @@ impl Module {
                         details,
 
                         // HACK(eddyb) reuse `shadowed_local_id_defs` storage.
-                        shadowed_local_id_defs: current_block
-                            .take()
-                            .map(|CurrentBlock { mut shadowed_local_id_defs, .. }| {
+                        shadowed_local_id_defs: current_block.take().map_or_default(
+                            |CurrentBlock { mut shadowed_local_id_defs, .. }| {
                                 shadowed_local_id_defs.clear();
                                 shadowed_local_id_defs
-                            })
-                            .unwrap_or_default(),
+                            },
+                        ),
                     });
                     continue;
                 }
