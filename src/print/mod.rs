@@ -1806,7 +1806,7 @@ impl Printer<'_> {
     fn sanitize_spv_operand_name<'b>(&self, name: &'b str) -> Option<Cow<'b, str>> {
         Some(name).and_then(|name| {
             // HACK(eddyb) some operand names are useless.
-            if name == "Type"
+            if matches!(name, "Opcode" | "Operand" | "Type")
                 || name
                     .strip_prefix("Operand ")
                     .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()))
@@ -3382,6 +3382,9 @@ impl Print for ConstDef {
                 &ConstKind::PtrToGlobalVar(gv) => {
                     pretty::Fragment::new(["&".into(), gv.print(printer)])
                 }
+                &ConstKind::PtrToFunc(func) => {
+                    pretty::Fragment::new(["&".into(), func.print(printer)])
+                }
                 ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                     let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                     pretty::Fragment::new([
@@ -4146,7 +4149,9 @@ impl Print for FuncAt<'_, DataInst> {
                                     }
                                 }
                             }
-                            ConstKind::PtrToGlobalVar(_) | ConstKind::SpvTypeOperand(_) => {}
+                            ConstKind::PtrToGlobalVar(_)
+                            | ConstKind::PtrToFunc(_)
+                            | ConstKind::SpvTypeOperand(_) => {}
                         }
                     }
                     None
