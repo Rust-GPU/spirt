@@ -483,7 +483,12 @@ impl<'a> Visitor<'a> for Plan<'a> {
             .attrs
             .iter()
             .filter_map(|attr| match attr {
-                Attr::SpvAnnotation(spv_inst) if spv_inst.opcode == wk.OpName => Some(spv_inst),
+                Attr::SpvAnnotation { spv_inst, per_instance_const_inputs }
+                    if spv_inst.opcode == wk.OpName =>
+                {
+                    assert!(per_instance_const_inputs.is_none());
+                    Some(spv_inst)
+                }
                 _ => None,
             })
             .peekable();
@@ -1132,9 +1137,9 @@ impl<'a> Printer<'a> {
                                                 || type_and_const_inputs.is_empty()
                                         }
 
-                                        TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {
-                                            true
-                                        }
+                                        TypeKind::QPtr
+                                        | TypeKind::SpvTypeOperand
+                                        | TypeKind::SpvStringLiteralForExtInst => true,
                                     };
 
                                     ty_def.attrs == AttrSet::default()
@@ -1874,7 +1879,7 @@ impl Printer<'_> {
         &self,
         imms: impl IntoIterator<Item = spv::Imm>,
     ) -> pretty::Fragment {
-        self.pretty_spv_print_tokens_for_operand(spv::print::operand_from_imms(imms))
+        self.pretty_spv_print_tokens_for_operand(spv::print::operand(imms, []))
     }
 
     /// Pretty-print a single SPIR-V (short) immediate (e.g. an enumerand).
@@ -2419,7 +2424,7 @@ impl Print for spv::Dialect {
                         // HACK(eddyb) construct a custom `spv.Capability.{A,B,C}`.
                         let capability_namespace_prefix = printer
                             .pretty_spv_print_tokens_for_operand({
-                                let mut tokens = spv::print::operand_from_imms(cap_imms(0));
+                                let mut tokens = spv::print::operand(cap_imms(0), []);
                                 assert!(matches!(
                                     tokens.tokens.pop(),
                                     Some(spv::print::Token::EnumerandName(_))
@@ -2429,7 +2434,7 @@ impl Print for spv::Dialect {
 
                         let mut cap_names = capabilities.iter().map(|&cap| {
                             printer.pretty_spv_print_tokens_for_operand({
-                                let mut tokens = spv::print::operand_from_imms(cap_imms(cap));
+                                let mut tokens = spv::print::operand(cap_imms(cap), []);
                                 tokens.tokens.drain(..tokens.tokens.len() - 1);
                                 assert!(matches!(
                                     tokens.tokens[..],
@@ -2703,7 +2708,9 @@ impl Print for AttrSet {
             attrs
                 .iter()
                 .filter(|attr| match attr {
-                    Attr::SpvAnnotation(spv_inst) => Some(spv_inst) != spv_name_to_hide,
+                    Attr::SpvAnnotation { spv_inst, per_instance_const_inputs: None } => {
+                        Some(spv_inst) != spv_name_to_hide
+                    }
                     _ => true,
                 })
                 .map(|attr| attr.print(printer))
@@ -2781,7 +2788,14 @@ impl DbgScope {
 impl Print for Attr {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
-        let non_comment_attr = match self {
+        let mk_non_comment_attr = |attr| {
+            pretty::Fragment::new([
+                printer.attr_style().apply("#[").into(),
+                attr,
+                printer.attr_style().apply("]").into(),
+            ])
+        };
+        match self {
             &Attr::DbgSrcLoc(OrdAssertEq(dbg_src_loc)) => {
                 let mut comment = SmallVec::<[_; 4]>::new();
 
@@ -2869,11 +2883,11 @@ impl Print for Attr {
                     }
                 }
 
-                return comment;
+                comment
             }
 
             Attr::Diagnostics(diags) => {
-                return pretty::Fragment::new(
+                pretty::Fragment::new(
                     diags
                         .0
                         .iter()
@@ -2947,7 +2961,7 @@ impl Print for Attr {
                             ])
                         })
                         .intersperse(pretty::Node::ForceLineSeparation.into()),
-                );
+                )
             }
 
             Attr::QPtr(attr) => {
@@ -2983,41 +2997,77 @@ impl Print for Attr {
                         ("usage", pretty::join_comma_sep("(", [usage.0.print(printer)], ")"))
                     }
                 };
-                pretty::Fragment::new([
+                mk_non_comment_attr(pretty::Fragment::new([
                     printer
                         .demote_style_for_namespace_prefix(printer.attr_style())
                         .apply("qptr.")
                         .into(),
                     printer.attr_style().apply(name).into(),
                     params_inputs,
-                ])
+                ]))
             }
 
-            Attr::SpvAnnotation(spv::Inst { opcode, imms }) => {
+            Attr::SpvAnnotation {
+                spv_inst: spv::Inst { opcode, imms },
+                per_instance_const_inputs,
+            } => {
                 let wk = &spv::spec::Spec::get().well_known;
 
-                // HACK(eddyb) `#[spv.OpDecorate(...)]` is redundant (with its operand).
-                if [wk.OpDecorate, wk.OpDecorateString, wk.OpExecutionMode].contains(opcode) {
-                    printer.pretty_spv_operand_from_imms(imms.iter().copied())
-                } else if *opcode == wk.OpName {
-                    // HACK(eddyb) unlike `OpDecorate`, we can't just omit `OpName`,
-                    // but pretending it's a SPIR-T-specific `#[name = "..."]`
-                    // attribute should be good enough for now.
-                    pretty::Fragment::new([
-                        printer.attr_style().apply("name = ").into(),
-                        printer.pretty_spv_operand_from_imms(imms.iter().copied()),
-                    ])
-                } else {
-                    printer.pretty_spv_inst(printer.attr_style(), *opcode, imms, [None])
-                }
+                let empty_const_inputs = SmallVec::new();
+                let instances =
+                    per_instance_const_inputs
+                        .as_ref()
+                        .map_or(std::slice::from_ref(&empty_const_inputs), |instances| {
+                            &instances.0[..]
+                        });
+
+                pretty::Fragment::new(
+                    instances
+                        .iter()
+                        .map(|const_inputs| {
+                            // HACK(eddyb) `#[spv.OpDecorate(...)]` is redundant (with its operand).
+                            if [
+                                wk.OpDecorate,
+                                wk.OpDecorateId,
+                                wk.OpDecorateString,
+                                wk.OpExecutionMode,
+                                wk.OpExecutionModeId,
+                            ]
+                            .contains(opcode)
+                            {
+                                printer.pretty_spv_print_tokens_for_operand(spv::print::operand(
+                                    imms.iter().copied(),
+                                    const_inputs.iter().map(|ct| ct.print(printer).into()),
+                                ))
+                            } else if *opcode == wk.OpName {
+                                assert_eq!(const_inputs.len(), 0);
+
+                                // HACK(eddyb) unlike `OpDecorate`, we can't just omit `OpName`,
+                                // but pretending it's a SPIR-T-specific `#[name = "..."]`
+                                // attribute should be good enough for now.
+                                pretty::Fragment::new([
+                                    printer.attr_style().apply("name = ").into(),
+                                    printer.pretty_spv_operand_from_imms(imms.iter().copied()),
+                                ])
+                            } else {
+                                printer.pretty_spv_inst(
+                                    printer.attr_style(),
+                                    *opcode,
+                                    imms,
+                                    [None].into_iter().chain(
+                                        const_inputs.iter().map(|ct| ct.print(printer)).map(Some),
+                                    ),
+                                )
+                            }
+                        })
+                        .map(mk_non_comment_attr)
+                        .intersperse_with(|| pretty::Node::ForceLineSeparation.into()),
+                )
             }
-            &Attr::SpvBitflagsOperand(imm) => printer.pretty_spv_operand_from_imms([imm]),
-        };
-        pretty::Fragment::new([
-            printer.attr_style().apply("#[").into(),
-            non_comment_attr,
-            printer.attr_style().apply("]").into(),
-        ])
+            &Attr::SpvBitflagsOperand(imm) => {
+                mk_non_comment_attr(printer.pretty_spv_operand_from_imms([imm]))
+            }
+        }
     }
 }
 
@@ -3168,6 +3218,12 @@ impl Print for TypeDef {
                                 TypeOrConst::Const(ct) => ct.print(printer),
                             }),
                         ),
+                    TypeKind::SpvTypeOperand => pretty::Fragment::new([
+                        printer.error_style().apply("type_of"),
+                        "(".into(),
+                        printer.declarative_keyword_style().apply("type"),
+                        ")".into(),
+                    ]),
                     TypeKind::SpvStringLiteralForExtInst => pretty::Fragment::new([
                         printer.error_style().apply("type_of").into(),
                         "(".into(),
@@ -3338,6 +3394,7 @@ impl Print for ConstDef {
                         printer.pretty_type_ascription_suffix(*ty),
                     ])
                 }
+                ConstKind::SpvTypeOperand(ty) => ty.print(printer),
                 &ConstKind::SpvStringLiteralForExtInst(s) => pretty::Fragment::new([
                     printer.pretty_spv_opcode(printer.spv_op_style(), wk.OpString),
                     "(".into(),
@@ -4089,7 +4146,7 @@ impl Print for FuncAt<'_, DataInst> {
                                     }
                                 }
                             }
-                            ConstKind::PtrToGlobalVar(_) => {}
+                            ConstKind::PtrToGlobalVar(_) | ConstKind::SpvTypeOperand(_) => {}
                         }
                     }
                     None

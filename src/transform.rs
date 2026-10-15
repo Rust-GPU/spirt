@@ -316,9 +316,7 @@ impl InnerTransform for AttrSetDef {
 impl InnerTransform for Attr {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         match self {
-            Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {
-                Transformed::Unchanged
-            }
+            Attr::Diagnostics(_) | Attr::SpvBitflagsOperand(_) => Transformed::Unchanged,
 
             &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
                 file_path,
@@ -374,6 +372,28 @@ impl InnerTransform for Attr {
                     } => QPtrAttr::Usage(OrdAssertEq(usage))),
                 }
             } => Attr::QPtr(attr)),
+
+            Attr::SpvAnnotation { spv_inst, per_instance_const_inputs } => {
+                // FIXME(eddyb) this should be replaced with an impl of `InnerTransform`
+                // for `Option<T>` or some other helper, to avoid "manual transpose".
+                transform!({
+                    per_instance_const_inputs -> per_instance_const_inputs
+                        .as_ref()
+                        .map(|OrdAssertEq(instances)| {
+                            Transformed::map_iter(instances.iter(), |const_inputs| {
+                                Transformed::map_iter(const_inputs.iter(), |&ct| {
+                                    transformer.transform_const_use(ct)
+                                })
+                                .map(|new_iter| new_iter.collect())
+                            })
+                            .map(|new_iter| OrdAssertEq(Rc::new(new_iter.collect())))
+                        })
+                        .map_or(Transformed::Unchanged, |t| t.map(Some)),
+                } => Attr::SpvAnnotation {
+                    spv_inst: spv_inst.clone(),
+                    per_instance_const_inputs,
+                })
+            }
         }
     }
 }
@@ -431,7 +451,9 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
+                TypeKind::QPtr
+                | TypeKind::SpvTypeOperand
+                | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
                 TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
@@ -477,6 +499,11 @@ impl InnerTransform for ConstDef {
                         spv_inst_and_const_inputs: Rc::new((spv_inst.clone(), new_iter.collect())),
                     })
                 }
+
+                ConstKind::SpvTypeOperand(ty) => transform!({
+                    ty -> transformer.transform_type_use(*ty),
+                } => ConstKind::SpvTypeOperand(ty)),
+
                 ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged
             },
         } => Self {

@@ -398,7 +398,20 @@ pub enum Attr {
     #[from]
     QPtr(qptr::QPtrAttr),
 
-    SpvAnnotation(spv::Inst),
+    SpvAnnotation {
+        spv_inst: spv::Inst,
+
+        /// If present, each "instance" represents a different use of `spv_inst`,
+        /// grouped together only because the non-ID operands (enumerand/literals)
+        /// inside `spv::Inst` are not enough to uniquely identify an annotation
+        /// (i.e. at least some of the `Const` IDs are semantically part of the
+        /// "key" side `Attr`, which should normally be outside the `OrdAssertEq`).
+        //
+        // HACK(eddyb) this is enough of a complication to furthger call into
+        // question the use of ordered sets for `AttrSet`s, in the first place.
+        #[allow(clippy::type_complexity)]
+        per_instance_const_inputs: Option<OrdAssertEq<Rc<Vec<SmallVec<[Const; 2]>>>>>,
+    },
 
     /// Some SPIR-V instructions, like `OpFunction`, take a bitflags operand
     /// that is effectively an optimization over using `OpDecorate`.
@@ -552,6 +565,10 @@ pub enum TypeKind {
         type_and_const_inputs: SmallVec<[TypeOrConst; 2]>,
     },
 
+    /// The type of a [`ConstKind::SpvTypeOperand`] constant, i.e. a [`Type`]
+    /// embedded in a [`Value`] to be passed as a SPIR-V operand.
+    SpvTypeOperand,
+
     /// The type of a [`ConstKind::SpvStringLiteralForExtInst`] constant, i.e.
     /// a SPIR-V `OpString` with no actual type in SPIR-V.
     SpvStringLiteralForExtInst,
@@ -594,6 +611,9 @@ pub enum ConstKind {
     SpvInst {
         spv_inst_and_const_inputs: Rc<(spv::Inst, SmallVec<[Const; 4]>)>,
     },
+
+    /// Type used as an operand to a SPIR-V instruction (other than result type).
+    SpvTypeOperand(Type),
 
     /// SPIR-V `OpString`, but only when used as an operand for an `OpExtInst`,
     /// which can't have literals itself - for non-string literals `OpConstant*`
