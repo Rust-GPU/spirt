@@ -152,7 +152,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
         }
         let ct_def = &self.cx[ct];
         match ct_def.kind {
-            ConstKind::PtrToGlobalVar(_) | ConstKind::SpvInst { .. } => {
+            ConstKind::PtrToGlobalVar(_) | ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
                 self.visit_const_def(ct_def);
                 self.globals.insert(global);
             }
@@ -904,22 +904,70 @@ impl<'a> FuncLifting<'a> {
         // HACK(eddyb) this takes advantage of `blocks` being an `IndexMap`,
         // to iterate at the same time as mutating other entries.
         for block_idx in (0..blocks.len()).rev() {
-            let BlockLifting { terminator: original_terminator, .. } = &blocks[block_idx];
+            // HACK(eddyb) elide empty cases of an `if`-`else`/`switch`, as
+            // SPIR-V allows their targets to just be the whole merge block
+            // (the same one that `OpSelectionMerge` describes).
+            let block = &blocks[block_idx];
+            if let (cfg::ControlInstKind::SelectBranch(_), Some(Merge::Selection(merge_point))) =
+                (&*block.terminator.kind, block.terminator.merge)
+            {
+                for target_idx in 0..block.terminator.targets.len() {
+                    let block = &blocks[block_idx];
+                    let target = block.terminator.targets[target_idx];
+                    if !block
+                        .terminator
+                        .target_phi_values
+                        .get(&target)
+                        .copied()
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        continue;
+                    }
 
+                    let target_is_trivial_branch = {
+                        let BlockLifting {
+                            phis,
+                            insts,
+                            terminator:
+                                Terminator { attrs, kind, inputs, targets, target_phi_values, merge },
+                        } = &blocks[&target];
+
+                        (phis.is_empty()
+                            && insts.iter().all(|insts| insts.is_empty())
+                            && *attrs == AttrSet::default()
+                            && matches!(**kind, cfg::ControlInstKind::Branch)
+                            && inputs.is_empty()
+                            && targets.len() == 1
+                            && target_phi_values.is_empty()
+                            && merge.is_none())
+                        .then(|| targets[0])
+                    };
+                    if let Some(target_of_target) = target_is_trivial_branch
+                        && target_of_target == merge_point
+                    {
+                        blocks[block_idx].terminator.targets[target_idx] = target_of_target;
+                        *use_counts.get_mut(&target).unwrap() -= 1;
+                        *use_counts.get_mut(&target_of_target).unwrap() += 1;
+                    }
+                }
+            }
+
+            let block = &blocks[block_idx];
             let is_trivial_branch = {
                 let Terminator { attrs, kind, inputs, targets, target_phi_values, merge } =
-                    original_terminator;
+                    &block.terminator;
 
-                *attrs == AttrSet::default()
+                (*attrs == AttrSet::default()
                     && matches!(**kind, cfg::ControlInstKind::Branch)
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
-                    && merge.is_none()
+                    && merge.is_none())
+                .then(|| targets[0])
             };
 
-            if is_trivial_branch {
-                let target = original_terminator.targets[0];
+            if let Some(target) = is_trivial_branch {
                 let target_use_count = use_counts.get_mut(&target).unwrap();
 
                 if *target_use_count == 1 {
@@ -1073,7 +1121,9 @@ impl LazyInst<'_, '_> {
                                 };
                                 (gv_decl.attrs, import)
                             }
-                            ConstKind::SpvInst { .. } => (ct_def.attrs, None),
+                            ConstKind::PtrToFunc(_) | ConstKind::SpvInst { .. } => {
+                                (ct_def.attrs, None)
+                            }
 
                             // Not inserted into `globals` while visiting.
                             ConstKind::SpvTypeOperand(_)
@@ -1191,6 +1241,13 @@ impl LazyInst<'_, '_> {
                                 ids: initializer.into_iter().collect(),
                             }
                         }
+
+                        &ConstKind::PtrToFunc(func) => spv::InstWithIds {
+                            without_ids: wk.OpConstantFunctionPointerINTEL.into(),
+                            result_type_id: Some(ids.globals[&Global::Type(ct_def.ty)]),
+                            result_id,
+                            ids: [ids.funcs[&func].func_id].into_iter().collect(),
+                        },
 
                         ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                             let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
